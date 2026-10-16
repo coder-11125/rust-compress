@@ -1,4 +1,5 @@
-//! JPEG decoder: baseline, extended-sequential and progressive Huffman, 8-bit, 1 or 3 components.
+//! JPEG decoder: baseline, extended-sequential and progressive Huffman, 8-bit, 1, 3 or 4 components
+//! (4 = CMYK/YCCK, which the DCT-domain path carries through untouched).
 
 use super::ZIGZAG;
 use super::dct::{AAN, idct, round_f32};
@@ -242,6 +243,35 @@ struct Decoder<'a> {
     scans_seen: usize,
     /// ICC profile fragments as (sequence number, bytes).
     icc_parts: Vec<(u8, Vec<u8>)>,
+    /// Descriptive segments (EXIF/XMP/Photoshop APP segments, comments) as (marker, body).
+    extras: Vec<(u8, Vec<u8>)>,
+}
+
+const EXIF_PREFIX: &[u8] = b"Exif\0\0";
+const XMP_PREFIX: &[u8] = b"http://ns.adobe.com/xap/1.0/\0";
+const PHOTOSHOP_PREFIX: &[u8] = b"Photoshop 3.0\0";
+/// Descriptive metadata is capped so a hostile file cannot make us hoard memory.
+const MAX_EXTRA_SEGMENTS: usize = 256;
+
+/// Assemble the `Metadata` of a decoded file from the ICC fragments and descriptive segments it held.
+fn build_meta(mut icc_parts: Vec<(u8, Vec<u8>)>, extras: Vec<(u8, Vec<u8>)>) -> Metadata {
+    icc_parts.sort_by_key(|p| p.0);
+    let mut meta = Metadata {
+        icc: (!icc_parts.is_empty()).then(|| icc_parts.into_iter().flat_map(|p| p.1).collect()),
+        ..Default::default()
+    };
+    for (marker, body) in extras {
+        match marker {
+            0xE1 if body.starts_with(EXIF_PREFIX) && meta.exif.is_none() => meta.exif = Some(body[6..].to_vec()),
+            0xE1 if body.starts_with(XMP_PREFIX) && meta.xmp.is_none() => {
+                meta.xmp = Some(body[XMP_PREFIX.len()..].to_vec());
+            }
+            0xED if body.starts_with(PHOTOSHOP_PREFIX) => meta.jpeg_extra.push((marker, body)),
+            0xFE => meta.jpeg_extra.push((marker, body)),
+            _ => {}
+        }
+    }
+    meta
 }
 
 fn be16(d: &[u8], at: usize) -> Result<usize> {
@@ -259,6 +289,8 @@ pub struct Info {
     pub source_quality: u8,
     /// Components are stored as RGB rather than YCbCr.
     pub coded_rgb: bool,
+    /// Four components: CMYK, or YCCK when `adobe_transform` is 2.
+    pub cmyk: bool,
 }
 
 /// Pixels a viewer would show for these quantized coefficients (dequantize, IDCT, upsample).
@@ -302,6 +334,7 @@ pub fn reconstruct(ci: &CoefImage) -> Result<Image> {
         adobe_transform: None,
         scans_seen: 1,
         icc_parts: Vec::new(),
+        extras: Vec::new(),
     };
     d.finish()
 }
@@ -335,6 +368,7 @@ pub fn parse(data: &[u8]) -> Result<Parsed<'_>> {
         adobe_transform: None,
         scans_seen: 0,
         icc_parts: Vec::new(),
+        extras: Vec::new(),
     };
     d.run()?;
     if d.scans_seen == 0 || d.comps.is_empty() {
@@ -361,6 +395,7 @@ impl Parsed<'_> {
             source_quality: luma_q.map_or(100, |t| super::quality::estimate_quality(&t)),
             coded_rgb: d.comps.len() == 3
                 && (d.adobe_transform == Some(0) || (d.adobe_transform.is_none() && ids == b"RGB")),
+            cmyk: d.comps.len() == 4,
         }
     }
 
@@ -386,12 +421,7 @@ impl Parsed<'_> {
             }
             qtables[c.tq] = Some(t8);
         }
-        let mut icc_parts = d.icc_parts;
-        icc_parts.sort_by_key(|p| p.0);
-        let meta = Metadata {
-            icc: (!icc_parts.is_empty()).then(|| icc_parts.into_iter().flat_map(|p| p.1).collect()),
-            png_color: Vec::new(),
-        };
+        let meta = build_meta(d.icc_parts, d.extras);
         Ok(CoefImage {
             width: d.width,
             height: d.height,
@@ -402,6 +432,7 @@ impl Parsed<'_> {
                 .collect(),
             qtables,
             meta,
+            adobe_transform: d.adobe_transform,
         })
     }
 }
@@ -514,6 +545,7 @@ impl Decoder<'_> {
                     self.icc_parts.push((body[12], body[14..].to_vec()));
                 }
                 0xEE if body.len() >= 12 && &body[..5] == b"Adobe" => self.adobe_transform = Some(body[11]),
+                0xE1 | 0xED | 0xFE if self.extras.len() < MAX_EXTRA_SEGMENTS => self.extras.push((m, body.to_vec())),
                 0xDA => {
                     self.read_sos(body)?;
                     self.scans_seen += 1;
@@ -583,7 +615,7 @@ impl Decoder<'_> {
         if (w as u64) * (h as u64) > MAX_PIXELS {
             return Err(Error::invalid("unreasonable image dimensions"));
         }
-        if nc != 1 && nc != 3 {
+        if nc != 1 && nc != 3 && nc != 4 {
             return Err(Error::unsupported(format!("{nc}-component JPEG")));
         }
         if b.len() < 6 + 3 * nc {
@@ -781,14 +813,15 @@ impl Decoder<'_> {
             }
             full.push(upsample(plane, *stride, cw, ch, self.hmax / c.h, self.vmax / c.v, w, h));
         }
-        let mut icc_parts = self.icc_parts;
-        icc_parts.sort_by_key(|p| p.0);
-        let meta = Metadata {
-            icc: (!icc_parts.is_empty()).then(|| icc_parts.into_iter().flat_map(|p| p.1).collect()),
-            png_color: Vec::new(),
-        };
+        let meta = build_meta(self.icc_parts, self.extras);
         if full.len() == 1 {
             let mut img = Image::new(w as u32, h as u32, ColorType::Gray, 8, full.pop().unwrap())?;
+            img.meta = meta;
+            return Ok(img);
+        }
+        if full.len() == 4 {
+            let data = cmyk_to_rgb(&full, self.adobe_transform);
+            let mut img = Image::new(w as u32, h as u32, ColorType::Rgb, 8, data)?;
             img.meta = meta;
             return Ok(img);
         }
@@ -814,6 +847,33 @@ impl Decoder<'_> {
         img.meta = meta;
         Ok(img)
     }
+}
+
+/// Convert four decoded planes to RGB. With an Adobe marker the values are stored inverted
+/// (255 = no ink) and transform 2 means the first three planes are YCC-coded; without a marker the
+/// values are plain ink amounts. This mirrors what libjpeg-based viewers do.
+fn cmyk_to_rgb(planes: &[Vec<u8>], adobe_transform: Option<u8>) -> Vec<u8> {
+    let n = planes[0].len();
+    let mut out = vec![0u8; n * 3];
+    let inverted = adobe_transform.is_some();
+    let ycck = adobe_transform == Some(2);
+    out.par_chunks_mut(3).enumerate().for_each(|(i, px)| {
+        let (mut c, mut m, mut y) = (planes[0][i] as i32, planes[1][i] as i32, planes[2][i] as i32);
+        let k = planes[3][i] as i32;
+        if ycck {
+            let (yy, cb, cr) = (c, m - 128, y - 128);
+            let r = (yy + ((91881 * cr + 32768) >> 16)).clamp(0, 255);
+            let g = (yy - ((22554 * cb + 46802 * cr + 32768) >> 16)).clamp(0, 255);
+            let b = (yy + ((116130 * cb + 32768) >> 16)).clamp(0, 255);
+            (c, m, y) = (255 - r, 255 - g, 255 - b);
+        }
+        for (o, v) in px.iter_mut().zip([c, m, y]) {
+            // `light` is how much light the ink lets through: the stored value when inverted.
+            let (light_v, light_k) = if inverted { (v, k) } else { (255 - v, 255 - k) };
+            *o = ((light_v * light_k + 127) / 255) as u8;
+        }
+    });
+    out
 }
 
 // ---------------------------------------------------------------- block decoders
@@ -995,4 +1055,37 @@ fn upsample(p: &[u8], stride: usize, cw: usize, ch: usize, fx: usize, fy: usize,
         }
     }
     out
+}
+
+#[cfg(test)]
+mod cmyk_tests {
+    use super::cmyk_to_rgb;
+
+    fn px(c: u8, m: u8, y: u8, k: u8, adobe: Option<u8>) -> [u8; 3] {
+        let planes = [vec![c], vec![m], vec![y], vec![k]];
+        cmyk_to_rgb(&planes, adobe).try_into().unwrap()
+    }
+
+    #[test]
+    fn adobe_values_are_inverted_ink() {
+        assert_eq!(px(255, 255, 255, 255, Some(0)), [255, 255, 255], "no ink is white");
+        assert_eq!(px(0, 0, 0, 255, Some(0)), [0, 0, 0], "full CMY is black");
+        assert_eq!(px(255, 255, 255, 0, Some(0)), [0, 0, 0], "full K is black");
+        assert_eq!(px(0, 255, 255, 255, Some(0)), [0, 255, 255], "full cyan ink blocks red only");
+    }
+
+    #[test]
+    fn plain_cmyk_without_an_adobe_marker_is_ink_amounts() {
+        assert_eq!(px(0, 0, 0, 0, None), [255, 255, 255]);
+        assert_eq!(px(0, 0, 0, 255, None), [0, 0, 0]);
+        assert_eq!(px(255, 0, 0, 0, None), [0, 255, 255]);
+    }
+
+    #[test]
+    fn ycck_is_decoded_to_cmy_first() {
+        // Y=0 with neutral chroma means "no ink" once libjpeg's 255 - RGB step is applied.
+        assert_eq!(px(0, 128, 128, 255, Some(2)), [255, 255, 255]);
+        assert_eq!(px(255, 128, 128, 255, Some(2)), [0, 0, 0]);
+        assert_eq!(px(0, 128, 128, 0, Some(2)), [0, 0, 0]);
+    }
 }

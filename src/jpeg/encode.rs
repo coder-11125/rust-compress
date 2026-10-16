@@ -73,6 +73,9 @@ pub struct CoefImage {
     /// Quantization tables in natural order, indexed by slot.
     pub qtables: [Option<[u8; 64]>; 4],
     pub meta: Metadata,
+    /// Adobe APP14 colour transform of a 4-component (CMYK/YCCK) file, written back so the colours
+    /// keep their meaning. `None` for everything else.
+    pub adobe_transform: Option<u8>,
 }
 
 impl CoefImage {
@@ -347,7 +350,7 @@ fn code_block<S: Sink>(s: &mut S, blk: &[i16], pred: &mut i16, tbl: usize) {
 }
 
 fn scan<S: Sink>(comps: &[CoefComponent], mcus_x: usize, mcus_y: usize, sink: &mut S) {
-    let mut pred = [0i16; 3];
+    let mut pred = [0i16; 4];
     for my in 0..mcus_y {
         for mx in 0..mcus_x {
             for (ci, c) in comps.iter().enumerate() {
@@ -478,6 +481,7 @@ pub fn build_coefs(src: &Image, opts: &EncodeOptions) -> CoefImage {
         comps,
         qtables: [Some(qy), if gray { None } else { Some(qc) }, None, None],
         meta: src.meta.clone(),
+        adobe_transform: None,
     };
     if opts.trellis && opts.quality < 100 {
         // Second pass: re-quantize every block with rate-distortion optimization, using code
@@ -564,6 +568,30 @@ pub(super) fn write_headers(ci: &CoefImage, sof_marker: u8, capacity: usize) -> 
     let mut out = Vec::with_capacity(capacity);
     out.extend_from_slice(&[0xFF, 0xD8]);
     segment(&mut out, 0xE0, &[b'J', b'F', b'I', b'F', 0, 1, 1, 0, 0, 1, 0, 1, 0, 0]);
+    if let (Some(t), 4) = (ci.adobe_transform, comps.len()) {
+        // "Adobe", version 100, two flag words, colour transform.
+        segment(&mut out, 0xEE, &[b'A', b'd', b'o', b'b', b'e', 0, 100, 0, 0, 0, 0, t]);
+    }
+    // Descriptive metadata (only present when the caller asked to keep it). A segment holds at most
+    // 65533 bytes; anything larger (an EXIF block with a big thumbnail, say) cannot be carried.
+    let fits = |body: &[u8]| body.len() <= 65533;
+    if let Some(exif) = &ci.meta.exif {
+        let body = [&b"Exif\0\0"[..], exif].concat();
+        if fits(&body) {
+            segment(&mut out, 0xE1, &body);
+        }
+    }
+    if let Some(xmp) = &ci.meta.xmp {
+        let body = [&b"http://ns.adobe.com/xap/1.0/\0"[..], xmp].concat();
+        if fits(&body) {
+            segment(&mut out, 0xE1, &body);
+        }
+    }
+    for (marker, body) in &ci.meta.jpeg_extra {
+        if fits(body) {
+            segment(&mut out, *marker, body);
+        }
+    }
     if let Some(icc) = &ci.meta.icc {
         let chunks: Vec<&[u8]> = icc.chunks(65519).collect();
         for (i, c) in chunks.iter().enumerate() {

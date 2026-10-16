@@ -2,6 +2,13 @@
 name = "rust-compress"
 version = "0.1.0"
 edition = "2024"
+description = "Fast PNG and JPEG image compressor with a from-scratch engine (DEFLATE, PNG, JPEG, quantization) and no codec dependencies"
+license = "MIT"
+repository = "https://github.com/coder-11125/rust-compress"
+readme = "README.md"
+keywords = ["png", "jpeg", "image", "compression", "optimizer"]
+categories = ["command-line-utilities", "multimedia::images", "compression"]
+exclude = ["/.github", "/.omc"]
 
 [dependencies]
 clap = { version = "4.6.7", features = ["derive"] }

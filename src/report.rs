@@ -54,7 +54,11 @@ impl Report {
                     (None, false) => String::new(),
                 }
             ),
-            Status::NoGain => format!("{name}  {}  (no gain, kept original size)", human(self.in_size)),
+            Status::NoGain => format!(
+                "{name}  {}  (no gain, kept original size){}",
+                human(self.in_size),
+                self.note.as_ref().map_or(String::new(), |n| format!("  [{n}]"))
+            ),
             Status::Failed(e) => format!("{name}  FAILED: {e}"),
         }
     }

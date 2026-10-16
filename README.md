@@ -1,6 +1,6 @@
 # rust-compress
 
-A fast command-line image compressor for **PNG** and **JPEG**. The compression engine is written from scratch in Rust — DEFLATE, PNG and JPEG codecs, Huffman coding, DCT, color quantization — with no codec crates. Only [`clap`](https://crates.io/crates/clap) (argument parsing) and [`rayon`](https://crates.io/crates/rayon) (parallelism) are dependencies.
+A fast command-line image compressor for **PNG**, **JPEG** and **lossless WebP** (GIF files can be converted). The compression engine is written from scratch in Rust — DEFLATE, PNG, JPEG, GIF and WebP-lossless codecs, Huffman coding, DCT, color quantization — with no codec crates. Only [`clap`](https://crates.io/crates/clap) (argument parsing) and [`rayon`](https://crates.io/crates/rayon) (parallelism) are dependencies.
 
 ```
 rust-compress photo.jpg                 # -> photo.min.jpg next to the original
@@ -9,6 +9,10 @@ rust-compress shot.png --lossy          # palette quantization: usually 50-70% s
 rust-compress *.png -l 9 --in-place     # squeeze harder (slow), only replace if smaller
 rust-compress logo.png -f jpeg -q 85    # convert while compressing
 rust-compress photo.jpg --target-ssim 0.95   # lowest quality that still scores SSIM >= 0.95
+rust-compress shot.png -f webp          # lossless WebP: ~20% smaller than the optimised PNG
+rust-compress big.jpg --resize 1920x    # shrink to fit 1920 px wide (never enlarges)
+rust-compress photo.jpg --keep-metadata # keep EXIF / XMP / comments
+cat in.png | rust-compress - > out.png  # stdin to stdout
 ```
 
 ## What it does
@@ -26,7 +30,23 @@ rust-compress photo.jpg --target-ssim 0.95   # lowest quality that still scores 
 - Own DEFLATE: hash-chain LZ77 with lazy matching (levels 1-6, compressed in parallel segments) and Zopfli-style optimal parsing (levels 7-9). The optimal parser finds matches with a **binary-tree match finder** (every match length at its nearest distance, no chain-length cliff), then runs a shortest path over them with an iteratively refined cost model, and adaptive block splitting. The refinement is started from two seeds — the longest-match parse and a parse priced from the data's own byte histogram (which avoids a slow drift on noisy data, where a greedy seed is full of coincidental short matches) — and the cheaper result wins.
 - `--lossy` quantizes to a ≤256-color palette: exact color histogram, median cut, k-means refinement, and edge-aware Floyd-Steinberg dithering (`--colors N`, `--dither 0..1`).
 
-**Safety** — an output is never larger than its input (the original bytes are kept instead), files are written atomically, existing outputs are not overwritten without `--force`, ICC profiles and PNG color chunks are kept (`--strip-icc` to drop them), animated PNGs are refused rather than flattened, and decoders are hardened against truncated/corrupt/hostile input.
+**WebP (lossless)** — full VP8L encoder and decoder:
+- Encoder tries a palette transform (bundling up to 8 pixels per symbol) or subtract-green + per-tile predictor + cross-color decorrelation, ranks the pipelines with a cheap estimate and fully encodes the best ones.
+- LZ77 with the format's 2-D distance codes, an optimal (cost-model driven) parse, a colour cache sized by trial, and **entropy-clustered prefix-code groups**: image tiles with similar statistics share one set of codes.
+- 8-bit only: 16-bit inputs are reduced to 8-bit (the report note says so). Images are limited to 16384×16384 by the format. Lossy WebP (VP8) cannot be decoded: such files are left untouched when the format is kept and are an error when a conversion is requested. Animated WebP is treated the same way.
+
+**Other formats**
+- GIF files (still images: palettes, interlacing, transparency) convert to PNG, JPEG or WebP with `-f`. Animated GIFs are refused with a clear message. There is no GIF output, so directory runs only pick up `.gif` files when `-f` names a target.
+- CMYK and YCCK JPEGs are transcoded losslessly in the DCT domain (identical coefficients, Adobe colour flag kept); converting or resizing them goes through RGB.
+- Animated PNGs are passed through unchanged instead of failing the batch.
+
+**Metadata** — only color information survives by default (ICC profile, PNG color chunks). `--keep-metadata` also keeps EXIF, XMP, JPEG comments / Photoshop blocks and PNG text, time and pixel-density chunks. EXIF and XMP carry across PNG ↔ JPEG ↔ WebP conversions; when an orientation is baked into the pixels the EXIF orientation is reset, its recorded dimensions are corrected and a now-stale thumbnail is dropped.
+
+**Resizing** — `--resize WxH | Wx | xH | P%` shrinks to fit (aspect ratio kept, never enlarges) with a Lanczos-3 filter on premultiplied alpha, for 8- and 16-bit images. Output matches Pillow's Lanczos to within ~0.1 level on average. Because the result must differ from the original, the never-grow rule does not apply.
+
+**Pipes** — `-` as the input reads one image from standard input; `-o -` (the default for stdin) writes to standard output, with all reporting moved to standard error.
+
+**Safety** — an output is never larger than its input (the original bytes are kept instead), files are written atomically, existing outputs are not overwritten without `--force`, ICC profiles and PNG color chunks are kept (`--strip-icc` to drop them), animations are never flattened, and decoders are hardened against truncated/corrupt/hostile input (see *Testing*).
 
 ## Usage
 
@@ -37,16 +57,18 @@ rust-compress [OPTIONS] <INPUT>...
   -o, --output <PATH>     output file (one input file) or directory (mirrors the input tree)
       --in-place          replace originals, only when the result is smaller
   -q, --quality <1-100>   JPEG quality ceiling (default 80)
-  -f, --format <FMT>      keep | png | jpeg (default keep)
+  -f, --format <FMT>      keep | png | jpeg | webp (default keep)
       --subsampling <S>   auto | 444 | 420
       --lossy             PNG: allow palette quantization
       --colors <2-256>    with --lossy (default 256)
       --dither <0.0-1.0>  with --lossy (default 0.5)
-  -l, --level <0-9>       PNG effort (default 7; 1-6 fast, 7-9 optimal parsing, 9 slowest)
+  -l, --level <0-9>       PNG / WebP effort (default 7; PNG: 1-6 fast, 7-9 optimal parsing, 9 slowest)
       --no-trellis        JPEG: skip rate-distortion quantization (faster, larger)
       --target-ssim <S>   JPEG: smallest quality with SSIM >= S (0-1; 0.95 small, 0.97 good, 0.99 near-lossless)
       --keep-hidden-pixels  PNG: keep exact color of fully transparent pixels
       --strip-icc         drop ICC profiles / PNG color chunks
+      --keep-metadata     keep EXIF, XMP, comments, PNG text/time/density
+      --resize <SIZE>     shrink to fit: WxH, Wx, xH or P% (never enlarges)
       --background <HEX>  color for flattening transparency (default ffffff)
   -j, --jobs <N>          worker threads (default: all cores)
       --dry-run           report savings without writing
@@ -54,13 +76,13 @@ rust-compress [OPTIONS] <INPUT>...
       --quiet             only errors and the summary line
 ```
 
-Without `-o`/`--in-place`, `photo.jpg` becomes `photo.min.jpg`; files already named `*.min.*` are skipped when walking directories. The exit status is non-zero if any file failed; the rest of the batch still runs.
+`<INPUT>` may be `-` (standard input) and `-o -` writes standard output. Without `-o`/`--in-place`, `photo.jpg` becomes `photo.min.jpg`; files already named `*.min.*` are skipped when walking directories. The exit status is non-zero if any file failed; the rest of the batch still runs.
 
 ## Head-to-head with established tools
 
 JPEG and lossy-PNG rows: five real JPEGs and three PNG screenshots (mozjpeg 4.1.5, oxipng 10.2.1 with `-t 1`, pngquant 3.0.3). Timings are single-threaded **CPU time** on a loaded 2-core laptop, so treat them as indicative; sizes are exact.
 
-Lossless-PNG rows: 12 PNGs (screenshots, diagrams, UI art, a 16-bit image, a gradient, a 6 MB RGBA illustration) against oxipng 9.1.1 (as packaged in `pyoxipng`), compared with `--keep-hidden-pixels` so neither side gets credit for rewriting invisible pixels. Sizes are exact; times are wall-clock on 4 cores for the whole process.
+Lossless-PNG and WebP rows: 12 PNGs (screenshots, diagrams, UI art, a 16-bit image, a gradient, a 6 MB RGBA illustration) against oxipng 9.1.1 (as packaged in `pyoxipng`), compared with `--keep-hidden-pixels` so neither side gets credit for rewriting invisible pixels. Sizes are exact; times are wall-clock on 4 cores for the whole process.
 
 | Task | rust-compress vs. the established tool |
 |---|---|
@@ -70,12 +92,17 @@ Lossless-PNG rows: 12 PNGs (screenshots, diagrams, UI art, a 16-bit image, a gra
 | Lossless PNG, default `-l 7` | **Equal or smaller than `oxipng -o2` on 8 of 12 files**, worst +1.5%, best −19.2%; 12-image total −1.5%. Wall time 0.09-1.3 s per file vs 0.04-2.0 s for `-o2` (faster on the larger files) |
 | Lossless PNG, `-l 9` | **Equal or smaller than `oxipng -o4` on 11 of 12 files**, worst +0.7%, best −19.0%; total −1.6%. Wall time 0.3-6.9 s per file vs 0.1-3.4 s for `-o4` (slower on the largest image: 6.9 s vs 3.4 s) |
 | Lossless PNG, `-l 6` | +11% vs `oxipng -o2` in total (worst +16.6%), at a fraction of the CPU: the fast levels use hash-chain LZ77 only |
+| Lossless WebP (`-f webp`, `-l 7`) | **+6.4% in total vs libwebp at its maximum effort** (`method=6, quality=100`, via Pillow): within +0.4% … +14.5% on 11 of 12 images, one image at +31%. Roughly **2-10× faster** in wall time than libwebp's max effort. About **22% smaller than our optimised PNG** of the same pixels (excluding two 16-bit images that WebP stores at 8-bit) |
 | Lossy PNG (`--lossy`) | **Better than pngquant**: 0.4-1.0 dB higher PSNR at −4.3%, −4.5%, −4.0% size; 1.5-1.9× its CPU time |
 | PNG with hidden transparent pixels | tools that keep invisible RGB (oxipng by default) can be orders of magnitude larger: 580 KB → 4 KB on a noisy-under-alpha test image |
 
 So it matches the established tools on JPEG, beats pngquant on lossy PNG, and matches or beats oxipng on lossless PNG at `-l 7`/`-l 9`. Against weaker baselines it is far ahead (e.g. 14-28% smaller than PIL's `optimize=True` PNGs).
 
-What it offers beyond ratio: no C dependencies, one binary for both formats, a coefficient-domain JPEG pipeline, and parallel batch processing.
+What it offers beyond ratio: no C dependencies, one binary for all of these formats, a coefficient-domain JPEG pipeline, pipe support, and parallel batch processing.
+
+## Testing
+
+`cargo test` runs the unit tests and integration suites, which cross-check the decoders against the `image` crate (and, for WebP and CMYK, against files made by libwebp and libjpeg-turbo) and verify encoder output with independent decoders. `tests/hostile.rs` feeds every decoder and encoder path truncated, bit-flipped and header-corrupted variants of every fixture and requires no panic, no hang and (for WebP) an exact re-encode round trip. This is deterministic mutation testing, not coverage-guided fuzzing. For a deeper sweep: `HOSTILE_ROUNDS=20000 cargo test --release --test hostile`.
 
 ## Build
 
@@ -90,18 +117,24 @@ Requires a stable Rust toolchain (edition 2024); `rust-toolchain.toml` pins `sta
 ## Layout
 
 ```
-src/util/       bit I/O, CRC-32 / Adler-32, canonical Huffman (shared by DEFLATE and JPEG)
+src/util/       bit I/O, CRC-32 / Adler-32, canonical Huffman (shared by DEFLATE, JPEG and WebP)
 src/deflate/    inflate, LZ77 matchers (hash chains; binary tree for levels 7-9), block encoder, optimal parser (levels 7-9)
 src/png/        decoder (all color types/depths, Adam7), filters, encoder (reduction + strategy search), quantizer
 src/jpeg/       decoder (baseline + progressive), DCT, baseline/progressive encoders, trellis quantization, quality search
+src/webp/       RIFF container, VP8L decoder and encoder (transforms, LZ77 + optimal parse, tile-group clustering)
+src/gif.rs      GIF decoder (still images)
+src/exif.rs     EXIF editing for kept metadata (orientation, dimensions, thumbnail)
+src/resize.rs   Lanczos-3 downscaling
 src/metrics.rs  SSIM
 src/pipeline.rs per-file policy: read → decode/transcode → never-grow check → atomic write
 examples/       png_probe, deflate_probe, stream_probe, jpeg_probe: developer tools for tuning ratio and speed
-tests/          codec round trips, reference-decoder cross-checks, CLI end-to-end
+tests/          codec round trips, reference-decoder cross-checks, hostile input, CLI end-to-end
 ```
 
 ## Limitations
 
-- Formats: PNG and JPEG only (no WebP/AVIF/GIF). JPEG: 8-bit Huffman, 1 or 3 components (no CMYK, arithmetic coding or 12-bit). Animated PNG is refused.
-- EXIF/XMP/comments are stripped (orientation is applied to the pixels; ICC is kept).
-- No resizing yet.
+- Formats: PNG, JPEG and lossless WebP in and out; GIF in (stills). No lossy WebP (it can be neither read nor written), no AVIF, no animated output. JPEG: 8-bit Huffman, 1, 3 or 4 components (no arithmetic coding or 12-bit).
+- WebP is 8-bit: 16-bit sources lose precision on conversion.
+- CMYK JPEGs are never requantized (`-q` does not apply to them); YCCK decoding is covered by unit tests but has no real-file fixture.
+- EXIF/XMP/comments are dropped unless `--keep-metadata` is given. An EXIF block too large for a JPEG segment (over 64 KB) cannot be carried into a JPEG.
+- Resizing only shrinks and filters in gamma-encoded space.

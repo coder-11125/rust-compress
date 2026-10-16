@@ -241,8 +241,9 @@ fn run_scan<S: ScanSink>(ci: &CoefImage, sc: &Scan, sink: &mut S) {
 fn scripts(ncomp: usize) -> Vec<Vec<Scan>> {
     let s = |comps: &[usize], ss, se, ah, al| Scan { comps: comps.to_vec(), ss, se, ah, al };
     let all: Vec<usize> = (0..ncomp).collect();
-    let chroma_als: &[u32] = if ncomp == 3 { &[0, 1] } else { &[0] };
-    let chroma_splits: &[Option<usize>] = if ncomp == 3 { &[None, Some(5)] } else { &[None] };
+    // Every component after the first is coded like chroma (Cb/Cr, or the M/Y/K planes of CMYK).
+    let chroma_als: &[u32] = if ncomp >= 3 { &[0, 1] } else { &[0] };
+    let chroma_splits: &[Option<usize>] = if ncomp >= 3 { &[None, Some(5)] } else { &[None] };
     let mut out = Vec::new();
     for dc_al in [0u32, 1] {
         for split in [None, Some(5usize), Some(8)] {
@@ -258,8 +259,8 @@ fn scripts(ncomp: usize) -> Vec<Vec<Scan>> {
                             v.push(s(&[0], k + 1, 63, 0, luma_al));
                         }
                     }
-                    if ncomp == 3 {
-                        for c in [1usize, 2] {
+                    if ncomp >= 3 {
+                        for c in 1..ncomp {
                             match chroma_split {
                                 None => v.push(s(&[c], 1, 63, 0, chroma_al)),
                                 Some(k) => {
@@ -276,8 +277,9 @@ fn scripts(ncomp: usize) -> Vec<Vec<Scan>> {
                         v.push(s(&[0], 1, 63, ah, ah - 1));
                     }
                     for ah in (1..=chroma_al).rev() {
-                        v.push(s(&[1], 1, 63, ah, ah - 1));
-                        v.push(s(&[2], 1, 63, ah, ah - 1));
+                        for c in 1..ncomp {
+                            v.push(s(&[c], 1, 63, ah, ah - 1));
+                        }
                     }
                     out.push(v);
                 }

@@ -7,6 +7,8 @@ pub enum FormatArg {
     Keep,
     Png,
     Jpeg,
+    /// Lossless WebP.
+    Webp,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
@@ -23,7 +25,7 @@ pub enum SubsamplingArg {
 #[derive(Parser, Debug)]
 #[command(name = "rust-compress", version, about)]
 pub struct Cli {
-    /// Image files and/or directories to compress.
+    /// Image files and/or directories to compress. Use `-` to read one image from standard input.
     #[arg(required = true, value_name = "INPUT")]
     pub inputs: Vec<PathBuf>,
 
@@ -31,7 +33,8 @@ pub struct Cli {
     #[arg(short, long)]
     pub recursive: bool,
 
-    /// Output file (single input file) or output directory. Default: write `<name>.min.<ext>` next to each input.
+    /// Output file (single input file) or output directory; `-` writes the image to standard output.
+    /// Default: write `<name>.min.<ext>` next to each input (standard input defaults to standard output).
     #[arg(short, long, value_name = "PATH")]
     pub output: Option<PathBuf>,
 
@@ -63,7 +66,8 @@ pub struct Cli {
     #[arg(long, default_value_t = 0.5)]
     pub dither: f32,
 
-    /// PNG effort (0-9). 1-6 use greedy/lazy parsing (6 is fast); 7-9 use optimal parsing (7 default, 9 smallest and slowest).
+    /// PNG / WebP effort (0-9). For PNG, 1-6 use greedy/lazy parsing (6 is fast) and 7-9 optimal parsing
+    /// (7 default, 9 smallest and slowest).
     #[arg(short, long, default_value_t = 7, value_parser = clap::value_parser!(u8).range(0..=9))]
     pub level: u8,
 
@@ -83,6 +87,18 @@ pub struct Cli {
     /// Drop embedded ICC profiles and PNG color chunks (smaller, but colors may shift on wide-gamut images).
     #[arg(long)]
     pub strip_icc: bool,
+
+    /// Shrink images to fit: `WIDTHxHEIGHT` (a box; aspect ratio is kept), `WIDTHx`, `xHEIGHT`, or a
+    /// percentage such as `50%`. Images are never enlarged. Resizing is not lossless and, unlike the
+    /// default, may make a file's pixels differ from the original; the never-grow rule does not apply.
+    #[arg(long, value_name = "SIZE", value_parser = crate::resize::parse)]
+    pub resize: Option<crate::resize::Spec>,
+
+    /// Keep descriptive metadata: EXIF, XMP, comments, PNG text chunks and pixel density. By default only
+    /// color information (ICC profile, PNG color chunks) is kept. EXIF and XMP also carry over when
+    /// converting between PNG and JPEG; orientation is reset once it has been baked into the pixels.
+    #[arg(long)]
+    pub keep_metadata: bool,
 
     /// Background color (hex RRGGBB) used when transparency must be flattened (e.g. PNG -> JPEG).
     #[arg(long, default_value = "ffffff", value_parser = parse_hex_color)]
