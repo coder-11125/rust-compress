@@ -466,6 +466,21 @@ fn encode_one(img: &Image, opts: &EncodeOptions) -> Vec<u8> {
             write_chunk(&mut out, b"tRNS", &trns);
         }
     }
+    // Descriptive metadata (only present when the caller asked to keep it).
+    let meta = &img.meta;
+    if let Some(exif) = &meta.exif {
+        write_chunk(&mut out, b"eXIf", exif);
+    }
+    if let Some(xmp) = &meta.xmp {
+        let mut body = super::decode::XMP_KEYWORD.to_vec();
+        // NUL, uncompressed flag, method 0, empty language tag, empty translated keyword.
+        body.extend_from_slice(&[0, 0, 0, 0, 0]);
+        body.extend_from_slice(xmp);
+        write_chunk(&mut out, b"iTXt", &body);
+    }
+    for (ty, body) in &meta.png_extra {
+        write_chunk(&mut out, ty, body);
+    }
     for chunk in idat.chunks(1 << 20) {
         write_chunk(&mut out, b"IDAT", chunk);
     }

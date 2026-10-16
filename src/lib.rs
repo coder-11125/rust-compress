@@ -2,6 +2,7 @@ pub mod cli;
 pub mod collect;
 pub mod deflate;
 pub mod error;
+pub mod exif;
 pub mod image;
 pub mod jpeg;
 pub mod metrics;

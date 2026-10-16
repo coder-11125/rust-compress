@@ -3,7 +3,8 @@
 use crate::cli::{Cli, SubsamplingArg};
 use crate::collect::{Format, Job, is_stdio, target_format};
 use crate::error::{Error, Result};
-use crate::image::Image;
+use crate::exif;
+use crate::image::{Image, Metadata};
 use crate::report::{Report, Status};
 use crate::{jpeg, png};
 use std::fs;
@@ -37,14 +38,35 @@ fn encode_jpeg_pixels(img: &Image, cli: &Cli, quality: u8) -> Result<Encoded> {
     }
 }
 
+/// Apply the metadata policy to a freshly decoded image.
+fn apply_metadata_policy(meta: &mut Metadata, cli: &Cli) {
+    if !cli.keep_metadata {
+        meta.drop_descriptive();
+    }
+    if cli.strip_icc {
+        meta.icc = None;
+        meta.png_color.clear();
+    }
+}
+
+/// Bake an EXIF orientation into the pixels, keeping any carried EXIF block consistent with the result.
+fn upright(img: Image, orientation: u8) -> Image {
+    if orientation == 1 {
+        return img;
+    }
+    let mut img = img.oriented(orientation);
+    let fix = exif::Fix { reset_orientation: true, dims: Some((img.width, img.height)), drop_thumbnail: true };
+    if let Some(e) = img.meta.exif.as_mut() {
+        exif::tidy(e, fix);
+    }
+    img
+}
+
 fn decode(data: &[u8], fmt: Format) -> Result<Image> {
     match fmt {
         Format::Png => png::decode::decode(data),
-        Format::Jpeg => {
-            let img = jpeg::decode::decode(data)?;
-            // Metadata is stripped, so bake the EXIF orientation into the pixels.
-            Ok(img.oriented(jpeg::decode::exif_orientation(data)))
-        }
+        // The orientation is baked into the pixels, so the tag must not rotate them a second time.
+        Format::Jpeg => Ok(upright(jpeg::decode::decode(data)?, jpeg::decode::exif_orientation(data))),
     }
 }
 
@@ -82,9 +104,7 @@ fn jpeg_to_jpeg(data: &[u8], cli: &Cli) -> Result<Encoded> {
         };
     if orientation == 1 && !resample && !info.coded_rgb {
         let mut ci = parsed.into_coefs()?;
-        if cli.strip_icc {
-            ci.meta = Default::default();
-        }
+        apply_metadata_policy(&mut ci.meta, cli);
         if let Some(target) = cli.target_ssim {
             let reference = jpeg::decode::reconstruct(&ci)?;
             let found = jpeg::target::find_quality(&reference, target, 100, |q| {
@@ -98,10 +118,8 @@ fn jpeg_to_jpeg(data: &[u8], cli: &Cli) -> Result<Encoded> {
         ci.requantize(cli.quality, !cli.no_trellis);
         return Ok(jpeg::encode::write_best(&ci).into());
     }
-    let mut img = parsed.into_image()?.oriented(orientation);
-    if cli.strip_icc {
-        img.meta = Default::default();
-    }
+    let mut img = upright(parsed.into_image()?, orientation);
+    apply_metadata_policy(&mut img.meta, cli);
     encode_jpeg_pixels(&img, cli, effective_q)
 }
 
@@ -171,9 +189,7 @@ fn run(job: &Job, cli: &Cli, data: &[u8]) -> Result<(Status, u64, Option<String>
         jpeg_to_jpeg(data, cli)?
     } else {
         let mut img = decode(data, in_fmt)?;
-        if cli.strip_icc {
-            img.meta = Default::default();
-        }
+        apply_metadata_policy(&mut img.meta, cli);
         encode(&img, out_fmt, cli)?
     };
     let note = encoded.note;

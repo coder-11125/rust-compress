@@ -564,6 +564,26 @@ pub(super) fn write_headers(ci: &CoefImage, sof_marker: u8, capacity: usize) -> 
     let mut out = Vec::with_capacity(capacity);
     out.extend_from_slice(&[0xFF, 0xD8]);
     segment(&mut out, 0xE0, &[b'J', b'F', b'I', b'F', 0, 1, 1, 0, 0, 1, 0, 1, 0, 0]);
+    // Descriptive metadata (only present when the caller asked to keep it). A segment holds at most
+    // 65533 bytes; anything larger (an EXIF block with a big thumbnail, say) cannot be carried.
+    let fits = |body: &[u8]| body.len() <= 65533;
+    if let Some(exif) = &ci.meta.exif {
+        let body = [&b"Exif\0\0"[..], exif].concat();
+        if fits(&body) {
+            segment(&mut out, 0xE1, &body);
+        }
+    }
+    if let Some(xmp) = &ci.meta.xmp {
+        let body = [&b"http://ns.adobe.com/xap/1.0/\0"[..], xmp].concat();
+        if fits(&body) {
+            segment(&mut out, 0xE1, &body);
+        }
+    }
+    for (marker, body) in &ci.meta.jpeg_extra {
+        if fits(body) {
+            segment(&mut out, *marker, body);
+        }
+    }
     if let Some(icc) = &ci.meta.icc {
         let chunks: Vec<&[u8]> = icc.chunks(65519).collect();
         for (i, c) in chunks.iter().enumerate() {

@@ -217,6 +217,27 @@ fn convert_pixel_row(row: &[u8], pw: usize, ctx: &Ctx, mut emit: impl FnMut(usiz
     }
 }
 
+/// Descriptive chunks are capped so a hostile file cannot make us hoard memory.
+const MAX_EXTRA_CHUNKS: usize = 512;
+const MAX_EXTRA_BYTES: usize = 8 << 20;
+/// Keyword of the `iTXt` chunk that carries an XMP packet.
+pub(crate) const XMP_KEYWORD: &[u8] = b"XML:com.adobe.xmp";
+
+/// The XMP packet inside an `iTXt` chunk body, if this chunk is the XMP one.
+/// Layout: keyword NUL, compression flag, compression method, language NUL, translated keyword NUL, text.
+fn xmp_text(body: &[u8]) -> Option<Vec<u8>> {
+    let rest = body.strip_prefix(XMP_KEYWORD)?.strip_prefix(&[0])?;
+    let (&flag, rest) = rest.split_first()?;
+    let (&method, rest) = rest.split_first()?;
+    let rest = &rest[rest.iter().position(|&b| b == 0)? + 1..];
+    let text = &rest[rest.iter().position(|&b| b == 0)? + 1..];
+    match (flag, method) {
+        (0, _) => Some(text.to_vec()),
+        (1, 0) => zlib_decompress(text, 0, 1 << 24).ok(),
+        _ => None,
+    }
+}
+
 pub fn decode(data: &[u8]) -> Result<Image> {
     if data.len() < 8 || data[..8] != SIGNATURE {
         return Err(Error::invalid("not a PNG file"));
@@ -227,6 +248,7 @@ pub fn decode(data: &[u8]) -> Result<Image> {
     let mut trns: Vec<u8> = Vec::new();
     let mut idat: Vec<u8> = Vec::new();
     let mut meta = Metadata::default();
+    let mut extra_bytes = 0usize;
     while pos + 12 <= data.len() {
         let len = u32::from_be_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
         let ty: [u8; 4] = data[pos + 4..pos + 8].try_into().unwrap();
@@ -236,7 +258,8 @@ pub fn decode(data: &[u8]) -> Result<Image> {
         let body = &data[pos + 8..pos + 8 + len];
         let crc = u32::from_be_bytes(data[pos + 8 + len..pos + 12 + len].try_into().unwrap());
         let ancillary = ty[0] & 0x20 != 0;
-        if crc32(&data[pos + 4..pos + 8 + len]) != crc && !ancillary {
+        let crc_ok = crc32(&data[pos + 4..pos + 8 + len]) == crc;
+        if !crc_ok && !ancillary {
             return Err(Error::invalid(format!("CRC mismatch in {} chunk", String::from_utf8_lossy(&ty))));
         }
         pos += 12 + len;
@@ -269,6 +292,19 @@ pub fn decode(data: &[u8]) -> Result<Image> {
                 }
             }
             b"sRGB" | b"gAMA" | b"cHRM" => meta.png_color.push((ty, body.to_vec())),
+            // Descriptive chunks are only worth keeping when their checksum says they are intact.
+            b"eXIf" if crc_ok && meta.exif.is_none() => meta.exif = Some(body.to_vec()),
+            b"iTXt" if crc_ok && xmp_text(body).is_some() => {
+                if meta.xmp.is_none() {
+                    meta.xmp = xmp_text(body);
+                }
+            }
+            b"tEXt" | b"zTXt" | b"iTXt" | b"tIME" | b"pHYs"
+                if crc_ok && meta.png_extra.len() < MAX_EXTRA_CHUNKS && extra_bytes < MAX_EXTRA_BYTES =>
+            {
+                extra_bytes += body.len();
+                meta.png_extra.push((ty, body.to_vec()));
+            }
             b"IEND" => break,
             _ => {
                 if !ancillary {

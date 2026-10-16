@@ -32,14 +32,39 @@ impl ColorType {
 /// Sanity limit on decoded size, to stop hostile headers from exhausting memory.
 pub const MAX_PIXELS: u64 = 150_000_000;
 
-/// Color-management metadata that must survive recompression to keep colors correct.
-/// Everything else (EXIF, XMP, comments, thumbnails) is dropped.
+/// Metadata carried through recompression.
+///
+/// The color-management part (`icc`, `png_color`) always survives, since dropping it shifts colors.
+/// The descriptive part (EXIF, XMP, comments, text chunks, ...) is collected too but discarded
+/// unless the user asks for `--keep-metadata`.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Metadata {
     /// Raw ICC profile.
     pub icc: Option<Vec<u8>>,
     /// PNG colorimetry chunks (`sRGB`, `gAMA`, `cHRM`) as (type, body).
     pub png_color: Vec<([u8; 4], Vec<u8>)>,
+    /// EXIF as a bare TIFF block; converts between a PNG `eXIf` chunk and a JPEG APP1 segment.
+    pub exif: Option<Vec<u8>>,
+    /// XMP packet (the XML text); converts between a PNG `iTXt` chunk and a JPEG APP1 segment.
+    pub xmp: Option<Vec<u8>>,
+    /// JPEG-only segments (comments, Photoshop/IPTC blocks) as (marker, body).
+    pub jpeg_extra: Vec<(u8, Vec<u8>)>,
+    /// PNG-only chunks (text, modification time, pixel density) as (type, body).
+    pub png_extra: Vec<([u8; 4], Vec<u8>)>,
+}
+
+impl Metadata {
+    /// Forget everything that is not needed to display the image correctly.
+    pub fn drop_descriptive(&mut self) {
+        self.exif = None;
+        self.xmp = None;
+        self.jpeg_extra.clear();
+        self.png_extra.clear();
+    }
+
+    pub fn has_descriptive(&self) -> bool {
+        self.exif.is_some() || self.xmp.is_some() || !self.jpeg_extra.is_empty() || !self.png_extra.is_empty()
+    }
 }
 
 /// Interleaved samples, row-major. 16-bit samples are stored big-endian.

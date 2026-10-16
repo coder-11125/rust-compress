@@ -85,6 +85,12 @@ pub struct Cli {
     #[arg(long)]
     pub strip_icc: bool,
 
+    /// Keep descriptive metadata: EXIF, XMP, comments, PNG text chunks and pixel density. By default only
+    /// color information (ICC profile, PNG color chunks) is kept. EXIF and XMP also carry over when
+    /// converting between PNG and JPEG; orientation is reset once it has been baked into the pixels.
+    #[arg(long)]
+    pub keep_metadata: bool,
+
     /// Background color (hex RRGGBB) used when transparency must be flattened (e.g. PNG -> JPEG).
     #[arg(long, default_value = "ffffff", value_parser = parse_hex_color)]
     pub background: [u8; 3],

@@ -242,6 +242,35 @@ struct Decoder<'a> {
     scans_seen: usize,
     /// ICC profile fragments as (sequence number, bytes).
     icc_parts: Vec<(u8, Vec<u8>)>,
+    /// Descriptive segments (EXIF/XMP/Photoshop APP segments, comments) as (marker, body).
+    extras: Vec<(u8, Vec<u8>)>,
+}
+
+const EXIF_PREFIX: &[u8] = b"Exif\0\0";
+const XMP_PREFIX: &[u8] = b"http://ns.adobe.com/xap/1.0/\0";
+const PHOTOSHOP_PREFIX: &[u8] = b"Photoshop 3.0\0";
+/// Descriptive metadata is capped so a hostile file cannot make us hoard memory.
+const MAX_EXTRA_SEGMENTS: usize = 256;
+
+/// Assemble the `Metadata` of a decoded file from the ICC fragments and descriptive segments it held.
+fn build_meta(mut icc_parts: Vec<(u8, Vec<u8>)>, extras: Vec<(u8, Vec<u8>)>) -> Metadata {
+    icc_parts.sort_by_key(|p| p.0);
+    let mut meta = Metadata {
+        icc: (!icc_parts.is_empty()).then(|| icc_parts.into_iter().flat_map(|p| p.1).collect()),
+        ..Default::default()
+    };
+    for (marker, body) in extras {
+        match marker {
+            0xE1 if body.starts_with(EXIF_PREFIX) && meta.exif.is_none() => meta.exif = Some(body[6..].to_vec()),
+            0xE1 if body.starts_with(XMP_PREFIX) && meta.xmp.is_none() => {
+                meta.xmp = Some(body[XMP_PREFIX.len()..].to_vec());
+            }
+            0xED if body.starts_with(PHOTOSHOP_PREFIX) => meta.jpeg_extra.push((marker, body)),
+            0xFE => meta.jpeg_extra.push((marker, body)),
+            _ => {}
+        }
+    }
+    meta
 }
 
 fn be16(d: &[u8], at: usize) -> Result<usize> {
@@ -302,6 +331,7 @@ pub fn reconstruct(ci: &CoefImage) -> Result<Image> {
         adobe_transform: None,
         scans_seen: 1,
         icc_parts: Vec::new(),
+        extras: Vec::new(),
     };
     d.finish()
 }
@@ -335,6 +365,7 @@ pub fn parse(data: &[u8]) -> Result<Parsed<'_>> {
         adobe_transform: None,
         scans_seen: 0,
         icc_parts: Vec::new(),
+        extras: Vec::new(),
     };
     d.run()?;
     if d.scans_seen == 0 || d.comps.is_empty() {
@@ -386,12 +417,7 @@ impl Parsed<'_> {
             }
             qtables[c.tq] = Some(t8);
         }
-        let mut icc_parts = d.icc_parts;
-        icc_parts.sort_by_key(|p| p.0);
-        let meta = Metadata {
-            icc: (!icc_parts.is_empty()).then(|| icc_parts.into_iter().flat_map(|p| p.1).collect()),
-            png_color: Vec::new(),
-        };
+        let meta = build_meta(d.icc_parts, d.extras);
         Ok(CoefImage {
             width: d.width,
             height: d.height,
@@ -514,6 +540,7 @@ impl Decoder<'_> {
                     self.icc_parts.push((body[12], body[14..].to_vec()));
                 }
                 0xEE if body.len() >= 12 && &body[..5] == b"Adobe" => self.adobe_transform = Some(body[11]),
+                0xE1 | 0xED | 0xFE if self.extras.len() < MAX_EXTRA_SEGMENTS => self.extras.push((m, body.to_vec())),
                 0xDA => {
                     self.read_sos(body)?;
                     self.scans_seen += 1;
@@ -781,12 +808,7 @@ impl Decoder<'_> {
             }
             full.push(upsample(plane, *stride, cw, ch, self.hmax / c.h, self.vmax / c.v, w, h));
         }
-        let mut icc_parts = self.icc_parts;
-        icc_parts.sort_by_key(|p| p.0);
-        let meta = Metadata {
-            icc: (!icc_parts.is_empty()).then(|| icc_parts.into_iter().flat_map(|p| p.1).collect()),
-            png_color: Vec::new(),
-        };
+        let meta = build_meta(self.icc_parts, self.extras);
         if full.len() == 1 {
             let mut img = Image::new(w as u32, h as u32, ColorType::Gray, 8, full.pop().unwrap())?;
             img.meta = meta;
