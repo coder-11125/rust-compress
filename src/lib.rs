@@ -9,4 +9,5 @@ pub mod metrics;
 pub mod pipeline;
 pub mod png;
 pub mod report;
+pub mod resize;
 pub mod util;

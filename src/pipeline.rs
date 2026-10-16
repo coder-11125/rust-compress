@@ -6,7 +6,7 @@ use crate::error::{Error, Result};
 use crate::exif;
 use crate::image::{Image, Metadata};
 use crate::report::{Report, Status};
-use crate::{jpeg, png};
+use crate::{jpeg, png, resize};
 use std::fs;
 use std::io::{Read, Write};
 use std::path::Path;
@@ -15,12 +15,45 @@ use std::path::Path;
 struct Encoded {
     bytes: Vec<u8>,
     note: Option<String>,
+    /// The user asked for a change (resizing) that the original bytes cannot satisfy, so the
+    /// never-grow fallback to the original file must not apply.
+    forced: bool,
 }
 
 impl From<Vec<u8>> for Encoded {
     fn from(bytes: Vec<u8>) -> Self {
-        Encoded { bytes, note: None }
+        Encoded { bytes, note: None, forced: false }
     }
+}
+
+impl Encoded {
+    /// Record that the image was resized, folding the description into the report note.
+    fn resized(mut self, what: Option<String>) -> Self {
+        if let Some(what) = what {
+            self.forced = true;
+            self.note = Some(match self.note.take() {
+                Some(n) => format!("{what}, {n}"),
+                None => what,
+            });
+        }
+        self
+    }
+}
+
+/// Shrink `img` as requested by `--resize`. Returns the image and a report note if it changed.
+fn resize_image(img: Image, cli: &Cli) -> (Image, Option<String>) {
+    let Some(spec) = cli.resize else { return (img, None) };
+    let (w, h) = (img.width, img.height);
+    let (nw, nh) = resize::target_size(spec, w, h);
+    if (nw, nh) == (w, h) {
+        return (img, None);
+    }
+    let mut out = resize::resize(&img, nw, nh);
+    let fix = exif::Fix { dims: Some((nw, nh)), drop_thumbnail: true, ..Default::default() };
+    if let Some(e) = out.meta.exif.as_mut() {
+        exif::tidy(e, fix);
+    }
+    (out, Some(format!("resized {w}x{h} -> {nw}x{nh}")))
 }
 
 /// Encode pixels as JPEG, honoring `--target-ssim` when given.
@@ -33,7 +66,7 @@ fn encode_jpeg_pixels(img: &Image, cli: &Cli, quality: u8) -> Result<Encoded> {
                 jpeg::encode::build_coefs(&reference, &jpeg_options(cli, q))
             });
             let note = format!("q{}, ssim {:.4}", found.quality, found.ssim);
-            Ok(Encoded { bytes: jpeg::encode::write_best(&found.coefs), note: Some(note) })
+            Ok(Encoded { bytes: jpeg::encode::write_best(&found.coefs), note: Some(note), forced: false })
         }
     }
 }
@@ -95,6 +128,9 @@ fn jpeg_to_jpeg(data: &[u8], cli: &Cli) -> Result<Encoded> {
     let is444 = three && info.sampling.iter().all(|&s| s == (1, 1));
     let is420 = three && info.sampling[0] == (2, 2) && info.sampling[1..].iter().all(|&s| s == (1, 1));
     let effective_q = cli.quality.min(info.source_quality);
+    // Dimensions as they will look once the orientation is applied.
+    let (ow, oh) = if orientation >= 5 { (info.height, info.width) } else { (info.width, info.height) };
+    let resizing = cli.resize.is_some_and(|s| resize::target_size(s, ow as u32, oh as u32) != (ow as u32, oh as u32));
     let resample = three
         && match cli.subsampling {
             // With a quality search the final quality is unknown up front: keep the source layout.
@@ -102,7 +138,7 @@ fn jpeg_to_jpeg(data: &[u8], cli: &Cli) -> Result<Encoded> {
             SubsamplingArg::S420 => !is420,
             SubsamplingArg::S444 => !is444,
         };
-    if orientation == 1 && !resample && !info.coded_rgb {
+    if orientation == 1 && !resample && !info.coded_rgb && !resizing {
         let mut ci = parsed.into_coefs()?;
         apply_metadata_policy(&mut ci.meta, cli);
         if let Some(target) = cli.target_ssim {
@@ -113,14 +149,16 @@ fn jpeg_to_jpeg(data: &[u8], cli: &Cli) -> Result<Encoded> {
                 c
             });
             let note = format!("q{}, ssim {:.4}", found.quality, found.ssim);
-            return Ok(Encoded { bytes: jpeg::encode::write_best(&found.coefs), note: Some(note) });
+            return Ok(Encoded { bytes: jpeg::encode::write_best(&found.coefs), note: Some(note), forced: false });
         }
         ci.requantize(cli.quality, !cli.no_trellis);
         return Ok(jpeg::encode::write_best(&ci).into());
     }
-    let mut img = upright(parsed.into_image()?, orientation);
+    let img = upright(parsed.into_image()?, orientation);
+    let mut img = img;
     apply_metadata_policy(&mut img.meta, cli);
-    encode_jpeg_pixels(&img, cli, effective_q)
+    let (img, resized) = resize_image(img, cli);
+    Ok(encode_jpeg_pixels(&img, cli, effective_q)?.resized(resized))
 }
 
 fn encode(img: &Image, fmt: Format, cli: &Cli) -> Result<Encoded> {
@@ -190,12 +228,14 @@ fn run(job: &Job, cli: &Cli, data: &[u8]) -> Result<(Status, u64, Option<String>
     } else {
         let mut img = decode(data, in_fmt)?;
         apply_metadata_policy(&mut img.meta, cli);
-        encode(&img, out_fmt, cli)?
+        let (img, resized) = resize_image(img, cli);
+        encode(&img, out_fmt, cli)?.resized(resized)
     };
     let note = encoded.note;
+    let forced = encoded.forced;
     let encoded = encoded.bytes;
     let same_format = in_fmt == out_fmt;
-    if same_format && encoded.len() >= data.len() {
+    if same_format && !forced && encoded.len() >= data.len() {
         // Never make the file bigger. Keep the original bytes (copy them when writing elsewhere).
         if !cli.in_place && !cli.dry_run {
             write_output(&job.output, data)?;

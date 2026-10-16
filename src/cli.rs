@@ -85,6 +85,12 @@ pub struct Cli {
     #[arg(long)]
     pub strip_icc: bool,
 
+    /// Shrink images to fit: `WIDTHxHEIGHT` (a box; aspect ratio is kept), `WIDTHx`, `xHEIGHT`, or a
+    /// percentage such as `50%`. Images are never enlarged. Resizing is not lossless and, unlike the
+    /// default, may make a file's pixels differ from the original; the never-grow rule does not apply.
+    #[arg(long, value_name = "SIZE", value_parser = crate::resize::parse)]
+    pub resize: Option<crate::resize::Spec>,
+
     /// Keep descriptive metadata: EXIF, XMP, comments, PNG text chunks and pixel density. By default only
     /// color information (ICC profile, PNG color chunks) is kept. EXIF and XMP also carry over when
     /// converting between PNG and JPEG; orientation is reset once it has been baked into the pixels.
