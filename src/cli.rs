@@ -42,7 +42,7 @@ pub struct Cli {
     #[arg(long, conflicts_with = "output")]
     pub in_place: bool,
 
-    /// JPEG quality ceiling (1-100). JPEG sources at or below it are transcoded losslessly; better ones are re-quantized down to it.
+    /// Quality (1-100): the JPEG quality ceiling (JPEG sources at or below it are transcoded losslessly; better ones are re-quantized down to it), or the lossy WebP quality with --lossy.
     #[arg(short, long, default_value_t = 80, value_parser = clap::value_parser!(u8).range(1..=100))]
     pub quality: u8,
 
@@ -54,15 +54,15 @@ pub struct Cli {
     #[arg(long, value_enum, default_value_t = SubsamplingArg::Auto)]
     pub subsampling: SubsamplingArg,
 
-    /// PNG: allow lossy palette quantization for much smaller files.
+    /// Allow lossy output: PNG palette quantization, or lossy (VP8) WebP when the output is WebP.
     #[arg(long)]
     pub lossy: bool,
 
-    /// With --lossy: number of palette colors (2-256).
+    /// With --lossy on PNG: number of palette colors (2-256).
     #[arg(long, default_value_t = 256, value_parser = clap::value_parser!(u16).range(2..=256))]
     pub colors: u16,
 
-    /// With --lossy: dithering strength 0.0-1.0 (0 disables).
+    /// With --lossy on PNG: dithering strength 0.0-1.0 (0 disables).
     #[arg(long, default_value_t = 0.5)]
     pub dither: f32,
 

@@ -538,6 +538,22 @@ pub fn decode(data: &[u8]) -> Result<Decoded> {
     if (width as u64) * (height as u64) > crate::image::MAX_PIXELS {
         return Err(Error::invalid("unreasonable image dimensions"));
     }
+    let argb = decode_body(&mut r, width, height)?;
+    Ok(Decoded { width, height, has_alpha, argb })
+}
+
+/// Decode a bare VP8L image stream (transforms plus pixels, no signature or size header) of a
+/// known size, as used for the alpha plane of lossy WebP files.
+pub fn decode_headerless(data: &[u8], width: usize, height: usize) -> Result<Vec<u32>> {
+    if width == 0 || height == 0 || (width as u64) * (height as u64) > crate::image::MAX_PIXELS {
+        return Err(Error::invalid("unreasonable image dimensions"));
+    }
+    let mut r = LsbReader::new(data);
+    r.refill();
+    decode_body(&mut r, width, height)
+}
+
+fn decode_body(r: &mut LsbReader, width: usize, height: usize) -> Result<Vec<u32>> {
     let mut transforms: Vec<(Transform, usize)> = Vec::new();
     let mut xsize = width;
     let mut seen = [false; 4];
@@ -553,7 +569,7 @@ pub fn decode(data: &[u8]) -> Result<Decoded> {
         match ty {
             0 | 1 => {
                 let bits = r.take(3) + 2;
-                let data = read_image(&mut r, div_round_up(xsize, bits), div_round_up(height, bits), false)?;
+                let data = read_image(r, div_round_up(xsize, bits), div_round_up(height, bits), false)?;
                 transforms.push((
                     if ty == 0 { Transform::Predictor { bits, data } } else { Transform::CrossColor { bits, data } },
                     xsize,
@@ -562,7 +578,7 @@ pub fn decode(data: &[u8]) -> Result<Decoded> {
             2 => transforms.push((Transform::SubtractGreen, xsize)),
             _ => {
                 let n = r.take(8) as usize + 1;
-                let mut palette = read_image(&mut r, n, 1, false)?;
+                let mut palette = read_image(r, n, 1, false)?;
                 for i in 1..n {
                     palette[i] = add_pixels(palette[i], palette[i - 1]);
                 }
@@ -577,7 +593,7 @@ pub fn decode(data: &[u8]) -> Result<Decoded> {
             }
         }
     }
-    let mut px = read_image(&mut r, xsize, height, true)?;
+    let mut px = read_image(r, xsize, height, true)?;
     for (t, w) in transforms.into_iter().rev() {
         match t {
             Transform::Predictor { bits, data } => inverse_predictor(&mut px, w, height, bits, &data),
@@ -588,7 +604,7 @@ pub fn decode(data: &[u8]) -> Result<Decoded> {
             }
         }
     }
-    Ok(Decoded { width, height, has_alpha, argb: px })
+    Ok(px)
 }
 
 #[cfg(test)]

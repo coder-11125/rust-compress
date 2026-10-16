@@ -10,6 +10,8 @@
   and lossy/animated WebP are passed through untouched instead of failing.
 - `--keep-metadata` (EXIF, XMP, comments, PNG text/time/density, converted between formats),
   `--resize` (Lanczos-3 downscale), and stdin/stdout support (`-` as input, `-o -`).
+- Lossy WebP (VP8), written from scratch: a decoder that matches libwebp bit for bit and a
+  rate-distortion encoder (`-f webp --lossy -q N`) with a lossless `ALPH` alpha channel.
 - Hostile-input mutation tests for every decoder.
 
 ## 0.1.0
