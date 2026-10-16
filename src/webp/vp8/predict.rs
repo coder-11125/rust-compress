@@ -215,3 +215,47 @@ pub fn predict_4x4(ws: &mut [u8], at: usize, mode: u8) {
         ws[at + y * WS..at + y * WS + 4].copy_from_slice(row);
     }
 }
+
+/// Fill the border of a workspace for the macroblock at (mbx, mby): 127 above the frame, 129 left
+/// of it, otherwise pixels already reconstructed (unfiltered) in the plane.
+#[allow(clippy::too_many_arguments)]
+pub fn fill_borders(
+    ws: &mut [u8],
+    plane: &[u8],
+    stride: usize,
+    mbx: usize,
+    mby: usize,
+    mbw: usize,
+    size: usize,
+    above_right: bool,
+) {
+    let x0 = mbx * size;
+    let y0 = mby * size;
+    // Row 0: top-left corner, the pixels above, and (luma) the pixels above-right.
+    let cols = 1 + size + if above_right { 4 } else { 0 };
+    if mby == 0 {
+        ws[..cols].fill(127);
+    } else {
+        let row = (y0 - 1) * stride;
+        ws[0] = if mbx == 0 { 129 } else { plane[row + x0 - 1] };
+        ws[1..=size].copy_from_slice(&plane[row + x0..row + x0 + size]);
+        if above_right {
+            if mbx + 1 < mbw {
+                ws[size + 1..size + 5].copy_from_slice(&plane[row + x0 + size..row + x0 + size + 4]);
+            } else {
+                let last = plane[row + x0 + size - 1];
+                ws[size + 1..size + 5].fill(last);
+            }
+        }
+    }
+    for r in 0..size {
+        ws[(r + 1) * WS] = if mbx == 0 { 129 } else { plane[(y0 + r) * stride + x0 - 1] };
+    }
+}
+
+pub fn store_block(ws: &[u8], plane: &mut [u8], stride: usize, mbx: usize, mby: usize, size: usize) {
+    for r in 0..size {
+        let dst = (mby * size + r) * stride + mbx * size;
+        plane[dst..dst + size].copy_from_slice(&ws[ORIGIN + r * WS..ORIGIN + r * WS + size]);
+    }
+}

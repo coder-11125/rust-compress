@@ -3,7 +3,7 @@
 
 use super::boolcoder::BoolDecoder;
 use super::loopfilter::{FilterInfo, Plane, filter_macroblock};
-use super::predict::{self, ORIGIN, WS};
+use super::predict::{self, ORIGIN, WS, fill_borders, store_block};
 use super::tables::*;
 use super::transform::{idct_add, iwht};
 use crate::error::{Error, Result};
@@ -20,11 +20,11 @@ pub struct Frame {
     pub uv_stride: usize,
 }
 
-const KF_YMODE_TREE: [i8; 8] =
+pub const KF_YMODE_TREE: [i8; 8] =
     [-(B_PRED as i8), 2, 4, 6, -(DC_PRED as i8), -(V_PRED as i8), -(H_PRED as i8), -(TM_PRED as i8)];
-const UV_MODE_TREE: [i8; 6] = [-(DC_PRED as i8), 2, -(V_PRED as i8), 4, -(H_PRED as i8), -(TM_PRED as i8)];
-const SEGMENT_TREE: [i8; 6] = [2, 4, 0, -1, -2, -3];
-const BMODE_TREE: [i8; 18] = [
+pub const UV_MODE_TREE: [i8; 6] = [-(DC_PRED as i8), 2, -(V_PRED as i8), 4, -(H_PRED as i8), -(TM_PRED as i8)];
+pub const SEGMENT_TREE: [i8; 6] = [2, 4, 0, -1, -2, -3];
+pub const BMODE_TREE: [i8; 18] = [
     -(B_DC_PRED as i8),
     2,
     -(B_TM_PRED as i8),
@@ -68,11 +68,24 @@ struct FilterHeader {
     mode_delta: [i32; 4],
 }
 
-#[derive(Default, Clone, Copy)]
-struct Dequant {
-    y1: [i32; 2],
-    y2: [i32; 2],
-    uv: [i32; 2],
+/// Dequantization factors `[dc, ac]` for the three kinds of block.
+#[derive(Default, Clone, Copy, Debug)]
+pub struct Dequant {
+    pub y1: [i32; 2],
+    pub y2: [i32; 2],
+    pub uv: [i32; 2],
+}
+
+/// The factors for quantizer index `q` and the per-plane index deltas of the frame header.
+pub fn dequant_for(q: i32, dy1_dc: i32, dy2_dc: i32, dy2_ac: i32, duv_dc: i32, duv_ac: i32) -> Dequant {
+    let clip = |v: i32, max: i32| v.clamp(0, max) as usize;
+    let mut d = Dequant {
+        y1: [DC_QUANT[clip(q + dy1_dc, 127)], AC_QUANT[clip(q, 127)]],
+        y2: [DC_QUANT[clip(q + dy2_dc, 127)] * 2, (AC_QUANT[clip(q + dy2_ac, 127)] * 101581) >> 16],
+        uv: [DC_QUANT[clip(q + duv_dc, 117)], AC_QUANT[clip(q + duv_ac, 127)]],
+    };
+    d.y2[1] = d.y2[1].max(8);
+    d
 }
 
 #[derive(Clone, Copy, Default)]
@@ -146,20 +159,13 @@ fn parse_dequant(br: &mut BoolDecoder, segment: &SegmentHeader) -> [Dequant; 4] 
     let dy2_ac = read_optional_delta(br, 4);
     let duv_dc = read_optional_delta(br, 4);
     let duv_ac = read_optional_delta(br, 4);
-    let clip = |v: i32, max: i32| v.clamp(0, max) as usize;
     std::array::from_fn(|s| {
         let q = if segment.enabled {
             if segment.absolute { segment.quant[s] } else { base + segment.quant[s] }
         } else {
             base
         };
-        let mut d = Dequant {
-            y1: [DC_QUANT[clip(q + dy1_dc, 127)], AC_QUANT[clip(q, 127)]],
-            y2: [DC_QUANT[clip(q + dy2_dc, 127)] * 2, (AC_QUANT[clip(q + dy2_ac, 127)] * 101581) >> 16],
-            uv: [DC_QUANT[clip(q + duv_dc, 117)], AC_QUANT[clip(q + duv_ac, 127)]],
-        };
-        d.y2[1] = d.y2[1].max(8);
-        d
+        dequant_for(q, dy1_dc, dy2_dc, dy2_ac, duv_dc, duv_ac)
     })
 }
 
@@ -382,50 +388,6 @@ fn parse_residuals(
         }
     }
     any
-}
-
-/// Fill the border of a workspace for the macroblock at (mbx, mby): 127 above the frame, 129 left
-/// of it, otherwise pixels already reconstructed (unfiltered) in the plane.
-#[allow(clippy::too_many_arguments)]
-fn fill_borders(
-    ws: &mut [u8],
-    plane: &[u8],
-    stride: usize,
-    mbx: usize,
-    mby: usize,
-    mbw: usize,
-    size: usize,
-    above_right: bool,
-) {
-    let x0 = mbx * size;
-    let y0 = mby * size;
-    // Row 0: top-left corner, the pixels above, and (luma) the pixels above-right.
-    let cols = 1 + size + if above_right { 4 } else { 0 };
-    if mby == 0 {
-        ws[..cols].fill(127);
-    } else {
-        let row = (y0 - 1) * stride;
-        ws[0] = if mbx == 0 { 129 } else { plane[row + x0 - 1] };
-        ws[1..=size].copy_from_slice(&plane[row + x0..row + x0 + size]);
-        if above_right {
-            if mbx + 1 < mbw {
-                ws[size + 1..size + 5].copy_from_slice(&plane[row + x0 + size..row + x0 + size + 4]);
-            } else {
-                let last = plane[row + x0 + size - 1];
-                ws[size + 1..size + 5].fill(last);
-            }
-        }
-    }
-    for r in 0..size {
-        ws[(r + 1) * WS] = if mbx == 0 { 129 } else { plane[(y0 + r) * stride + x0 - 1] };
-    }
-}
-
-fn store_block(ws: &[u8], plane: &mut [u8], stride: usize, mbx: usize, mby: usize, size: usize) {
-    for r in 0..size {
-        let dst = (mby * size + r) * stride + mbx * size;
-        plane[dst..dst + size].copy_from_slice(&ws[ORIGIN + r * WS..ORIGIN + r * WS + size]);
-    }
 }
 
 fn add_blocks(ws: &mut [u8], coefs: &[i32; 400], first_block: usize, blocks_per_row: usize, count: usize) {
