@@ -5,6 +5,7 @@
 //! per-tile predictor (and optionally cross-colour) for everything else. The transformed pixels go
 //! through LZ77 with plane-aware distance codes, an optional colour cache and canonical prefix codes.
 
+use super::cluster::{self, ALPHABETS, Sparse};
 use super::vp8l::{DISTANCE_MAP, SIGNATURE, cache_index, div_round_up, predict};
 use crate::util::bitio::LsbWriter;
 use crate::util::huffman::{build_lengths, lsb_codes};
@@ -95,6 +96,96 @@ fn predictor_transform(src: &[u32], w: usize, h: usize, bits: u32) -> (Vec<u32>,
         }
     });
     (res, modes.into_iter().map(|m| 0xFF00_0000 | m << 8).collect())
+}
+
+/// `(t * c) >> 5` with both operands as signed bytes: the cross-colour correction term.
+#[inline(always)]
+fn color_delta(t: i8, c: i8) -> i32 {
+    (t as i32 * c as i32) >> 5
+}
+
+/// Shannon entropy in bits of a 256-bin histogram.
+fn entropy256(hist: &[u32; 256]) -> f64 {
+    let total: f64 = hist.iter().map(|&c| c as f64).sum();
+    if total == 0.0 {
+        return 0.0;
+    }
+    hist.iter().filter(|&&c| c > 0).map(|&c| c as f64 * (total / c as f64).log2()).sum()
+}
+
+/// Best of `candidates` by `cost`, then refined by +-3 around the winner.
+fn best_coefficient(candidates: impl Iterator<Item = i32>, mut cost: impl FnMut(i8) -> f64) -> i8 {
+    let mut best = (f64::MAX, 0i32);
+    for t in candidates {
+        let c = cost(t as i8);
+        if c < best.0 || (c == best.0 && t.abs() < best.1.abs()) {
+            best = (c, t);
+        }
+    }
+    for t in best.1 - 3..=best.1 + 3 {
+        if (-128..128).contains(&t) {
+            let c = cost(t as i8);
+            if c < best.0 {
+                best = (c, t);
+            }
+        }
+    }
+    best.1 as i8
+}
+
+/// Per-tile decorrelation of red and blue from green (and blue from red). Returns the corrected
+/// pixels and the coefficient image (red = red_to_blue, green = green_to_blue, blue = green_to_red).
+fn cross_color_transform(src: &[u32], w: usize, h: usize, bits: u32) -> (Vec<u32>, Vec<u32>) {
+    let (tw, th) = (div_round_up(w, bits), div_round_up(h, bits));
+    let tile = 1usize << bits;
+    let coefs: Vec<(i8, i8, i8)> = (0..th)
+        .into_par_iter()
+        .flat_map_iter(|ty| {
+            (0..tw).map(move |tx| {
+                let (x0, y0) = (tx * tile, ty * tile);
+                let (x1, y1) = ((x0 + tile).min(w), (y0 + tile).min(h));
+                let px = || (y0..y1).flat_map(move |y| (x0..x1).map(move |x| src[y * w + x]));
+                let hist_of = |f: &dyn Fn(u32) -> u8| {
+                    let mut hist = [0u32; 256];
+                    px().for_each(|p| hist[f(p) as usize] += 1);
+                    entropy256(&hist)
+                };
+                let sweep = || (-64..=64).step_by(8);
+                let g2r = best_coefficient(sweep(), |t| {
+                    hist_of(&|p| ((p >> 16) as i32 - color_delta(t, (p >> 8) as i8)) as u8)
+                });
+                let g2b =
+                    best_coefficient(sweep(), |t| hist_of(&|p| (p as i32 - color_delta(t, (p >> 8) as i8)) as u8));
+                let r2b = best_coefficient(sweep(), |t| {
+                    hist_of(&|p| (p as i32 - color_delta(g2b, (p >> 8) as i8) - color_delta(t, (p >> 16) as i8)) as u8)
+                });
+                // Zero coefficients are free to code; only keep ones that pay for themselves.
+                let base = hist_of(&|p| (p >> 16) as u8) + hist_of(&|p| p as u8);
+                let tuned = hist_of(&|p| ((p >> 16) as i32 - color_delta(g2r, (p >> 8) as i8)) as u8)
+                    + hist_of(&|p| {
+                        (p as i32 - color_delta(g2b, (p >> 8) as i8) - color_delta(r2b, (p >> 16) as i8)) as u8
+                    });
+                if tuned + 12.0 < base { (g2r, g2b, r2b) } else { (0, 0, 0) }
+            })
+        })
+        .collect();
+    let mut out = vec![0u32; src.len()];
+    out.par_chunks_mut(w).enumerate().for_each(|(y, row)| {
+        for x in 0..w {
+            let p = src[y * w + x];
+            let (g2r, g2b, r2b) = coefs[(y >> bits) * tw + (x >> bits)];
+            let green = (p >> 8) as i8;
+            let red = (p >> 16) as u8;
+            let new_red = (red as i32 - color_delta(g2r, green)) as u8;
+            let new_blue = (p as i32 - color_delta(g2b, green) - color_delta(r2b, red as i8)) as u8;
+            row[x] = (p & 0xFF00_FF00) | (new_red as u32) << 16 | new_blue as u32;
+        }
+    });
+    let data = coefs
+        .into_iter()
+        .map(|(g2r, g2b, r2b)| 0xFF00_0000 | (r2b as u8 as u32) << 16 | (g2b as u8 as u32) << 8 | g2r as u8 as u32)
+        .collect();
+    (out, data)
 }
 
 /// The distinct colours in ascending order, or `None` when there are more than 256.
@@ -241,6 +332,191 @@ fn parse(px: &[u32], xsize: usize, depth: usize, lazy: bool) -> Vec<Step> {
         }
         i += len;
     }
+    steps
+}
+
+// ------------------------------------------------------------------ optimal parse
+
+/// Matches at least this long are taken as they come: no candidate search inside them.
+const LONG_MATCH: usize = 192;
+
+/// Per-symbol costs in bits, derived from the statistics of a previous parse.
+struct Costs {
+    green: Vec<f32>,
+    red: Vec<f32>,
+    blue: Vec<f32>,
+    alpha: Vec<f32>,
+    dist: Vec<f32>,
+}
+
+fn costs_from(h: &Hist) -> Costs {
+    let cost = |f: &Vec<u32>| -> Vec<f32> {
+        let total = f.iter().map(|&x| x as f64).sum::<f64>().max(1.0);
+        f.iter().map(|&x| if x > 0 { (total / x as f64).log2() as f32 } else { (total.log2() + 3.0) as f32 }).collect()
+    };
+    Costs { green: cost(&h.h[0]), red: cost(&h.h[1]), blue: cost(&h.h[2]), alpha: cost(&h.h[3]), dist: cost(&h.h[4]) }
+}
+
+/// Candidate matches for each position, found with hash chains over pixel pairs. Every pixel must be
+/// visited in order (`candidates` also inserts the position).
+struct Finder {
+    head: Vec<u32>,
+    prev: Vec<u32>,
+    depth: usize,
+}
+
+impl Finder {
+    fn new(depth: usize) -> Self {
+        Finder { head: vec![u32::MAX; 1 << HASH_BITS], prev: vec![u32::MAX; WINDOW], depth }
+    }
+
+    /// Append (length, distance) candidates at `i`: strictly longer matches found along the chain
+    /// (nearest first) plus the common 2-D neighbours, then index `i`.
+    fn candidates(&mut self, px: &[u32], i: usize, xsize: usize, out: &mut Vec<(usize, usize)>) {
+        let n = px.len();
+        let max = (n - i).min(MAX_LEN);
+        out.clear();
+        if max >= 3 && i + 1 < n {
+            let mut best = 2;
+            for d in [1, xsize.saturating_sub(1), xsize, xsize + 1] {
+                if d >= 1 && d <= i && d <= MAX_DIST {
+                    let l = common_len(px, i - d, i, max);
+                    if l >= 3 {
+                        out.push((l, d));
+                        best = best.max(l);
+                    }
+                }
+            }
+            let mut cand = self.head[hash_pair(px[i], px[i + 1])];
+            let mut left = self.depth;
+            while cand != u32::MAX && left > 0 {
+                let c = cand as usize;
+                if c >= i || i - c > MAX_DIST {
+                    break;
+                }
+                if px[c + best.min(max - 1)] == px[i + best.min(max - 1)] {
+                    let l = common_len(px, c, i, max);
+                    if l > best {
+                        best = l;
+                        out.push((l, i - c));
+                        if l == max {
+                            break;
+                        }
+                    }
+                }
+                let next = self.prev[c & (WINDOW - 1)];
+                if next == u32::MAX || next as usize >= c {
+                    break;
+                }
+                cand = next;
+                left -= 1;
+            }
+        }
+        self.insert(px, i);
+    }
+
+    fn insert(&mut self, px: &[u32], i: usize) {
+        if i + 1 < px.len() {
+            let h = hash_pair(px[i], px[i + 1]);
+            self.prev[i & (WINDOW - 1)] = self.head[h];
+            self.head[h] = i as u32;
+        }
+    }
+}
+
+/// Lengths worth considering for a match whose longest usable length is `max`: all short ones,
+/// then the ends of each length-code bucket (inside a bucket only the extra bits change).
+fn lengths_to_try(max: usize, out: &mut Vec<usize>) {
+    out.clear();
+    for l in 3..=max.min(12) {
+        out.push(l);
+    }
+    let mut l = 13;
+    while l <= max {
+        out.push(l);
+        l += 1 + (l >> 3).max(1);
+    }
+    if max > 12 && out.last() != Some(&max) {
+        out.push(max);
+    }
+}
+
+/// Cheapest parse under `costs`: shortest path over literal/cache pixels and candidate copies.
+fn optimal_parse(
+    px: &[u32],
+    xsize: usize,
+    depth: usize,
+    cache_bits: u32,
+    costs: &Costs,
+    plane: &[u8; 8 * 16],
+) -> Vec<Step> {
+    let n = px.len();
+    let mut cost = vec![f32::INFINITY; n + 1];
+    let mut step = vec![Step { len: 1, dist: 0 }; n + 1];
+    cost[0] = 0.0;
+    let mut finder = Finder::new(depth);
+    let mut cache = vec![0u32; if cache_bits > 0 { 1 << cache_bits } else { 0 }];
+    let mut cands = Vec::new();
+    let mut lens = Vec::new();
+    let cache_base = NUM_LITERAL + NUM_LENGTH;
+    // Inside a very long copy, re-measuring matches at every pixel is quadratic for little gain.
+    let mut skip_until = 0usize;
+    for i in 0..n {
+        let ci = cost[i];
+        let p = px[i];
+        // A single pixel: a cache hit if the pixel is where the cache says, else a literal.
+        let single = if cache_bits > 0 && cache[cache_index(p, cache_bits)] == p {
+            costs.green[cache_base + cache_index(p, cache_bits)]
+        } else {
+            costs.green[((p >> 8) & 255) as usize]
+                + costs.red[((p >> 16) & 255) as usize]
+                + costs.blue[(p & 255) as usize]
+                + costs.alpha[(p >> 24) as usize]
+        };
+        if ci + single < cost[i + 1] {
+            cost[i + 1] = ci + single;
+            step[i + 1] = Step { len: 1, dist: 0 };
+        }
+        if i < skip_until {
+            finder.insert(px, i);
+            if cache_bits > 0 {
+                cache[cache_index(p, cache_bits)] = p;
+            }
+            continue;
+        }
+        finder.candidates(px, i, xsize, &mut cands);
+        if let Some(&(l, _)) = cands.last()
+            && l >= LONG_MATCH
+        {
+            skip_until = i + l - 1;
+        }
+        for &(max, dist) in &cands {
+            let code = distance_code(dist, xsize, plane);
+            let (dsym, dextra, _) = prefix_encode(code);
+            let dcost = costs.dist[dsym as usize] + dextra as f32;
+            lengths_to_try(max, &mut lens);
+            for &l in &lens {
+                let (lsym, lextra, _) = prefix_encode(l as u32);
+                let c = ci + costs.green[NUM_LITERAL + lsym as usize] + lextra as f32 + dcost;
+                if c < cost[i + l] {
+                    cost[i + l] = c;
+                    step[i + l] = Step { len: l as u32, dist: dist as u32 };
+                }
+            }
+        }
+        if cache_bits > 0 {
+            cache[cache_index(p, cache_bits)] = p;
+        }
+    }
+    // Walk back from the end.
+    let mut steps = Vec::new();
+    let mut i = n;
+    while i > 0 {
+        let s = step[i];
+        steps.push(s);
+        i -= s.len as usize;
+    }
+    steps.reverse();
     steps
 }
 
@@ -507,9 +783,99 @@ fn emit(w: &mut LsbWriter, c: &Written, sym: usize) {
     }
 }
 
-/// Write an entropy-coded image: cache setup, (optionally) a single-group meta prefix flag, the
-/// prefix codes and the tokens.
-fn write_image(w: &mut LsbWriter, toks: &[Tok], cache_bits: u32, main: bool) {
+/// Symbol (alphabet, index) events of one token, to feed histograms.
+fn token_events(t: Tok, mut f: impl FnMut(usize, usize)) {
+    match t {
+        Tok::Literal(p) => {
+            f(0, ((p >> 8) & 255) as usize);
+            f(1, ((p >> 16) & 255) as usize);
+            f(2, (p & 255) as usize);
+            f(3, (p >> 24) as usize);
+        }
+        Tok::Cache(i) => f(0, NUM_LITERAL + NUM_LENGTH + i as usize),
+        Tok::Copy { len, code } => {
+            f(0, NUM_LITERAL + prefix_encode(len).0 as usize);
+            f(4, prefix_encode(code).0 as usize);
+        }
+    }
+}
+
+/// Pixels a token covers.
+fn token_len(t: Tok) -> usize {
+    match t {
+        Tok::Copy { len, .. } => len as usize,
+        _ => 1,
+    }
+}
+
+/// Plan for sharing prefix codes between tiles of the image.
+struct GroupPlan {
+    meta_bits: u32,
+    tiles_w: usize,
+    assign: Vec<u16>,
+    groups: usize,
+}
+
+/// Cluster the image's tiles by their symbol statistics; `None` when one group is as good.
+fn plan_groups(toks: &[Tok], xsize: usize, ysize: usize, cache_size: usize, level: u32) -> Option<GroupPlan> {
+    if level < 3 || xsize * ysize < 4096 {
+        return None;
+    }
+    // Tiles of 2^bits pixels a side, as large as needed to keep their number manageable.
+    let mut meta_bits = 4;
+    while meta_bits < 9 && div_round_up(xsize, meta_bits) * div_round_up(ysize, meta_bits) > 2500 {
+        meta_bits += 1;
+    }
+    let (tiles_w, tiles_h) = (div_round_up(xsize, meta_bits), div_round_up(ysize, meta_bits));
+    let sizes = [NUM_LITERAL + NUM_LENGTH + cache_size, NUM_LITERAL, NUM_LITERAL, NUM_LITERAL, NUM_DIST];
+    let offsets: Vec<usize> = sizes
+        .iter()
+        .scan(0, |acc, &n| {
+            let o = *acc;
+            *acc += n;
+            Some(o)
+        })
+        .collect();
+    let stride: usize = sizes.iter().sum();
+    let mut counts = vec![0u32; tiles_w * tiles_h * stride];
+    let mut pos = 0usize;
+    for &t in toks {
+        let (y, x) = (pos / xsize, pos % xsize);
+        let base = ((y >> meta_bits) * tiles_w + (x >> meta_bits)) * stride;
+        token_events(t, |a, s| counts[base + offsets[a] + s] += 1);
+        pos += token_len(t);
+    }
+    let tiles: Vec<Sparse> = counts
+        .chunks_exact(stride)
+        .map(|c| {
+            let mut v = Sparse::new();
+            for a in 0..ALPHABETS {
+                for (s, &n) in c[offsets[a]..offsets[a] + sizes[a]].iter().enumerate() {
+                    if n > 0 {
+                        v.push((a as u8, s as u16, n));
+                    }
+                }
+            }
+            v
+        })
+        .collect();
+    drop(counts);
+    let (max_groups, passes) = match level {
+        0..=4 => (24, 1),
+        5..=7 => (96, 2),
+        _ => (256, 3),
+    };
+    let g = cluster::cluster(&tiles, &sizes, max_groups, passes);
+    // The meta image and its per-tile index cost something too.
+    let overhead = (tiles_w * tiles_h) as f64 * 1.0 + 64.0;
+    if g.groups < 2 || g.saving_bits <= overhead {
+        return None;
+    }
+    Some(GroupPlan { meta_bits, tiles_w, assign: g.assign, groups: g.groups })
+}
+
+/// Write an entropy-coded image: cache setup, optional meta prefix groups, prefix codes, tokens.
+fn write_image(w: &mut LsbWriter, toks: &[Tok], cache_bits: u32, main: bool, xsize: usize, ysize: usize, level: u32) {
     let cache_size = if cache_bits > 0 { 1usize << cache_bits } else { 0 };
     if cache_bits > 0 {
         w.put(1, 1);
@@ -517,15 +883,39 @@ fn write_image(w: &mut LsbWriter, toks: &[Tok], cache_bits: u32, main: bool) {
     } else {
         w.put(0, 1);
     }
+    let plan = if main { plan_groups(toks, xsize, ysize, cache_size, level) } else { None };
     if main {
-        w.put(0, 1); // one prefix group for the whole image
+        match &plan {
+            Some(p) => {
+                w.put(1, 1);
+                w.put(p.meta_bits - 2, 3);
+                let meta: Vec<u32> = p.assign.iter().map(|&g| 0xFF00_0000 | (g as u32) << 8).collect();
+                encode_image(w, &meta, p.tiles_w, level.min(3), false);
+            }
+            None => w.put(0, 1),
+        }
     }
-    let mut hist = Hist::new(cache_size);
+    let groups = plan.as_ref().map_or(1, |p| p.groups);
+    let mut hists: Vec<Hist> = (0..groups).map(|_| Hist::new(cache_size)).collect();
+    let group_at = |pos: usize| -> usize {
+        match &plan {
+            Some(p) => {
+                let (y, x) = (pos / xsize, pos % xsize);
+                p.assign[(y >> p.meta_bits) * p.tiles_w + (x >> p.meta_bits)] as usize
+            }
+            None => 0,
+        }
+    };
+    let mut pos = 0usize;
     for &t in toks {
-        hist.add(t);
+        hists[group_at(pos)].add(t);
+        pos += token_len(t);
     }
-    let written: Vec<Written> = hist.h.iter().map(|f| write_code(w, &code_lengths(f))).collect();
+    let written: Vec<Vec<Written>> =
+        hists.iter().map(|h| h.h.iter().map(|f| write_code(w, &code_lengths(f))).collect()).collect();
+    let mut pos = 0usize;
     for &t in toks {
+        let written = &written[group_at(pos)];
         match t {
             Tok::Literal(p) => {
                 emit(w, &written[0], ((p >> 8) & 255) as usize);
@@ -547,12 +937,14 @@ fn write_image(w: &mut LsbWriter, toks: &[Tok], cache_bits: u32, main: bool) {
                 }
             }
         }
+        pos += token_len(t);
     }
 }
 
 /// Parse, pick a colour cache size, and write one image.
 fn encode_image(w: &mut LsbWriter, px: &[u32], xsize: usize, level: u32, main: bool) {
     let plane = plane_table();
+    let ysize = px.len() / xsize.max(1);
     let (depth, lazy) = match level {
         0..=1 => (2, false),
         2..=3 => (8, false),
@@ -566,18 +958,41 @@ fn encode_image(w: &mut LsbWriter, px: &[u32], xsize: usize, level: u32, main: b
         2..=4 => &[0, 6],
         _ => &[0, 3, 6, 9],
     };
-    let mut best: Option<(u64, u32, Vec<Tok>)> = None;
-    for &bits in candidates {
-        let toks = to_tokens(px, &steps, xsize, bits, &plane);
+    let estimate = |toks: &[Tok], bits: u32| -> u64 {
         let mut hist = Hist::new(if bits > 0 { 1 << bits } else { 0 });
         toks.iter().for_each(|&t| hist.add(t));
-        let est = estimate_bits(&hist);
+        estimate_bits(&hist)
+    };
+    let mut best: Option<(u64, u32, Vec<Step>, Vec<Tok>)> = None;
+    for &bits in candidates {
+        let toks = to_tokens(px, &steps, xsize, bits, &plane);
+        let est = estimate(&toks, bits);
         if best.as_ref().is_none_or(|b| est < b.0) {
-            best = Some((est, bits, toks));
+            best = Some((est, bits, steps.clone(), toks));
         }
     }
-    let (_, bits, toks) = best.expect("at least one cache size");
-    write_image(w, &toks, bits, main);
+    let (mut est, bits, mut steps, mut toks) = best.expect("at least one cache size");
+    // Re-parse with costs learned from the current best parse, keeping whatever improves.
+    let rounds = match level {
+        0..=4 => 0,
+        5..=6 => 1,
+        7..=8 => 2,
+        _ => 3,
+    };
+    for _ in 0..rounds {
+        let mut hist = Hist::new(if bits > 0 { 1 << bits } else { 0 });
+        toks.iter().for_each(|&t| hist.add(t));
+        let candidate = optimal_parse(px, xsize, depth.min(96), bits, &costs_from(&hist), &plane);
+        let cand_toks = to_tokens(px, &candidate, xsize, bits, &plane);
+        let cand_est = estimate(&cand_toks, bits);
+        if cand_est < est {
+            (est, steps, toks) = (cand_est, candidate, cand_toks);
+        } else {
+            break;
+        }
+    }
+    let _ = steps;
+    write_image(w, &toks, bits, main, xsize, ysize, level);
 }
 
 // ------------------------------------------------------------------ whole image
@@ -598,43 +1013,138 @@ fn header(w: &mut LsbWriter, width: usize, height: usize, alpha: bool) {
     w.put(0, 3);
 }
 
-fn encode_palette(argb: &[u32], width: usize, height: usize, alpha: bool, palette: &[u32], level: u32) -> Vec<u8> {
-    let mut w = LsbWriter::new();
-    header(&mut w, width, height, alpha);
+/// One transform as it appears in the bitstream, with its side image.
+enum Transform {
+    SubtractGreen,
+    Predictor {
+        bits: u32,
+        modes: Vec<u32>,
+        xsize: usize,
+    },
+    CrossColor {
+        bits: u32,
+        data: Vec<u32>,
+        xsize: usize,
+    },
+    /// Palette colours, already delta-coded.
+    Palette {
+        deltas: Vec<u32>,
+    },
+}
+
+/// An image after its transforms: what is left to entropy-code.
+struct Prepared {
+    transforms: Vec<Transform>,
+    pixels: Vec<u32>,
+    xsize: usize,
+}
+
+/// Pipeline choices for the non-palette path.
+#[derive(Clone, Copy)]
+struct Direct {
+    /// Subtract green from red and blue first.
+    sg: bool,
+    predictor: bool,
+    cross: bool,
+    /// Predictor tile size (log2); 0 = pick by image size.
+    pred_bits: u32,
+}
+
+fn prepare_direct(argb: &[u32], width: usize, height: usize, d: Direct) -> Prepared {
+    let mut px = argb.to_vec();
+    let mut transforms = Vec::new();
+    if d.sg {
+        subtract_green(&mut px);
+        transforms.push(Transform::SubtractGreen);
+    }
+    if d.predictor {
+        let bits = if d.pred_bits > 0 { d.pred_bits } else { predictor_bits(width, height) };
+        let (res, modes) = predictor_transform(&px, width, height, bits);
+        transforms.push(Transform::Predictor { bits, modes, xsize: div_round_up(width, bits) });
+        px = res;
+    }
+    if d.cross {
+        let bits = 5;
+        let (fixed, data) = cross_color_transform(&px, width, height, bits);
+        transforms.push(Transform::CrossColor { bits, data, xsize: div_round_up(width, bits) });
+        px = fixed;
+    }
+    Prepared { transforms, pixels: px, xsize: width }
+}
+
+fn prepare_palette(argb: &[u32], width: usize, height: usize, palette: &[u32]) -> Prepared {
     let bits = bundle_bits(palette.len());
-    w.put(1, 1); // transform present
-    w.put(3, 2); // colour indexing
-    w.put(palette.len() as u32 - 1, 8);
     let mut deltas = palette.to_vec();
     for i in (1..deltas.len()).rev() {
         deltas[i] = sub_pixels(deltas[i], deltas[i - 1]);
     }
-    encode_image(&mut w, &deltas, palette.len(), level.min(3), false);
-    w.put(0, 1); // no more transforms
-    let indexed = index_pixels(argb, width, height, palette, bits);
-    encode_image(&mut w, &indexed, div_round_up(width, bits), level, true);
-    w.finish()
+    Prepared {
+        transforms: vec![Transform::Palette { deltas }],
+        pixels: index_pixels(argb, width, height, palette, bits),
+        xsize: div_round_up(width, bits),
+    }
 }
 
-fn encode_direct(argb: &[u32], width: usize, height: usize, alpha: bool, level: u32, predictor: bool) -> Vec<u8> {
-    let mut w = LsbWriter::new();
-    header(&mut w, width, height, alpha);
-    let mut px = argb.to_vec();
-    w.put(1, 1);
-    w.put(2, 2); // subtract green
-    subtract_green(&mut px);
-    if predictor {
-        let bits = predictor_bits(width, height);
-        let (res, modes) = predictor_transform(&px, width, height, bits);
-        w.put(1, 1);
-        w.put(0, 2);
-        w.put(bits - 2, 3);
-        encode_image(&mut w, &modes, div_round_up(width, bits), level.min(3), false);
-        px = res;
+/// Quick size estimate in bits: greedy parse and entropy, with and without a small colour cache,
+/// but no grouping.
+fn quick_cost(px: &[u32], xsize: usize) -> u64 {
+    let plane = plane_table();
+    let steps = parse(px, xsize, 8, false);
+    [0u32, 6]
+        .iter()
+        .map(|&bits| {
+            let toks = to_tokens(px, &steps, xsize, bits, &plane);
+            let mut hist = Hist::new(if bits > 0 { 1 << bits } else { 0 });
+            toks.iter().for_each(|&t| hist.add(t));
+            estimate_bits(&hist)
+        })
+        .min()
+        .unwrap_or(0)
+}
+
+impl Prepared {
+    fn estimate(&self) -> u64 {
+        let side: u64 = self
+            .transforms
+            .iter()
+            .map(|t| match t {
+                Transform::Predictor { modes, xsize, .. } => quick_cost(modes, *xsize),
+                Transform::CrossColor { data, xsize, .. } => quick_cost(data, *xsize),
+                Transform::Palette { deltas } => quick_cost(deltas, deltas.len()) + 8,
+                Transform::SubtractGreen => 0,
+            })
+            .sum();
+        side + quick_cost(&self.pixels, self.xsize)
     }
-    w.put(0, 1);
-    encode_image(&mut w, &px, width, level, true);
-    w.finish()
+
+    fn write(&self, width: usize, height: usize, alpha: bool, level: u32) -> Vec<u8> {
+        let mut w = LsbWriter::new();
+        header(&mut w, width, height, alpha);
+        for t in &self.transforms {
+            w.put(1, 1);
+            match t {
+                Transform::SubtractGreen => w.put(2, 2),
+                Transform::Predictor { bits, modes, xsize } => {
+                    w.put(0, 2);
+                    w.put(bits - 2, 3);
+                    encode_image(&mut w, modes, *xsize, level.min(3), false);
+                }
+                Transform::CrossColor { bits, data, xsize } => {
+                    w.put(1, 2);
+                    w.put(bits - 2, 3);
+                    encode_image(&mut w, data, *xsize, level.min(3), false);
+                }
+                Transform::Palette { deltas } => {
+                    w.put(3, 2);
+                    w.put(deltas.len() as u32 - 1, 8);
+                    encode_image(&mut w, deltas, deltas.len(), level.min(3), false);
+                }
+            }
+        }
+        w.put(0, 1);
+        encode_image(&mut w, &self.pixels, self.xsize, level, true);
+        w.finish()
+    }
 }
 
 /// Encode packed ARGB pixels as a VP8L bitstream (the payload of a `VP8L` chunk).
@@ -646,20 +1156,44 @@ pub fn encode(argb: &[u32], width: usize, height: usize, has_alpha: bool, opts: 
         px.iter_mut().filter(|p| **p >> 24 == 0).for_each(|p| *p = 0);
     }
     let level = opts.level.min(9);
-    let mut candidates: Vec<Vec<u8>> = Vec::new();
+    let direct = |sg, predictor, cross, pred_bits| Direct { sg, predictor, cross, pred_bits };
+    let mut candidates: Vec<Prepared> = Vec::new();
     if let Some(palette) = small_palette(&px) {
-        candidates.push(encode_palette(&px, width, height, has_alpha, &palette, level));
+        candidates.push(prepare_palette(&px, width, height, &palette));
         // Palette images with smooth gradients can still do better with prediction.
         if level >= 6 && palette.len() > 16 {
-            candidates.push(encode_direct(&px, width, height, has_alpha, level, true));
+            candidates.push(prepare_direct(&px, width, height, direct(true, true, true, 0)));
         }
     } else {
-        candidates.push(encode_direct(&px, width, height, has_alpha, level, true));
+        candidates.push(prepare_direct(&px, width, height, direct(true, true, level >= 4, 0)));
         if level >= 3 {
-            candidates.push(encode_direct(&px, width, height, has_alpha, level, false));
+            // Graphics often do best with no prediction at all.
+            candidates.push(prepare_direct(&px, width, height, direct(true, false, false, 0)));
+        }
+        if level >= 5 {
+            // Photographic content: let cross-colour do the green decorrelation instead.
+            candidates.push(prepare_direct(&px, width, height, direct(false, true, true, 0)));
+        }
+        if level >= 6 {
+            for bits in [3, 5] {
+                candidates.push(prepare_direct(&px, width, height, direct(true, true, true, bits)));
+            }
         }
     }
-    candidates.into_iter().min_by_key(|c| c.len()).expect("at least one candidate")
+    // Rank the pipelines cheaply, then spend the full effort on the best one (more at higher levels).
+    let keep = match level {
+        0..=5 => 1,
+        6..=8 => 2,
+        _ => 3,
+    };
+    let mut ranked: Vec<(u64, Prepared)> = candidates.into_iter().map(|c| (c.estimate(), c)).collect();
+    ranked.sort_by_key(|r| r.0);
+    ranked
+        .into_iter()
+        .take(keep)
+        .map(|(_, c)| c.write(width, height, has_alpha, level))
+        .min_by_key(|c| c.len())
+        .expect("at least one candidate")
 }
 
 #[cfg(test)]

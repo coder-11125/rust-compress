@@ -6,6 +6,11 @@
   filter strategies. Level 7 matches or beats `oxipng -o2` and level 9 matches or beats `oxipng -o4`
   on most images.
 - Packaging: MIT license, crate metadata, CI and release workflows.
+- Lossless WebP (VP8L) reading and writing; GIF (still) input; CMYK/YCCK JPEG transcoding; animated PNG
+  and lossy/animated WebP are passed through untouched instead of failing.
+- `--keep-metadata` (EXIF, XMP, comments, PNG text/time/density, converted between formats),
+  `--resize` (Lanczos-3 downscale), and stdin/stdout support (`-` as input, `-o -`).
+- Hostile-input mutation tests for every decoder.
 
 ## 0.1.0
 

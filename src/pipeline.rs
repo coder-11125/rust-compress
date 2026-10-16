@@ -196,7 +196,11 @@ fn encode(img: &Image, fmt: Format, cli: &Cli) -> Result<Encoded> {
                 )));
             }
             let opts = crate::webp::EncodeOptions { level: cli.level as u32, clean_alpha: !cli.keep_hidden_pixels };
-            Ok(crate::webp::encode(img, &opts).into())
+            let mut encoded: Encoded = crate::webp::encode(img, &opts).into();
+            if img.depth == 16 {
+                encoded.note = Some("16-bit reduced to 8-bit".into());
+            }
+            Ok(encoded)
         }
         Format::Gif => Err(Error::unsupported("GIF output")),
     }

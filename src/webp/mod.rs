@@ -1,6 +1,7 @@
 //! WebP: container handling plus the lossless (VP8L) codec. Lossy (VP8) files are recognised but
 //! not decoded, and animated files are refused.
 
+pub mod cluster;
 pub mod vp8l;
 pub mod vp8l_enc;
 
