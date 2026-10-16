@@ -139,6 +139,14 @@ fn jpeg_to_jpeg(data: &[u8], cli: &Cli) -> Result<Encoded> {
             SubsamplingArg::S420 => !is420,
             SubsamplingArg::S444 => !is444,
         };
+    if info.cmyk && orientation == 1 && !resizing {
+        // Requantizing would have to guess ink-channel tolerances, so CMYK is only ever transcoded
+        // losslessly: identical coefficients, better entropy coding, Adobe colour flag preserved.
+        let mut ci = parsed.into_coefs()?;
+        apply_metadata_policy(&mut ci.meta, cli);
+        let bytes = jpeg::encode::write_best(&ci);
+        return Ok(Encoded { bytes, note: Some("CMYK, lossless".into()), forced: false });
+    }
     if orientation == 1 && !resample && !info.coded_rgb && !resizing {
         let mut ci = parsed.into_coefs()?;
         apply_metadata_policy(&mut ci.meta, cli);

@@ -27,7 +27,7 @@ const PNGS: &[&str] = &[
     "rgba8.png",
 ];
 const JPEGS: &[&str] =
-    &["gray8.jpg", "icc.jpg", "rgb8.jpg", "rgb8_420.jpg", "rgb8_444.jpg", "rgb8_opt.jpg", "rgb8_prog.jpg"];
+    &["cmyk.jpg", "gray8.jpg", "icc.jpg", "rgb8.jpg", "rgb8_420.jpg", "rgb8_444.jpg", "rgb8_opt.jpg", "rgb8_prog.jpg"];
 
 /// Small deterministic generator so failures are reproducible from the printed seed.
 struct Rng(u64);
