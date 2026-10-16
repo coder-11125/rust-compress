@@ -189,6 +189,15 @@ fn encode(img: &Image, fmt: Format, cli: &Cli) -> Result<Encoded> {
         }
         Format::Jpeg => encode_jpeg_pixels(img, cli, cli.quality),
         Format::Webp => {
+            if cli.lossy {
+                let bytes = crate::webp::encode_lossy(img, cli.quality, cli.level as u32, !cli.keep_hidden_pixels)?;
+                let mut encoded: Encoded = bytes.into();
+                encoded.forced = false;
+                if img.depth == 16 {
+                    encoded.note = Some("16-bit reduced to 8-bit".into());
+                }
+                return Ok(encoded);
+            }
             if img.width > crate::webp::MAX_DIMENSION || img.height > crate::webp::MAX_DIMENSION {
                 return Err(Error::unsupported(format!(
                     "WebP images are limited to {0}x{0} pixels",
@@ -256,6 +265,7 @@ fn run(job: &Job, cli: &Cli, data: &[u8]) -> Result<(Status, u64, Option<String>
     let untouchable = match (in_fmt, out_fmt) {
         (Format::Png, Format::Png) if png::is_animated(data) => Some("animated PNG left unchanged"),
         (Format::Webp, Format::Webp) => crate::webp::unsupported_reason(data)
+            .filter(|r| !(cli.lossy && *r == "lossy WebP"))
             .map(|r| if r == "lossy WebP" { "lossy WebP left unchanged" } else { "animated WebP left unchanged" }),
         _ => None,
     };

@@ -30,6 +30,11 @@ cat in.png | rust-compress - > out.png  # stdin to stdout
 - Own DEFLATE: hash-chain LZ77 with lazy matching (levels 1-6, compressed in parallel segments) and Zopfli-style optimal parsing (levels 7-9). The optimal parser finds matches with a **binary-tree match finder** (every match length at its nearest distance, no chain-length cliff), then runs a shortest path over them with an iteratively refined cost model, and adaptive block splitting. The refinement is started from two seeds — the longest-match parse and a parse priced from the data's own byte histogram (which avoids a slow drift on noisy data, where a greedy seed is full of coincidental short matches) — and the cheaper result wins.
 - `--lossy` quantizes to a ≤256-color palette: exact color histogram, median cut, k-means refinement, and edge-aware Floyd-Steinberg dithering (`--colors N`, `--dither 0..1`).
 
+**WebP (lossy)** — a from-scratch VP8 key-frame encoder and decoder (`-f webp --lossy -q N`):
+- The decoder is bit-exact with libwebp (planes and RGB output, including the "fancy" chroma upsampling, loop filters, segments, multiple partitions and `ALPH`).
+- The encoder does rate-distortion mode decisions (16x16, 4x4 and chroma intra modes), quantizes with deadzone biasing, tunes the token probabilities from first-pass statistics, and searches the loop-filter level. Its streams decode to the identical picture in libwebp. At the same `-q` on twelve real images it lands within a few percent of libwebp's size at equal or slightly higher PSNR.
+- Transparency is stored losslessly in an `ALPH` chunk (best of four prediction filters, coded with the VP8L encoder); hidden pixels are smoothed to be cheap. Lossy WebP inputs are only re-encoded with `--lossy`; otherwise they are left untouched.
+
 **WebP (lossless)** — full VP8L encoder and decoder:
 - Encoder tries a palette transform (bundling up to 8 pixels per symbol) or subtract-green + per-tile predictor + cross-color decorrelation, ranks the pipelines with a cheap estimate and fully encodes the best ones.
 - LZ77 with the format's 2-D distance codes, an optimal (cost-model driven) parse, a colour cache sized by trial, and **entropy-clustered prefix-code groups**: image tiles with similar statistics share one set of codes.
@@ -59,7 +64,7 @@ rust-compress [OPTIONS] <INPUT>...
   -q, --quality <1-100>   JPEG quality ceiling (default 80)
   -f, --format <FMT>      keep | png | jpeg | webp (default keep)
       --subsampling <S>   auto | 444 | 420
-      --lossy             PNG: allow palette quantization
+      --lossy             PNG palette quantization, or lossy WebP with -f webp (-q = quality)
       --colors <2-256>    with --lossy (default 256)
       --dither <0.0-1.0>  with --lossy (default 0.5)
   -l, --level <0-9>       PNG / WebP effort (default 7; PNG: 1-6 fast, 7-9 optimal parsing, 9 slowest)
@@ -133,7 +138,7 @@ tests/          codec round trips, reference-decoder cross-checks, hostile input
 
 ## Limitations
 
-- Formats: PNG, JPEG and lossless WebP in and out; GIF in (stills). No lossy WebP (it can be neither read nor written), no AVIF, no animated output. JPEG: 8-bit Huffman, 1, 3 or 4 components (no arithmetic coding or 12-bit).
+- Formats: PNG, JPEG and WebP (lossless and lossy) in and out; GIF in (stills). No AVIF, no animated output. JPEG: 8-bit Huffman, 1, 3 or 4 components (no arithmetic coding or 12-bit).
 - WebP is 8-bit: 16-bit sources lose precision on conversion.
 - CMYK JPEGs are never requantized (`-q` does not apply to them); YCCK decoding is covered by unit tests but has no real-file fixture.
 - EXIF/XMP/comments are dropped unless `--keep-metadata` is given. An EXIF block too large for a JPEG segment (over 64 KB) cannot be carried into a JPEG.

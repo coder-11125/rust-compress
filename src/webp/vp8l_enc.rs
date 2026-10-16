@@ -1196,6 +1196,16 @@ pub fn encode(argb: &[u32], width: usize, height: usize, has_alpha: bool, opts: 
         .expect("at least one candidate")
 }
 
+/// Encode an 8-bit plane as the headerless lossless stream stored in an `ALPH` chunk (the plane
+/// travels in the green channel).
+pub fn encode_plane(plane: &[u8], width: usize, height: usize, level: u32) -> Vec<u8> {
+    let argb: Vec<u32> = plane.iter().map(|&a| 0xFF00_0000 | (a as u32) << 8).collect();
+    let mut stream = encode(&argb, width, height, false, Options { level, clean_alpha: false });
+    // The 40-bit header (signature, size, alpha hint, version) is exactly five bytes.
+    stream.drain(..5);
+    stream
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

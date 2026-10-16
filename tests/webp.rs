@@ -128,6 +128,27 @@ mod cli {
     }
 
     #[test]
+    fn lossy_flag_writes_lossy_webp_and_only_then_reencodes_lossy_input() {
+        let d = tempdir().unwrap();
+        let input = d.path().join("in.png");
+        fs::write(&input, fixture("rgb8.png")).unwrap();
+        let lossy = d.path().join("lossy.webp");
+        cmd().arg(&input).args(["-f", "webp", "--lossy", "-q", "60", "-o"]).arg(&lossy).assert().success();
+        let bytes = fs::read(&lossy).unwrap();
+        assert!(bytes.windows(4).any(|w| w == b"VP8 "));
+        reference_rgba16(&bytes);
+        // Without --lossy a lossy WebP is passed through untouched; with it, it is recoded.
+        let plain = d.path().join("plain.webp");
+        cmd().arg(&lossy).arg("-o").arg(&plain).assert().success();
+        assert_eq!(fs::read(&plain).unwrap(), bytes);
+        let again = d.path().join("again.webp");
+        cmd().arg(&lossy).args(["--lossy", "-q", "30", "-o"]).arg(&again).assert().success();
+        let recoded = fs::read(&again).unwrap();
+        assert!(recoded.len() <= bytes.len());
+        reference_rgba16(&recoded);
+    }
+
+    #[test]
     fn png_jpeg_and_gif_convert_to_webp() {
         for (name, lossless_source) in
             [("rgb8.png", true), ("rgba8.png", true), ("pal5.png", true), ("gif_plain.gif", true), ("rgb8.jpg", false)]
@@ -194,4 +215,84 @@ mod cli {
             cmd().args(["-", "-f", "webp"]).write_stdin(fixture("rgb8.png")).assert().success().get_output().clone();
         assert!(out.stdout.starts_with(b"RIFF") && &out.stdout[8..12] == b"WEBP");
     }
+}
+
+fn synthetic(w: u32, h: u32, color: rust_compress::image::ColorType) -> rust_compress::image::Image {
+    use rust_compress::image::{ColorType, Image};
+    let ch = color.channels();
+    let mut data = Vec::new();
+    for y in 0..h {
+        for x in 0..w {
+            let (r, g, b) = ((x * 255 / w.max(1)) as u8, (y * 255 / h.max(1)) as u8, ((x * 7 + y * 3) % 256) as u8);
+            match color {
+                ColorType::Gray => data.push(r),
+                ColorType::GrayAlpha => data.extend([r, if (x / 4 + y / 4) % 3 == 0 { 0 } else { g }]),
+                ColorType::Rgb => data.extend([r, g, b]),
+                ColorType::Rgba => {
+                    data.extend([r, g, b, if (x / 5 + y / 3) % 4 == 0 { 0 } else { (x * 3 % 256) as u8 }])
+                }
+            }
+        }
+    }
+    assert_eq!(data.len(), (w * h) as usize * ch);
+    Image::new(w, h, color, 8, data).unwrap()
+}
+
+#[test]
+fn lossy_encoder_output_is_valid_close_and_keeps_alpha_exact() {
+    use rust_compress::image::ColorType;
+    for (w, h) in [(1, 1), (2, 3), (17, 33), (64, 48), (130, 70)] {
+        for color in [ColorType::Rgb, ColorType::Rgba, ColorType::Gray, ColorType::GrayAlpha] {
+            for quality in [1u8, 50, 100] {
+                let img = synthetic(w, h, color);
+                let bytes = webp::encode_lossy(&img, quality, 6, true).unwrap();
+                let ours = webp::decode(&bytes).unwrap_or_else(|e| panic!("{w}x{h} {color:?} q{quality}: {e}"));
+                assert_eq!((ours.width, ours.height), (w, h));
+                // The reference decoder must agree with ours on the decoded picture.
+                let (rw, rh, want) = reference_rgba16(&bytes);
+                assert_eq!((rw, rh), (w, h));
+                let got = to_rgba16(&ours);
+                let mean: f64 =
+                    got.iter().zip(&want).map(|(&a, &b)| (a as i32 - b as i32).abs() as f64 / 257.0).sum::<f64>()
+                        / got.len() as f64;
+                assert!(mean < 0.5, "{w}x{h} {color:?} q{quality}: decoders differ by {mean:.2}");
+                // Transparency is lossless; colour error is bounded at high quality.
+                let src = to_rgba16(&img);
+                let alpha_bad = got.chunks_exact(4).zip(src.chunks_exact(4)).filter(|(a, b)| a[3] != b[3]).count();
+                assert_eq!(alpha_bad, 0, "{w}x{h} {color:?} q{quality}: alpha changed");
+                if quality == 100 && w >= 17 {
+                    let (mut sum, mut n) = (0.0, 0.0);
+                    for (a, b) in got.chunks_exact(4).zip(src.chunks_exact(4)).filter(|(a, _)| a[3] != 0) {
+                        for c in 0..3 {
+                            sum += (a[c] as f64 - b[c] as f64).abs() / 257.0;
+                            n += 1.0;
+                        }
+                    }
+                    assert!(n == 0.0 || sum / n < 6.0, "{w}x{h} {color:?}: mean error {:.2}", sum / n);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn lossy_encoder_keeps_metadata_and_rejects_oversized_images() {
+    use rust_compress::image::{ColorType, Image};
+    let mut img = synthetic(40, 40, ColorType::Rgb);
+    img.meta.icc = Some(vec![1, 2, 3, 4, 5]);
+    img.meta.exif = Some(b"abc".to_vec());
+    let back = webp::decode(&webp::encode_lossy(&img, 70, 4, true).unwrap()).unwrap();
+    assert_eq!(back.meta.icc, img.meta.icc);
+    assert_eq!(back.meta.exif, img.meta.exif);
+    let huge = Image::new(16384, 1, ColorType::Gray, 8, vec![0; 16384]).unwrap();
+    assert!(webp::encode_lossy(&huge, 70, 4, true).is_err());
+}
+
+#[test]
+fn quality_trades_size_for_fidelity() {
+    use rust_compress::image::ColorType;
+    let img = synthetic(160, 120, ColorType::Rgb);
+    let small = webp::encode_lossy(&img, 10, 6, true).unwrap().len();
+    let big = webp::encode_lossy(&img, 95, 6, true).unwrap().len();
+    assert!(small < big, "{small} !< {big}");
 }
