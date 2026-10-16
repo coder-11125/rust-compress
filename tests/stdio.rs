@@ -71,3 +71,25 @@ fn no_gain_still_streams_the_original_bytes() {
     assert!(out.stdout.len() <= input.len());
     assert!(image::load_from_memory(&out.stdout).is_ok());
 }
+
+#[test]
+fn animated_png_passes_through_untouched_instead_of_failing() {
+    use rust_compress::util::checksum::crc32;
+    let base = fixture("rgb8.png");
+    let at = 8 + 12 + 13;
+    let mut actl = Vec::new();
+    let body = [0u8, 0, 0, 2, 0, 0, 0, 0]; // 2 frames, loop forever
+    actl.extend_from_slice(&(body.len() as u32).to_be_bytes());
+    let mut tb = b"acTL".to_vec();
+    tb.extend_from_slice(&body);
+    actl.extend_from_slice(&tb);
+    actl.extend_from_slice(&crc32(&tb).to_be_bytes());
+    let apng = [&base[..at], &actl[..], &base[at..]].concat();
+    assert!(rust_compress::png::is_animated(&apng));
+    assert!(!rust_compress::png::is_animated(&base));
+    let out = cmd().arg("-").write_stdin(apng.clone()).assert().success().get_output().clone();
+    assert_eq!(out.stdout, apng, "animation must come back byte for byte");
+    assert!(String::from_utf8_lossy(&out.stderr).contains("animated PNG left unchanged"));
+    // Asking for a format change is still an error: that would drop the animation.
+    cmd().args(["-", "-f", "jpeg"]).write_stdin(apng).assert().failure();
+}

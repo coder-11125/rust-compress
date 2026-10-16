@@ -223,6 +223,13 @@ fn run(job: &Job, cli: &Cli, data: &[u8]) -> Result<(Status, u64, Option<String>
     if !cli.in_place && !cli.force && !cli.dry_run && !is_stdio(&job.output) && job.output.exists() {
         return Err(Error::unsupported(format!("{} already exists (use --force)", job.output.display())));
     }
+    // Recompressing an animation as a still would drop every frame but the first, so leave it as it is.
+    if in_fmt == Format::Png && out_fmt == Format::Png && png::is_animated(data) {
+        if !cli.in_place && !cli.dry_run {
+            write_output(&job.output, data)?;
+        }
+        return Ok((Status::NoGain, data.len() as u64, Some("animated PNG left unchanged".into())));
+    }
     let encoded = if in_fmt == Format::Jpeg && out_fmt == Format::Jpeg {
         jpeg_to_jpeg(data, cli)?
     } else {
