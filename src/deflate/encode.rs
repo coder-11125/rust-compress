@@ -315,22 +315,13 @@ fn compress_range(data: &[u8], start: usize, end: usize, level: u32, is_last: bo
     let mut matcher = Matcher::new(matcher_params);
     matcher.prime(d, start.saturating_sub(WINDOW), start);
     let mut tokens = Vec::with_capacity(BLOCK_TOKENS);
-    let mut hints: Vec<u16> = Vec::new();
     let mut pos = start;
     while pos < end {
         let block_start = pos;
         tokens.clear();
         if matcher_params.optimal {
             let chunk_end = (pos + OPT_CHUNK).min(end);
-            tokens = super::optimal::optimal_tokens(
-                &mut matcher,
-                d,
-                pos,
-                chunk_end,
-                matcher_params.iters,
-                matcher_params.hints,
-                &mut hints,
-            );
+            tokens = super::optimal::optimal_tokens(&mut matcher, d, pos, chunk_end, matcher_params.iters);
             pos = chunk_end;
         } else {
             matcher.tokenize(d, &mut pos, &mut tokens, BLOCK_TOKENS);
@@ -460,6 +451,50 @@ mod tests {
         let best = deflate_compress(&data, 9).len();
         assert!(best <= fast, "{best} > {fast}");
         assert!(best < data.len());
+    }
+
+    #[test]
+    fn skewed_noise_compresses_near_its_entropy() {
+        // Independent symbols from a skewed distribution: nothing to match, so the best parse is all
+        // literals. A parse seeded from coincidental short matches used to land ~10% above this.
+        let weights = [60u32, 20, 10, 5, 3, 1, 1];
+        let total: u32 = weights.iter().sum();
+        let mut s = 777u32;
+        let data: Vec<u8> = (0..200_000)
+            .map(|_| {
+                s = s.wrapping_mul(1664525).wrapping_add(1013904223);
+                let mut r = (s >> 8) % total;
+                weights
+                    .iter()
+                    .position(|&w| {
+                        if r < w {
+                            true
+                        } else {
+                            r -= w;
+                            false
+                        }
+                    })
+                    .unwrap() as u8
+            })
+            .collect();
+        let entropy_bytes: f64 = weights
+            .iter()
+            .map(|&w| {
+                let p = w as f64 / total as f64;
+                -p * p.log2()
+            })
+            .sum::<f64>()
+            * data.len() as f64
+            / 8.0;
+        for level in [7, 8, 9] {
+            let c = deflate_compress(&data, level);
+            assert_eq!(inflate(&c, 0, usize::MAX).unwrap(), data);
+            assert!(
+                (c.len() as f64) < entropy_bytes * 1.08,
+                "level {level}: {} vs entropy {entropy_bytes:.0}",
+                c.len()
+            );
+        }
     }
 
     #[test]

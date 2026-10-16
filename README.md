@@ -22,8 +22,8 @@ rust-compress photo.jpg --target-ssim 0.95   # lowest quality that still scores 
 **PNG** — lossless by default, bit-exact pixels:
 - Reduces the representation: drops unused alpha, RGB → gray, ≤256 colors → palette, 1/2/4-bit depths, 16 → 8-bit when lossless.
 - Fully transparent pixels get their invisible color rewritten to whatever compresses best (zeroed for palettes, copied from the left/above neighbor for filters); `--keep-hidden-pixels` preserves the exact bytes. Palette order is chosen among four orderings by trial compression.
-- Chooses the scanline filter strategy by trial-compressing a sample of the image (the usual sum-of-abs heuristic is often wrong for screenshots/graphics).
-- Own DEFLATE: hash-chain LZ77 with lazy matching (levels 1-6, compressed in parallel segments) and Zopfli-style optimal parsing (levels 7-9: shortest path over all matches with an iteratively refined cost model, adaptive block splitting, and direct tests of the distances earlier chunks found productive — e.g. the row above — which hash chains miss in flat regions).
+- Chooses the scanline filter strategy by trial-compressing a sample of the image with a real LZ77 level (the usual sum-of-abs heuristic is often wrong for screenshots/graphics). Candidates: the five fixed filters, per-row min-sum, entropy and *distinct-bigram* heuristics, and at `-l 9` a **brute-force search** that picks each row's filter by actually compressing it together with the preceding rows (skipped above 48 MB).
+- Own DEFLATE: hash-chain LZ77 with lazy matching (levels 1-6, compressed in parallel segments) and Zopfli-style optimal parsing (levels 7-9). The optimal parser finds matches with a **binary-tree match finder** (every match length at its nearest distance, no chain-length cliff), then runs a shortest path over them with an iteratively refined cost model, and adaptive block splitting. The refinement is started from two seeds — the longest-match parse and a parse priced from the data's own byte histogram (which avoids a slow drift on noisy data, where a greedy seed is full of coincidental short matches) — and the cheaper result wins.
 - `--lossy` quantizes to a ≤256-color palette: exact color histogram, median cut, k-means refinement, and edge-aware Floyd-Steinberg dithering (`--colors N`, `--dither 0..1`).
 
 **Safety** — an output is never larger than its input (the original bytes are kept instead), files are written atomically, existing outputs are not overwritten without `--force`, ICC profiles and PNG color chunks are kept (`--strip-icc` to drop them), animated PNGs are refused rather than flattened, and decoders are hardened against truncated/corrupt/hostile input.
@@ -58,20 +58,22 @@ Without `-o`/`--in-place`, `photo.jpg` becomes `photo.min.jpg`; files already na
 
 ## Head-to-head with established tools
 
-Measured on five real JPEGs and three PNG screenshots (mozjpeg 4.1.5, oxipng 10.2.1 with `-t 1`, pngquant 3.0.3, zopflipng from upstream git). Timings are single-threaded **CPU time** on a loaded 2-core laptop, so treat them as indicative; sizes are exact.
+JPEG and lossy-PNG rows: five real JPEGs and three PNG screenshots (mozjpeg 4.1.5, oxipng 10.2.1 with `-t 1`, pngquant 3.0.3). Timings are single-threaded **CPU time** on a loaded 2-core laptop, so treat them as indicative; sizes are exact.
+
+Lossless-PNG rows: 12 PNGs (screenshots, diagrams, UI art, a 16-bit image, a gradient, a 6 MB RGBA illustration) against oxipng 9.1.1 (as packaged in `pyoxipng`), compared with `--keep-hidden-pixels` so neither side gets credit for rewriting invisible pixels. Sizes are exact; times are wall-clock on 4 cores for the whole process.
 
 | Task | rust-compress vs. the established tool |
 |---|---|
 | Lossy JPEG (`-q 60/70/80`) | **At parity with mozjpeg at equal PSNR**: mean +1.4% / −0.4% / +0.6% size (per file −10% … +7%) |
 | Lossy JPEG speed | 51-246 ms vs `cjpeg` 64-410 ms (cjpeg excludes decoding; with trellis) |
 | Lossless JPEG (`-q 100`) | +0.6% vs `jpegtran -optimize -progressive` (range +0.1% … +1.0%), **faster** (55-206 ms vs 86-236 ms) |
-| Lossless PNG, default `-l 7` | +0.2% … +2.3% vs `oxipng -o2` (+1.7%, +0.2%, +2.3% on the three files); 0.85-1.6 s CPU vs 0.6-1.3 s |
-| Lossless PNG, `-l 9` | +1.3% … +3.0% vs `zopflipng` (15 iterations); 4.5-8 s, slower than `oxipng -o4` |
-| Lossless PNG, `-l 6` | ~12% larger than `oxipng -o2`, but 4-6× less CPU |
+| Lossless PNG, default `-l 7` | **Equal or smaller than `oxipng -o2` on 8 of 12 files**, worst +1.5%, best −19.2%; 12-image total −1.5%. Wall time 0.09-1.3 s per file vs 0.04-2.0 s for `-o2` (faster on the larger files) |
+| Lossless PNG, `-l 9` | **Equal or smaller than `oxipng -o4` on 11 of 12 files**, worst +0.7%, best −19.0%; total −1.6%. Wall time 0.3-6.9 s per file vs 0.1-3.4 s for `-o4` (slower on the largest image: 6.9 s vs 3.4 s) |
+| Lossless PNG, `-l 6` | +11% vs `oxipng -o2` in total (worst +16.6%), at a fraction of the CPU: the fast levels use hash-chain LZ77 only |
 | Lossy PNG (`--lossy`) | **Better than pngquant**: 0.4-1.0 dB higher PSNR at −4.3%, −4.5%, −4.0% size; 1.5-1.9× its CPU time |
 | PNG with hidden transparent pixels | tools that keep invisible RGB (oxipng by default) can be orders of magnitude larger: 580 KB → 4 KB on a noisy-under-alpha test image |
 
-So it matches the established tools on JPEG, beats pngquant on lossy PNG, and is a couple of percent behind oxipng/zopflipng on lossless PNG. Against weaker baselines it is far ahead (e.g. 14-28% smaller than PIL's `optimize=True` PNGs).
+So it matches the established tools on JPEG, beats pngquant on lossy PNG, and matches or beats oxipng on lossless PNG at `-l 7`/`-l 9`. Against weaker baselines it is far ahead (e.g. 14-28% smaller than PIL's `optimize=True` PNGs).
 
 What it offers beyond ratio: no C dependencies, one binary for both formats, a coefficient-domain JPEG pipeline, and parallel batch processing.
 
@@ -89,7 +91,7 @@ Requires a stable Rust toolchain (edition 2024); `rust-toolchain.toml` pins `sta
 
 ```
 src/util/       bit I/O, CRC-32 / Adler-32, canonical Huffman (shared by DEFLATE and JPEG)
-src/deflate/    inflate, LZ77 matcher, block encoder, optimal parser (level 9)
+src/deflate/    inflate, LZ77 matchers (hash chains; binary tree for levels 7-9), block encoder, optimal parser (levels 7-9)
 src/png/        decoder (all color types/depths, Adam7), filters, encoder (reduction + strategy search), quantizer
 src/jpeg/       decoder (baseline + progressive), DCT, baseline/progressive encoders, trellis quantization, quality search
 src/metrics.rs  SSIM

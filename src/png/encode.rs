@@ -348,16 +348,22 @@ fn reduce(img: &Image, level: u32) -> Reduced {
     }
 }
 
+/// Largest image (in bytes) for which the brute-force filter search is attempted.
+const BRUTE_MAX_BYTES: usize = 48 << 20;
+
 /// Pick the filter strategy by trial-compressing a sample of the image, then filter everything.
 fn filter_with_best_strategy(r: &Reduced, level: u32) -> Vec<u8> {
-    let candidates: Vec<Strategy> = if level < 2 {
+    // Brute compresses every candidate row ~5 times; skip it for huge images.
+    let brute = level >= 9 && r.rows.len() <= BRUTE_MAX_BYTES;
+    let mut candidates: Vec<Strategy> = if level < 2 {
         vec![if r.depth < 8 || r.color_type == 3 { Strategy::Fixed(0) } else { Strategy::MinSum }]
     } else if r.depth < 8 || r.color_type == 3 {
-        vec![Strategy::Fixed(0), Strategy::MinSum, Strategy::Entropy]
+        vec![Strategy::Fixed(0), Strategy::MinSum, Strategy::Entropy, Strategy::Bigrams]
     } else {
         vec![
             Strategy::MinSum,
             Strategy::Entropy,
+            Strategy::Bigrams,
             Strategy::Fixed(0),
             Strategy::Fixed(1),
             Strategy::Fixed(2),
@@ -365,12 +371,15 @@ fn filter_with_best_strategy(r: &Reduced, level: u32) -> Vec<u8> {
             Strategy::Fixed(4),
         ]
     };
+    if brute {
+        candidates.push(Strategy::Brute);
+    }
     if candidates.len() == 1 {
         return filter_image(&r.rows, r.row_bytes, r.bpp, candidates[0]);
     }
     // Representative sample: whole image if small, otherwise a few evenly spaced bands of rows.
     let budget: usize = if level >= 9 { 8 << 20 } else { 1 << 20 };
-    let trial_level = 2;
+    let trial_level = if level >= 7 { 6 } else { 2 };
     let sample: std::borrow::Cow<[u8]> = if r.rows.len() <= budget {
         std::borrow::Cow::Borrowed(&r.rows)
     } else {

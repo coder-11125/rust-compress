@@ -38,11 +38,14 @@ fn main() {
         let full = je::EncodeOptions::default();
         println!("  encode pixels q80 trellis   {:6.2} ms", median_ms(|| drop(je::encode(&img, &full).unwrap())));
         let ci = jd::parse(&data).unwrap().into_coefs().unwrap();
-        println!("  coef-domain requantize q80  {:6.2} ms", median_ms(|| {
-            let mut c = ci.clone();
-            c.requantize(80, false);
-            drop(je::write_jpeg(&c));
-        }));
+        println!(
+            "  coef-domain requantize q80  {:6.2} ms",
+            median_ms(|| {
+                let mut c = ci.clone();
+                c.requantize(80, false);
+                drop(je::write_jpeg(&c));
+            })
+        );
     } else {
         let img = pd::decode(&data).unwrap();
         println!("{}x{} PNG, {} B", img.width, img.height, data.len());

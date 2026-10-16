@@ -50,6 +50,30 @@ fn costs_from(f: &Freqs) -> Costs {
     c
 }
 
+/// Cost model for a first pass that knows nothing about the parse: literals cost what the chunk's own
+/// byte histogram says, and a match costs roughly an average length code plus a distance code with its
+/// extra bits. Starting from a parse that already uses many literals avoids the slow drift the
+/// statistics-driven refinement shows on noisy data, where a greedy parse seeds it with thousands of
+/// coincidental short matches that make literals look expensive.
+fn prior_costs(d: &[u8]) -> Costs {
+    let mut hist = [0u32; 256];
+    for &b in d {
+        hist[b as usize] += 1;
+    }
+    let n = d.len().max(1) as f32;
+    let mut c = Costs { lit: [0.0; 256], len: [0.0; MAX_MATCH + 1], dist: [0.0; 30] };
+    for b in 0..256 {
+        c.lit[b] = if hist[b] > 0 { (n / hist[b] as f32).log2() } else { n.log2() + 2.0 };
+    }
+    for l in 3..=MAX_MATCH {
+        c.len[l] = 5.0 + LEN_EXTRA[LEN_CODE[l] as usize] as f32;
+    }
+    for ds in 0..30 {
+        c.dist[ds] = 5.0 + DIST_EXTRA[ds] as f32;
+    }
+    c
+}
+
 /// Lengths up to this are always tried; above it only bucket edges and the last `TAIL` lengths.
 const DENSE: usize = 32;
 const TAIL: usize = 4;
@@ -192,30 +216,51 @@ fn greedy(d: &[u8], start: usize, end: usize, arena: &[(u16, u16)], offs: &[u32]
 }
 
 /// Tokenize `d[start..end]` with optimal parsing. The matcher's hash state advances past `end`.
-pub(super) fn optimal_tokens(
-    m: &mut Matcher,
-    d: &[u8],
-    start: usize,
-    end: usize,
-    iterations: u32,
-    hint_count: usize,
-    hints: &mut Vec<u16>,
-) -> Vec<Token> {
+pub(super) fn optimal_tokens(m: &mut Matcher, d: &[u8], start: usize, end: usize, iterations: u32) -> Vec<Token> {
     let mut arena: Vec<(u16, u16)> = Vec::new();
     let mut offs: Vec<u32> = Vec::with_capacity(end - start + 1);
     for p in start..end {
         offs.push(arena.len() as u32);
-        m.collect_matches(d, p, end, hints, &mut arena);
+        m.collect_matches(d, p, end, &mut arena);
     }
     offs.push(arena.len() as u32);
-    let mut best = greedy(d, start, end, &arena, &offs);
-    let mut best_bits = estimate_bits(&best);
+    // Two starting points: the longest-match parse, and a parse priced from the data's own byte
+    // histogram. Which one leads to the better fixed point depends on the data (the first suits image
+    // rows full of real repeats, the second noisy ones), so both are refined and the cheaper kept.
+    let (a, b) = rayon::join(
+        || {
+            let seed = greedy(d, start, end, &arena, &offs);
+            refine(d, start, end, &arena, &offs, seed, iterations, &mut Scratch::default())
+        },
+        || {
+            let mut scratch = Scratch::default();
+            let seed = shortest_path(d, start, end, &arena, &offs, &prior_costs(&d[start..end]), &mut scratch);
+            refine(d, start, end, &arena, &offs, seed, iterations, &mut scratch)
+        },
+    );
+    if b.0 < a.0 { b.1 } else { a.1 }
+}
+
+/// Repeatedly re-price the matches by the statistics of the previous parse and re-run the shortest
+/// path, starting from `seed`; stops after two passes without improvement. Returns (bits, tokens).
+#[allow(clippy::too_many_arguments)]
+fn refine(
+    d: &[u8],
+    start: usize,
+    end: usize,
+    arena: &[(u16, u16)],
+    offs: &[u32],
+    seed: Vec<Token>,
+    iterations: u32,
+    scratch: &mut Scratch,
+) -> (u64, Vec<Token>) {
+    let mut best_bits = estimate_bits(&seed);
+    let mut best = seed;
     let mut freqs = freqs_of(&best);
-    let mut scratch = Scratch::default();
     let mut stale = 0;
     for _ in 0..iterations {
         let costs = costs_from(&freqs);
-        let current = shortest_path(d, start, end, &arena, &offs, &costs, &mut scratch);
+        let current = shortest_path(d, start, end, arena, offs, &costs, scratch);
         let bits = estimate_bits(&current);
         freqs = freqs_of(&current);
         if bits < best_bits {
@@ -229,14 +274,5 @@ pub(super) fn optimal_tokens(
             }
         }
     }
-    // The distances this chunk actually used become the hints for the next one.
-    let mut counts = std::collections::HashMap::<u16, u32>::new();
-    for t in best.iter().filter(|t| t.is_match()) {
-        *counts.entry(t.dist() as u16).or_default() += 1;
-    }
-    let mut ranked: Vec<(u16, u32)> = counts.into_iter().filter(|&(_, c)| c >= 3).collect();
-    ranked.sort_by_key(|&(dist, c)| (std::cmp::Reverse(c), dist));
-    hints.clear();
-    hints.extend(ranked.iter().take(hint_count).map(|&(dist, _)| dist));
-    best
+    (best_bits, best)
 }
