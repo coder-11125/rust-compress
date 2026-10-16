@@ -38,9 +38,16 @@ fn decoder_is_pixel_exact_against_the_reference_decoder() {
 }
 
 #[test]
-fn lossy_and_garbage_are_clean_errors() {
-    let e = webp::decode(&fixture("webp_lossy.webp")).unwrap_err().to_string();
-    assert!(e.contains("lossy"), "{e}");
+fn lossy_files_decode_close_to_the_reference_and_garbage_is_an_error() {
+    let bytes = fixture("webp_lossy.webp");
+    let ours = webp::decode(&bytes).unwrap();
+    let (w, h, want) = reference_rgba16(&bytes);
+    assert_eq!((ours.width, ours.height), (w, h));
+    // The reference decoder may upsample chroma differently; the pictures must still agree closely.
+    let got = to_rgba16(&ours);
+    let mean: f64 = got.iter().zip(&want).map(|(&a, &b)| (a as i32 - b as i32).abs() as f64 / 257.0).sum::<f64>()
+        / got.len() as f64;
+    assert!(mean < 3.0, "mean difference {mean:.2} levels");
     assert!(webp::decode(b"RIFF\0\0\0\0WEBP").is_err());
     assert!(webp::decode(b"not webp at all").is_err());
 }
@@ -162,8 +169,9 @@ mod cli {
         let out = cmd().arg(&input).assert().success().get_output().clone();
         assert!(String::from_utf8_lossy(&out.stdout).contains("lossy WebP left unchanged"));
         assert_eq!(fs::read(d.path().join("lossy.min.webp")).unwrap(), fixture("webp_lossy.webp"));
-        // Converting it is a different matter: there is no lossy decoder.
-        cmd().arg(&input).args(["-f", "png"]).assert().failure();
+        // Converting is fine: lossy files can be decoded.
+        cmd().arg(&input).args(["-f", "png"]).assert().success();
+        assert!(image::open(d.path().join("lossy.min.png")).is_ok());
     }
 
     #[test]

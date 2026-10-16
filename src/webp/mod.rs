@@ -1,7 +1,9 @@
-//! WebP: container handling plus the lossless (VP8L) codec. Lossy (VP8) files are recognised but
-//! not decoded, and animated files are refused.
+//! WebP: container handling, the lossless (VP8L) codec and the lossy (VP8) codec. Animated files
+//! are refused.
 
+pub mod alpha;
 pub mod cluster;
+pub mod vp8;
 pub mod vp8l;
 pub mod vp8l_enc;
 
@@ -61,7 +63,8 @@ pub fn decode(data: &[u8]) -> Result<Image> {
     let chunks = chunks(data)?;
     let mut meta = Metadata::default();
     let mut lossless: Option<&[u8]> = None;
-    let mut lossy = false;
+    let mut lossy_data: Option<&[u8]> = None;
+    let mut alpha_data: Option<&[u8]> = None;
     for c in &chunks {
         match &c.id {
             b"VP8X" => {
@@ -71,7 +74,8 @@ pub fn decode(data: &[u8]) -> Result<Image> {
             }
             b"ANIM" | b"ANMF" => return Err(Error::unsupported("animated WebP")),
             b"VP8L" if lossless.is_none() => lossless = Some(c.body),
-            b"VP8 " => lossy = true,
+            b"VP8 " if lossy_data.is_none() => lossy_data = Some(c.body),
+            b"ALPH" if alpha_data.is_none() => alpha_data = Some(c.body),
             b"ICCP" => meta.icc = Some(c.body.to_vec()),
             b"EXIF" => {
                 // Some writers keep the JPEG-style "Exif\0\0" prefix; the bare TIFF block is what we store.
@@ -82,11 +86,25 @@ pub fn decode(data: &[u8]) -> Result<Image> {
         }
     }
     let Some(body) = lossless else {
-        return Err(if lossy {
-            Error::unsupported("lossy WebP (VP8); only lossless WebP is supported")
-        } else {
-            Error::invalid("WebP file without image data")
-        });
+        let Some(frame_data) = lossy_data else {
+            return Err(Error::invalid("WebP file without image data"));
+        };
+        let frame = vp8::decode::decode_frame(frame_data)?;
+        let (w, h) = (frame.width, frame.height);
+        let rgb = vp8::yuv::yuv420_to_rgb(w, h, &frame.y, frame.y_stride, &frame.u, &frame.v, frame.uv_stride);
+        let mut img = match alpha_data {
+            Some(a) => {
+                let plane = alpha::decode(a, w, h)?;
+                let mut out = Vec::with_capacity(w * h * 4);
+                for (px, &al) in rgb.chunks_exact(3).zip(&plane) {
+                    out.extend_from_slice(&[px[0], px[1], px[2], al]);
+                }
+                Image::new(w as u32, h as u32, ColorType::Rgba, 8, out)?
+            }
+            None => Image::new(w as u32, h as u32, ColorType::Rgb, 8, rgb)?,
+        };
+        img.meta = meta;
+        return Ok(img);
     };
     let d = vp8l::decode(body)?;
     debug_assert!((d.width * d.height) as u64 <= MAX_PIXELS);

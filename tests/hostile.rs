@@ -4,6 +4,7 @@ mod common;
 use common::fixture;
 use rust_compress::{jpeg, png};
 use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 const PNGS: &[&str] = &[
@@ -167,6 +168,33 @@ fn damaged_webps_never_panic() {
         "webp_lossy.webp",
     ] {
         hammer(name, &fixture(name), exercise_webp, &mut failures);
+    }
+    report(failures);
+}
+
+fn vp8_fixture(name: &str) -> Vec<u8> {
+    let p: PathBuf = [env!("CARGO_MANIFEST_DIR"), "tests", "fixtures", "vp8", name].iter().collect();
+    std::fs::read(p).unwrap()
+}
+
+#[test]
+fn damaged_lossy_webps_never_panic() {
+    let mut failures = Vec::new();
+    for name in [
+        "q75_photo.webp",
+        "q10_m6.webp",
+        "seg3.webp",
+        "part3.webp",
+        "simple_filter.webp",
+        "sharp7.webp",
+        "size_3x2.webp",
+        "size_33x1.webp",
+        "alpha_default.webp",
+        "alpha_raw.webp",
+        "alpha_filter_best.webp",
+        "alpha_small.webp",
+    ] {
+        hammer(name, &vp8_fixture(name), |b| drop(rust_compress::webp::decode(b)), &mut failures);
     }
     report(failures);
 }
