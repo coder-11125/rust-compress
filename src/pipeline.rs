@@ -1,13 +1,13 @@
 //! Per-file processing: read -> decode -> encode -> never-grow check -> atomic write.
 
 use crate::cli::{Cli, SubsamplingArg};
-use crate::collect::{Format, Job, target_format};
+use crate::collect::{Format, Job, is_stdio, target_format};
 use crate::error::{Error, Result};
 use crate::image::Image;
 use crate::report::{Report, Status};
 use crate::{jpeg, png};
 use std::fs;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::Path;
 
 /// An encoded file plus an optional note for the report (e.g. the quality that was chosen).
@@ -145,6 +145,17 @@ fn write_atomic(path: &Path, data: &[u8]) -> Result<()> {
     result.map_err(Error::from)
 }
 
+/// Write the result to its destination: standard output for `-`, otherwise an atomically replaced file.
+fn write_output(path: &Path, data: &[u8]) -> Result<()> {
+    if is_stdio(path) {
+        let mut out = std::io::stdout().lock();
+        out.write_all(data)?;
+        out.flush()?;
+        return Ok(());
+    }
+    write_atomic(path, data)
+}
+
 fn run(job: &Job, cli: &Cli, data: &[u8]) -> Result<(Status, u64, Option<String>)> {
     let in_fmt = Format::sniff(data)
         .or_else(|| Format::from_extension(&job.input))
@@ -153,7 +164,7 @@ fn run(job: &Job, cli: &Cli, data: &[u8]) -> Result<(Status, u64, Option<String>
     if cli.in_place && out_fmt != in_fmt {
         return Err(Error::unsupported("--in-place cannot be combined with a format change"));
     }
-    if !cli.in_place && !cli.force && !cli.dry_run && job.output.exists() {
+    if !cli.in_place && !cli.force && !cli.dry_run && !is_stdio(&job.output) && job.output.exists() {
         return Err(Error::unsupported(format!("{} already exists (use --force)", job.output.display())));
     }
     let encoded = if in_fmt == Format::Jpeg && out_fmt == Format::Jpeg {
@@ -171,12 +182,12 @@ fn run(job: &Job, cli: &Cli, data: &[u8]) -> Result<(Status, u64, Option<String>
     if same_format && encoded.len() >= data.len() {
         // Never make the file bigger. Keep the original bytes (copy them when writing elsewhere).
         if !cli.in_place && !cli.dry_run {
-            write_atomic(&job.output, data)?;
+            write_output(&job.output, data)?;
         }
         return Ok((Status::NoGain, data.len() as u64, note));
     }
     if !cli.dry_run {
-        write_atomic(&job.output, &encoded)?;
+        write_output(&job.output, &encoded)?;
     }
     Ok((Status::Compressed, encoded.len() as u64, note))
 }
@@ -190,7 +201,13 @@ pub fn process(job: &Job, cli: &Cli) -> Report {
         status: Status::NoGain,
         note: None,
     };
-    let data = match fs::read(&job.input) {
+    let read = if is_stdio(&job.input) {
+        let mut buf = Vec::new();
+        std::io::stdin().lock().read_to_end(&mut buf).map(|_| buf)
+    } else {
+        fs::read(&job.input)
+    };
+    let data = match read {
         Ok(d) => d,
         Err(e) => {
             report.status = Status::Failed(e.to_string());

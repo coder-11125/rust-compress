@@ -23,7 +23,7 @@ pub enum SubsamplingArg {
 #[derive(Parser, Debug)]
 #[command(name = "rust-compress", version, about)]
 pub struct Cli {
-    /// Image files and/or directories to compress.
+    /// Image files and/or directories to compress. Use `-` to read one image from standard input.
     #[arg(required = true, value_name = "INPUT")]
     pub inputs: Vec<PathBuf>,
 
@@ -31,7 +31,8 @@ pub struct Cli {
     #[arg(short, long)]
     pub recursive: bool,
 
-    /// Output file (single input file) or output directory. Default: write `<name>.min.<ext>` next to each input.
+    /// Output file (single input file) or output directory; `-` writes the image to standard output.
+    /// Default: write `<name>.min.<ext>` next to each input (standard input defaults to standard output).
     #[arg(short, long, value_name = "PATH")]
     pub output: Option<PathBuf>,
 

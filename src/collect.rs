@@ -43,6 +43,13 @@ pub struct Job {
     pub output: PathBuf,
 }
 
+/// The path spelling that means standard input (as an input) or standard output (as `-o`).
+pub const STDIO: &str = "-";
+
+pub fn is_stdio(p: &Path) -> bool {
+    p.as_os_str() == STDIO
+}
+
 pub fn target_format(cli: &Cli, input: Format) -> Format {
     match cli.format {
         FormatArg::Keep => input,
@@ -108,6 +115,32 @@ fn walk(dir: &Path, recursive: bool, out: &mut Vec<PathBuf>) -> std::io::Result<
 /// Returns jobs plus human-readable problems with individual inputs.
 pub fn collect(cli: &Cli) -> (Vec<Job>, Vec<String>) {
     let mut problems = Vec::new();
+    let to_stdout = cli.output.as_deref().is_some_and(is_stdio);
+    let from_stdin = cli.inputs.iter().filter(|p| is_stdio(p)).count();
+    if from_stdin > 0 || to_stdout {
+        // Streams carry exactly one image: no directory walking, no batches, no in-place edits.
+        if cli.inputs.len() != 1 {
+            problems.push("standard input/output can only be used with a single input".to_string());
+        } else if cli.in_place {
+            problems.push("--in-place cannot be combined with standard input/output".to_string());
+        } else if cli.inputs[0].is_dir() {
+            problems.push(format!("{}: cannot write a directory to standard output", cli.inputs[0].display()));
+        } else if from_stdin == 0 && !cli.inputs[0].is_file() {
+            problems.push(format!("{}: no such file or directory", cli.inputs[0].display()));
+        }
+        if !problems.is_empty() {
+            return (Vec::new(), problems);
+        }
+        let input = cli.inputs[0].clone();
+        // Reading a pipe with no -o writes to a pipe, the convention for filters.
+        let output = if to_stdout || from_stdin > 0 && cli.output.is_none() {
+            PathBuf::from(STDIO)
+        } else {
+            let rel = PathBuf::from(input.file_name().unwrap_or_default());
+            output_path(cli, &input, &rel, false)
+        };
+        return (vec![Job { input, output }], problems);
+    }
     let n_file_inputs = cli.inputs.iter().filter(|p| !p.is_dir()).count();
     let any_dir = cli.inputs.iter().any(|p| p.is_dir());
     let dir_mode = is_dir_output(cli, n_file_inputs, any_dir);
