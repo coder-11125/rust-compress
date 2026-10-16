@@ -99,6 +99,7 @@ fn decode(data: &[u8], fmt: Format) -> Result<Image> {
     match fmt {
         Format::Png => png::decode::decode(data),
         Format::Gif => crate::gif::decode(data),
+        Format::Webp => crate::webp::decode(data),
         // The orientation is baked into the pixels, so the tag must not rotate them a second time.
         Format::Jpeg => Ok(upright(jpeg::decode::decode(data)?, jpeg::decode::exif_orientation(data))),
     }
@@ -187,6 +188,16 @@ fn encode(img: &Image, fmt: Format, cli: &Cli) -> Result<Encoded> {
             .into())
         }
         Format::Jpeg => encode_jpeg_pixels(img, cli, cli.quality),
+        Format::Webp => {
+            if img.width > crate::webp::MAX_DIMENSION || img.height > crate::webp::MAX_DIMENSION {
+                return Err(Error::unsupported(format!(
+                    "WebP images are limited to {0}x{0} pixels",
+                    crate::webp::MAX_DIMENSION
+                )));
+            }
+            let opts = crate::webp::EncodeOptions { level: cli.level as u32, clean_alpha: !cli.keep_hidden_pixels };
+            Ok(crate::webp::encode(img, &opts).into())
+        }
         Format::Gif => Err(Error::unsupported("GIF output")),
     }
 }
@@ -223,9 +234,9 @@ fn write_output(path: &Path, data: &[u8]) -> Result<()> {
 }
 
 fn run(job: &Job, cli: &Cli, data: &[u8]) -> Result<(Status, u64, Option<String>)> {
-    let in_fmt = Format::sniff(data)
-        .or_else(|| Format::from_extension(&job.input))
-        .ok_or_else(|| Error::unsupported("unrecognized image format (supported: PNG, JPEG, and GIF as input)"))?;
+    let in_fmt = Format::sniff(data).or_else(|| Format::from_extension(&job.input)).ok_or_else(|| {
+        Error::unsupported("unrecognized image format (supported: PNG, JPEG, lossless WebP, and GIF as input)")
+    })?;
     let out_fmt = target_format(cli, in_fmt);
     if out_fmt == Format::Gif {
         return Err(Error::unsupported("GIF files can only be converted: use --format png or --format jpeg"));
@@ -236,12 +247,19 @@ fn run(job: &Job, cli: &Cli, data: &[u8]) -> Result<(Status, u64, Option<String>
     if !cli.in_place && !cli.force && !cli.dry_run && !is_stdio(&job.output) && job.output.exists() {
         return Err(Error::unsupported(format!("{} already exists (use --force)", job.output.display())));
     }
-    // Recompressing an animation as a still would drop every frame but the first, so leave it as it is.
-    if in_fmt == Format::Png && out_fmt == Format::Png && png::is_animated(data) {
+    // Recompressing an animation as a still would drop every frame but the first, and lossy WebP has
+    // no decoder here, so such files are left exactly as they are.
+    let untouchable = match (in_fmt, out_fmt) {
+        (Format::Png, Format::Png) if png::is_animated(data) => Some("animated PNG left unchanged"),
+        (Format::Webp, Format::Webp) => crate::webp::unsupported_reason(data)
+            .map(|r| if r == "lossy WebP" { "lossy WebP left unchanged" } else { "animated WebP left unchanged" }),
+        _ => None,
+    };
+    if let Some(note) = untouchable {
         if !cli.in_place && !cli.dry_run {
             write_output(&job.output, data)?;
         }
-        return Ok((Status::NoGain, data.len() as u64, Some("animated PNG left unchanged".into())));
+        return Ok((Status::NoGain, data.len() as u64, Some(note.into())));
     }
     let encoded = if in_fmt == Format::Jpeg && out_fmt == Format::Jpeg {
         jpeg_to_jpeg(data, cli)?

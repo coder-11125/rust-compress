@@ -12,3 +12,4 @@ pub mod png;
 pub mod report;
 pub mod resize;
 pub mod util;
+pub mod webp;

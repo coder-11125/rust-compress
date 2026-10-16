@@ -74,6 +74,20 @@ fn exercise_gif(bytes: &[u8]) {
     }
 }
 
+fn exercise_webp(bytes: &[u8]) {
+    let _ = rust_compress::webp::unsupported_reason(bytes);
+    if let Ok(img) = rust_compress::webp::decode(bytes) {
+        // Whatever decoded must survive a re-encode and decode back to the same pixels.
+        let opts = rust_compress::webp::EncodeOptions { level: 3, clean_alpha: false };
+        if img.width <= 4096 && img.height <= 4096 {
+            let back =
+                rust_compress::webp::decode(&rust_compress::webp::encode(&img, &opts)).expect("own output decodes");
+            // Opaque RGBA is stored as RGB, so compare as canonical RGBA.
+            assert_eq!(common::to_rgba16(&back), common::to_rgba16(&img));
+        }
+    }
+}
+
 type Exercise = fn(&[u8]);
 
 /// Apply `exercise` to many damaged variants of `original`; collect panics and slow runs.
@@ -134,6 +148,25 @@ fn damaged_gifs_never_panic() {
     let mut failures = Vec::new();
     for name in ["gif_plain.gif", "gif_interlaced.gif", "gif_transparent.gif", "gif_anim.gif"] {
         hammer(name, &fixture(name), exercise_gif, &mut failures);
+    }
+    report(failures);
+}
+
+#[test]
+fn damaged_webps_never_panic() {
+    let mut failures = Vec::new();
+    for name in [
+        "webp_rgb.webp",
+        "webp_rgba.webp",
+        "webp_pal.webp",
+        "webp_bw.webp",
+        "webp_tiled.webp",
+        "webp_noise4.webp",
+        "webp_noise16.webp",
+        "webp_noise256.webp",
+        "webp_lossy.webp",
+    ] {
+        hammer(name, &fixture(name), exercise_webp, &mut failures);
     }
     report(failures);
 }

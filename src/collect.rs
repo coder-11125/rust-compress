@@ -8,8 +8,10 @@ use std::path::{Path, PathBuf};
 pub enum Format {
     Png,
     Jpeg,
-    /// Input only: GIFs are converted to PNG or JPEG.
+    /// Input only: GIFs are converted to PNG, JPEG or WebP.
     Gif,
+    /// Lossless WebP.
+    Webp,
 }
 
 impl Format {
@@ -18,6 +20,7 @@ impl Format {
             "png" => Some(Format::Png),
             "jpg" | "jpeg" | "jpe" => Some(Format::Jpeg),
             "gif" => Some(Format::Gif),
+            "webp" => Some(Format::Webp),
             _ => None,
         }
     }
@@ -29,6 +32,8 @@ impl Format {
             Some(Format::Jpeg)
         } else if crate::gif::is_gif(data) {
             Some(Format::Gif)
+        } else if crate::webp::is_webp(data) {
+            Some(Format::Webp)
         } else {
             None
         }
@@ -39,6 +44,7 @@ impl Format {
             Format::Png => "png",
             Format::Jpeg => "jpg",
             Format::Gif => "gif",
+            Format::Webp => "webp",
         }
     }
 }
@@ -61,6 +67,7 @@ pub fn target_format(cli: &Cli, input: Format) -> Format {
         FormatArg::Keep => input,
         FormatArg::Png => Format::Png,
         FormatArg::Jpeg => Format::Jpeg,
+        FormatArg::Webp => Format::Webp,
     }
 }
 
@@ -79,9 +86,12 @@ fn output_path(cli: &Cli, input: &Path, rel: &Path, dir_mode: bool) -> PathBuf {
     // Keep the original extension spelling when the format is unchanged.
     let ext = match (fmt_in, cli.format) {
         (Some(_), FormatArg::Keep) => ext_in.unwrap_or_default(),
-        (Some(Format::Png), FormatArg::Png) | (Some(Format::Jpeg), FormatArg::Jpeg) => ext_in.unwrap_or_default(),
+        (Some(Format::Png), FormatArg::Png)
+        | (Some(Format::Jpeg), FormatArg::Jpeg)
+        | (Some(Format::Webp), FormatArg::Webp) => ext_in.unwrap_or_default(),
         (_, FormatArg::Png) => "png".to_string(),
         (_, FormatArg::Jpeg) => "jpg".to_string(),
+        (_, FormatArg::Webp) => "webp".to_string(),
         (None, FormatArg::Keep) => String::new(),
     };
     if cli.in_place {
