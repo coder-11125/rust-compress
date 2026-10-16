@@ -8,6 +8,8 @@ use std::path::{Path, PathBuf};
 pub enum Format {
     Png,
     Jpeg,
+    /// Input only: GIFs are converted to PNG or JPEG.
+    Gif,
 }
 
 impl Format {
@@ -15,6 +17,7 @@ impl Format {
         match path.extension()?.to_str()?.to_ascii_lowercase().as_str() {
             "png" => Some(Format::Png),
             "jpg" | "jpeg" | "jpe" => Some(Format::Jpeg),
+            "gif" => Some(Format::Gif),
             _ => None,
         }
     }
@@ -24,6 +27,8 @@ impl Format {
             Some(Format::Png)
         } else if data.starts_with(&[0xFF, 0xD8, 0xFF]) {
             Some(Format::Jpeg)
+        } else if crate::gif::is_gif(data) {
+            Some(Format::Gif)
         } else {
             None
         }
@@ -33,6 +38,7 @@ impl Format {
         match self {
             Format::Png => "png",
             Format::Jpeg => "jpg",
+            Format::Gif => "gif",
         }
     }
 }
@@ -91,7 +97,7 @@ fn output_path(cli: &Cli, input: &Path, rel: &Path, dir_mode: bool) -> PathBuf {
     }
 }
 
-fn walk(dir: &Path, recursive: bool, out: &mut Vec<PathBuf>) -> std::io::Result<()> {
+fn walk(dir: &Path, recursive: bool, gifs: bool, out: &mut Vec<PathBuf>) -> std::io::Result<()> {
     let mut entries: Vec<_> = std::fs::read_dir(dir)?.collect::<Result<_, _>>()?;
     entries.sort_by_key(|e| e.file_name());
     for e in entries {
@@ -99,9 +105,9 @@ fn walk(dir: &Path, recursive: bool, out: &mut Vec<PathBuf>) -> std::io::Result<
         let ty = e.file_type()?;
         if ty.is_dir() {
             if recursive {
-                walk(&p, recursive, out)?;
+                walk(&p, recursive, gifs, out)?;
             }
-        } else if ty.is_file() && Format::from_extension(&p).is_some() {
+        } else if ty.is_file() && Format::from_extension(&p).is_some_and(|f| gifs || f != Format::Gif) {
             // Skip our own default outputs so reruns do not recompress them.
             let stem = p.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
             if !stem.ends_with(".min") {
@@ -148,7 +154,8 @@ pub fn collect(cli: &Cli) -> (Vec<Job>, Vec<String>) {
     for input in &cli.inputs {
         if input.is_dir() {
             let mut files = Vec::new();
-            if let Err(e) = walk(input, cli.recursive, &mut files) {
+            // GIFs can only be converted, so directory walks skip them unless a target format was chosen.
+            if let Err(e) = walk(input, cli.recursive, cli.format != FormatArg::Keep, &mut files) {
                 problems.push(format!("{}: {e}", input.display()));
                 continue;
             }

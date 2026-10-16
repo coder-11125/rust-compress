@@ -67,6 +67,13 @@ fn exercise_jpeg(bytes: &[u8]) {
     }
 }
 
+fn exercise_gif(bytes: &[u8]) {
+    if let Ok(img) = rust_compress::gif::decode(bytes) {
+        let opts = png::encode::EncodeOptions { level: 1, ..Default::default() };
+        let _ = png::encode::encode(&img, &opts);
+    }
+}
+
 type Exercise = fn(&[u8]);
 
 /// Apply `exercise` to many damaged variants of `original`; collect panics and slow runs.
@@ -118,6 +125,15 @@ fn damaged_pngs_never_panic() {
     let mut failures = Vec::new();
     for name in PNGS {
         hammer(name, &fixture(name), exercise_png, &mut failures);
+    }
+    report(failures);
+}
+
+#[test]
+fn damaged_gifs_never_panic() {
+    let mut failures = Vec::new();
+    for name in ["gif_plain.gif", "gif_interlaced.gif", "gif_transparent.gif", "gif_anim.gif"] {
+        hammer(name, &fixture(name), exercise_gif, &mut failures);
     }
     report(failures);
 }

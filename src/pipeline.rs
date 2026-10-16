@@ -98,6 +98,7 @@ fn upright(img: Image, orientation: u8) -> Image {
 fn decode(data: &[u8], fmt: Format) -> Result<Image> {
     match fmt {
         Format::Png => png::decode::decode(data),
+        Format::Gif => crate::gif::decode(data),
         // The orientation is baked into the pixels, so the tag must not rotate them a second time.
         Format::Jpeg => Ok(upright(jpeg::decode::decode(data)?, jpeg::decode::exif_orientation(data))),
     }
@@ -178,6 +179,7 @@ fn encode(img: &Image, fmt: Format, cli: &Cli) -> Result<Encoded> {
             .into())
         }
         Format::Jpeg => encode_jpeg_pixels(img, cli, cli.quality),
+        Format::Gif => Err(Error::unsupported("GIF output")),
     }
 }
 
@@ -215,8 +217,11 @@ fn write_output(path: &Path, data: &[u8]) -> Result<()> {
 fn run(job: &Job, cli: &Cli, data: &[u8]) -> Result<(Status, u64, Option<String>)> {
     let in_fmt = Format::sniff(data)
         .or_else(|| Format::from_extension(&job.input))
-        .ok_or_else(|| Error::unsupported("unrecognized image format (only PNG and JPEG are supported)"))?;
+        .ok_or_else(|| Error::unsupported("unrecognized image format (supported: PNG, JPEG, and GIF as input)"))?;
     let out_fmt = target_format(cli, in_fmt);
+    if out_fmt == Format::Gif {
+        return Err(Error::unsupported("GIF files can only be converted: use --format png or --format jpeg"));
+    }
     if cli.in_place && out_fmt != in_fmt {
         return Err(Error::unsupported("--in-place cannot be combined with a format change"));
     }
