@@ -354,15 +354,15 @@ impl<'a, C: Coder> TileCoder<'a, C> {
                 let u = &self.f.lr_units[plane];
                 (u.0, u.1, ())
             };
-            let row_start = (r * (4 >> sy) + unit_size - 1) / unit_size;
-            let row_end = unit_rows.min(((r + h) * (4 >> sy) + unit_size - 1) / unit_size);
+            let row_start = (r * (4 >> sy)).div_ceil(unit_size);
+            let row_end = unit_rows.min(((r + h) * (4 >> sy)).div_ceil(unit_size));
             let (num, den) = if self.f.hdr.use_superres {
                 ((4 >> sx) * self.f.hdr.superres_denom, unit_size * 8)
             } else {
                 (4 >> sx, unit_size)
             };
-            let col_start = (c * num + den - 1) / den;
-            let col_end = unit_cols.min(((c + w) * num + den - 1) / den);
+            let col_start = (c * num).div_ceil(den);
+            let col_end = unit_cols.min(((c + w) * num).div_ceil(den));
             for ur in row_start..row_end {
                 for uc in col_start..col_end {
                     self.read_lr_unit(plane, ur, uc);
@@ -631,13 +631,8 @@ impl<'a, C: Coder> TileCoder<'a, C> {
         let bw4 = NUM_4X4_WIDE[bsize as usize] as usize;
         let bh4 = NUM_4X4_HIGH[bsize as usize] as usize;
         let (ssx, ssy) = (self.f.sub_x, self.f.sub_y);
-        b.has_chroma = if bh4 == 1 && ssy == 1 && (r & 1) == 0 {
-            false
-        } else if bw4 == 1 && ssx == 1 && (c & 1) == 0 {
-            false
-        } else {
-            self.f.num_planes > 1
-        };
+        b.has_chroma =
+            !(bh4 == 1 && ssy == 1 && (r & 1) == 0 || bw4 == 1 && ssx == 1 && (c & 1) == 0) && self.f.num_planes > 1;
         b.avail_u = self.is_inside(r as isize - 1, c as isize);
         b.avail_l = self.is_inside(r as isize, c as isize - 1);
         b.avail_u_chroma = b.avail_u;
@@ -851,10 +846,8 @@ impl<'a, C: Coder> TileCoder<'a, C> {
         let prev_u = if b.avail_u { self.f.seg_id[self.mi(r - 1, c)] as i32 } else { -1 };
         let prev_l = if b.avail_l { self.f.seg_id[self.mi(r, c - 1)] as i32 } else { -1 };
         let pred = if prev_u == -1 {
-            if prev_l == -1 { 0 } else { prev_l }
-        } else if prev_l == -1 {
-            prev_u
-        } else if prev_ul == prev_u {
+            prev_l.max(0)
+        } else if prev_l == -1 || prev_ul == prev_u {
             prev_u
         } else {
             prev_l
@@ -1364,6 +1357,7 @@ impl<C: Coder> TileCoder<'_, C> {
         uv_tx
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn transform_block(&mut self, b: &Blk, plane: usize, base_x: usize, base_y: usize, tx_sz: u8, x: usize, y: usize) {
         let start_x = base_x + 4 * x;
         let start_y = base_y + 4 * y;
@@ -1396,8 +1390,8 @@ impl<C: Coder> TileCoder<'_, C> {
             let have_left = (if plane == 0 { b.avail_l } else { b.avail_l_chroma }) || x > 0;
             let have_above = (if plane == 0 { b.avail_u } else { b.avail_u_chroma }) || y > 0;
             let bd = &self.block_decoded[plane];
-            let have_ar = bd[(sub_row >> sy)][(sub_col >> sx) + step_x + 1];
-            let have_bl = bd[(sub_row >> sy) + step_y + 1][(sub_col >> sx)];
+            let have_ar = bd[sub_row >> sy][(sub_col >> sx) + step_x + 1];
+            let have_bl = bd[(sub_row >> sy) + step_y + 1][sub_col >> sx];
             self.predict_intra_block(b, plane, start_x, start_y, tx_sz, have_left, have_above, have_ar, have_bl, mode);
             if is_cfl {
                 self.predict_cfl(b, plane, start_x, start_y, tx_sz);
@@ -1505,7 +1499,7 @@ impl<C: Coder> TileCoder<'_, C> {
             bit_depth,
         };
         let stride = pl.stride;
-        ipred::predict(&mut pl.data[y * stride + x..], stride, &mut edges, &params);
+        ipred::predict(&mut pl.data[y * stride + x..], stride, &edges, &params);
     }
 
     fn predict_cfl(&mut self, b: &Blk, plane: usize, x: usize, y: usize, tx_sz: u8) {
@@ -1581,7 +1575,7 @@ impl<C: Coder> TileCoder<'_, C> {
         // 0 = DCT only, 1 = 7-type set, 2 = 5-type set
         let sqr_up = TX_SQR_UP[tx_sz as usize];
         let sqr = TX_SQR[tx_sz as usize];
-        if sqr_up > TX_32X32 || sqr_up == TX_32X32 {
+        if sqr_up >= TX_32X32 {
             0
         } else if self.f.hdr.reduced_tx_set || sqr == TX_16X16 {
             2

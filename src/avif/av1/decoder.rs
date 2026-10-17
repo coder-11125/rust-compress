@@ -63,10 +63,10 @@ pub fn decode(data: &[u8]) -> Result<Decoded> {
             }
             _ => {}
         }
-        if let (Some(h), true) = (hdr.as_ref(), state.is_some()) {
-            if tiles_done == h.tile_info.cols * h.tile_info.rows {
-                break;
-            }
+        if let (Some(h), true) = (hdr.as_ref(), state.is_some())
+            && tiles_done == h.tile_info.cols * h.tile_info.rows
+        {
+            break;
         }
     }
     let (Some(seq), Some(hdr), Some(fs)) = (seq, hdr, state) else {
@@ -81,7 +81,7 @@ pub fn decode(data: &[u8]) -> Result<Decoded> {
 
 fn check_limits(seq: &SequenceHeader, h: &FrameHeader) -> Result<()> {
     let pixels = h.upscaled_width as u64 * h.frame_height as u64;
-    if pixels > crate::image::MAX_PIXELS as u64 {
+    if pixels > crate::image::MAX_PIXELS {
         return Err(Error::unsupported("AV1 picture too large"));
     }
     if seq.color.mono_chrome && h.frame_type > 3 {

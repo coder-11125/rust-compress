@@ -98,7 +98,7 @@ impl<'a> SymbolDecoder<'a> {
         loop {
             u = v;
             let icdf = 32768 - cdf[sym] as u32;
-            v = ((r >> 8) * (icdf >> EC_PROB_SHIFT) >> (7 - EC_PROB_SHIFT)) + EC_MIN_PROB * (n - sym - 1) as u32;
+            v = (((r >> 8) * (icdf >> EC_PROB_SHIFT)) >> (7 - EC_PROB_SHIFT)) + EC_MIN_PROB * (n - sym - 1) as u32;
             if c >= v {
                 break;
             }
@@ -148,12 +148,12 @@ impl SymbolEncoder {
         let mut r = self.rng;
         let n = (nsyms - 1) as u32;
         if fl < 32768 {
-            let u = ((r >> 8) * (fl >> EC_PROB_SHIFT) >> (7 - EC_PROB_SHIFT)) + EC_MIN_PROB * (n - (s as u32 - 1));
-            let v = ((r >> 8) * (fh >> EC_PROB_SHIFT) >> (7 - EC_PROB_SHIFT)) + EC_MIN_PROB * (n - s as u32);
+            let u = (((r >> 8) * (fl >> EC_PROB_SHIFT)) >> (7 - EC_PROB_SHIFT)) + EC_MIN_PROB * (n - (s as u32 - 1));
+            let v = (((r >> 8) * (fh >> EC_PROB_SHIFT)) >> (7 - EC_PROB_SHIFT)) + EC_MIN_PROB * (n - s as u32);
             l += (r - u) as u64;
             r = u - v;
         } else {
-            r -= ((r >> 8) * (fh >> EC_PROB_SHIFT) >> (7 - EC_PROB_SHIFT)) + EC_MIN_PROB * (n - s as u32);
+            r -= (((r >> 8) * (fh >> EC_PROB_SHIFT)) >> (7 - EC_PROB_SHIFT)) + EC_MIN_PROB * (n - s as u32);
         }
         self.normalize(l, r);
     }
@@ -346,7 +346,7 @@ mod tests {
             let ops: Vec<(usize, usize, bool)> = (0..count)
                 .map(|_| {
                     let c = (rng.next() % nctx as u32) as usize;
-                    let literal = rng.next() % 5 == 0;
+                    let literal = rng.next().is_multiple_of(5);
                     let v = if literal { (rng.next() & 1) as usize } else { (rng.next() % sizes[c] as u32) as usize };
                     (c, v, literal)
                 })

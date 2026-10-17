@@ -322,7 +322,7 @@ pub fn uniform_tile_info(
     t.rows = t.mi_row_starts.len();
     t.mi_row_starts.push(mi_rows);
     // The log2 values written are those implied by the actual tile counts.
-    t.cols_log2 = (t.cols.next_power_of_two()).ilog2().max(0);
-    t.rows_log2 = (t.rows.next_power_of_two()).ilog2().max(0);
+    t.cols_log2 = (t.cols.next_power_of_two()).ilog2();
+    t.rows_log2 = (t.rows.next_power_of_two()).ilog2();
     t
 }
