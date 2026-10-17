@@ -969,7 +969,7 @@ pub fn forward_transform(
     let rect = lw.abs_diff(lh) == 1;
     let scale = |v: i32, s: i32| if s >= 0 { v << s } else { round_shift(v, (-s) as u32) };
 
-    let mut mid = [0i32; 64 * 64];
+    let mut mid = vec![0i32; w * h];
     let mut input = [0i32; 64];
     let mut output = [0i32; 64];
     for j in 0..w {

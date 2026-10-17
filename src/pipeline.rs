@@ -218,7 +218,7 @@ fn encode(img: &Image, fmt: Format, cli: &Cli) -> Result<Encoded> {
                 SubsamplingArg::S444 => true,
                 SubsamplingArg::S420 => false,
             };
-            let opts = crate::avif::encode::EncodeOptions { quality: cli.quality, full_chroma };
+            let opts = crate::avif::encode::EncodeOptions { quality: cli.quality, full_chroma, effort: cli.level };
             let mut encoded: Encoded = crate::avif::encode::encode(img, &opts)?.into();
             if img.depth == 16 {
                 encoded.note = Some("16-bit reduced to 8-bit".into());

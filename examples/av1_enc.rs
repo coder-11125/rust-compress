@@ -55,6 +55,9 @@ fn main() {
     if let Ok(v) = std::env::var("AV1_LAMBDA") {
         p.lambda_scale = v.parse().unwrap();
     }
+    if let Ok(v) = std::env::var("AV1_EFFORT") {
+        p.effort = v.parse().unwrap();
+    }
     if let Ok(v) = std::env::var("AV1_ROUND") {
         p.quant_round = v.parse().unwrap();
     }

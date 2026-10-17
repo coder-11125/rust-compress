@@ -68,7 +68,7 @@ pub struct Cli {
     #[arg(long, default_value_t = 0.5)]
     pub dither: f32,
 
-    /// PNG / WebP effort (0-9). For PNG, 1-6 use greedy/lazy parsing (6 is fast) and 7-9 optimal parsing
+    /// PNG / WebP / AVIF effort (0-9). For PNG, 1-6 use greedy/lazy parsing (6 is fast) and 7-9 optimal parsing
     /// (7 default, 9 smallest and slowest).
     #[arg(short, long, default_value_t = 7, value_parser = clap::value_parser!(u8).range(0..=9))]
     pub level: u8,

@@ -2036,8 +2036,8 @@ pub(crate) fn code_txb<K: Coder>(k: &mut K, cdf: &mut Cdfs, s: &TxbSetup, cb: &m
 
         // Levels, in reverse scan order.
         let stride = 36usize;
-        let mut levels = [0u8; 36 * 36];
-        let mut quant = [0u32; 1024];
+        let mut levels = vec![0u8; stride * (ch + 4)];
+        let mut quant = vec![0u32; cw * ch];
         let want_abs = |pos: usize, q: &CoefBlock| q.quant[pos].unsigned_abs();
         for c in (0..eob).rev() {
             let pos = scan[c] as usize;

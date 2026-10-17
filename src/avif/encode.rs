@@ -14,6 +14,8 @@ pub struct EncodeOptions {
     pub quality: u8,
     /// Keep full-resolution chroma (4:4:4) instead of 4:2:0.
     pub full_chroma: bool,
+    /// Search effort 0-9 (the CLI's `-l`): higher is smaller and slower.
+    pub effort: u8,
 }
 
 /// libaom's `--min-q/--max-q` scale (0-63) mapped to AV1 quantizer indices.
@@ -35,8 +37,8 @@ fn plane_from(v: &[u16], w: usize, h: usize) -> Plane {
     p
 }
 
-fn stream_of(frame: &Frame, color: &ColorConfig, qidx: u8) -> Result<Av1Stream> {
-    let params = EncodeParams { base_q_idx: qidx, ..EncodeParams::default() };
+fn stream_of(frame: &Frame, color: &ColorConfig, qidx: u8, effort: u8) -> Result<Av1Stream> {
+    let params = EncodeParams { base_q_idx: qidx, effort, ..EncodeParams::default() };
     let e = encode_picture(frame, color, &params)?;
     let level = e.seq.operating_points[0].level;
     let config = Av1Config {
@@ -81,7 +83,7 @@ pub fn encode(img: &Image, opts: &EncodeOptions) -> Result<Vec<u8>> {
     let color_stream = if gray {
         let y: Vec<u16> = img8.data.chunks_exact(ch).map(|p| p[0] as u16).collect();
         let frame = Frame { planes: vec![plane_from(&y, w, h)], bit_depth: 8, sub_x: 1, sub_y: 1, width: w, height: h };
-        stream_of(&frame, &color_config(true, 1), qidx)?
+        stream_of(&frame, &color_config(true, 1), qidx, opts.effort)?
     } else {
         let sub = if opts.full_chroma { 0 } else { 1 };
         let yuv = rgb_to_yuv(&img8, 8, sub as usize, sub as usize, 0.299, 0.114);
@@ -97,14 +99,14 @@ pub fn encode(img: &Image, opts: &EncodeOptions) -> Result<Vec<u8>> {
             width: w,
             height: h,
         };
-        stream_of(&frame, &color_config(false, sub), qidx)?
+        stream_of(&frame, &color_config(false, sub), qidx, opts.effort)?
     };
 
     let alpha_stream = if img8.color.has_alpha() {
         let a: Vec<u16> = img8.data.chunks_exact(ch).map(|p| p[ch - 1] as u16).collect();
         let frame = Frame { planes: vec![plane_from(&a, w, h)], bit_depth: 8, sub_x: 1, sub_y: 1, width: w, height: h };
         // Alpha edges matter more than colour detail: code it a little finer.
-        Some(stream_of(&frame, &color_config(true, 1), qidx.saturating_sub(qidx / 8).max(4))?)
+        Some(stream_of(&frame, &color_config(true, 1), qidx.saturating_sub(qidx / 8).max(4), opts.effort)?)
     } else {
         None
     };

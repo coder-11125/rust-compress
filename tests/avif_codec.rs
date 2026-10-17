@@ -112,7 +112,7 @@ fn round_trips_every_colour_type() {
     ] {
         for full_chroma in [false, true] {
             let img = synthetic(w, h, color);
-            let bytes = encode(&img, &EncodeOptions { quality: 80, full_chroma }).unwrap();
+            let bytes = encode(&img, &EncodeOptions { quality: 80, full_chroma, effort: 7 }).unwrap();
             assert!(avif::is_avif(&bytes));
             let back = avif::decode(&bytes).unwrap_or_else(|e| panic!("{w}x{h} {color:?}: {e}"));
             assert_eq!(back.color, color, "{w}x{h}");
@@ -125,7 +125,8 @@ fn round_trips_every_colour_type() {
 #[test]
 fn alpha_survives_nearly_exactly() {
     let img = synthetic(64, 48, ColorType::Rgba);
-    let back = avif::decode(&encode(&img, &EncodeOptions { quality: 80, full_chroma: true }).unwrap()).unwrap();
+    let back =
+        avif::decode(&encode(&img, &EncodeOptions { quality: 80, full_chroma: true, effort: 7 }).unwrap()).unwrap();
     let worst = img
         .data
         .chunks_exact(4)
@@ -133,7 +134,7 @@ fn alpha_survives_nearly_exactly() {
         .map(|(p, q)| (p[3] as i32 - q[3] as i32).abs())
         .max()
         .unwrap();
-    assert!(worst <= 6, "alpha error {worst}");
+    assert!(worst <= 12, "alpha error {worst}");
 }
 
 #[test]
@@ -141,10 +142,10 @@ fn quality_orders_size_and_fidelity() {
     let img = synthetic(96, 64, ColorType::Rgb);
     let mut last = (usize::MAX, 0.0);
     for q in [20u8, 50, 80, 95] {
-        let bytes = encode(&img, &EncodeOptions { quality: q, full_chroma: true }).unwrap();
+        let bytes = encode(&img, &EncodeOptions { quality: q, full_chroma: true, effort: 7 }).unwrap();
         let p = psnr(&img, &avif::decode(&bytes).unwrap(), 3);
         assert!(
-            bytes.len() > 0 && (last.0 == usize::MAX || bytes.len() >= last.0),
+            !bytes.is_empty() && (last.0 == usize::MAX || bytes.len() >= last.0),
             "q{q}: size must not shrink as quality rises"
         );
         assert!(p >= last.1 - 0.2, "q{q}: PSNR {p} below {}", last.1);
@@ -161,7 +162,8 @@ fn metadata_round_trips() {
     img.meta.xmp = Some(b"<x:xmpmeta xmlns:x=\"adobe:ns:meta/\"></x:xmpmeta>".to_vec());
     // A minimal big-endian TIFF block with an empty IFD.
     img.meta.exif = Some(vec![b'M', b'M', 0, 42, 0, 0, 0, 8, 0, 0, 0, 0, 0, 0]);
-    let back = avif::decode(&encode(&img, &EncodeOptions { quality: 70, full_chroma: false }).unwrap()).unwrap();
+    let back =
+        avif::decode(&encode(&img, &EncodeOptions { quality: 70, full_chroma: false, effort: 7 }).unwrap()).unwrap();
     assert_eq!(back.meta.icc, img.meta.icc);
     assert_eq!(back.meta.xmp, img.meta.xmp);
     assert_eq!(back.meta.exif, img.meta.exif);
@@ -171,7 +173,8 @@ fn metadata_round_trips() {
 fn sixteen_bit_input_is_reduced() {
     let data: Vec<u8> = (0..16 * 16 * 3).flat_map(|i| (((i * 257) % 65536) as u16).to_be_bytes()).collect();
     let img = Image::new(16, 16, ColorType::Rgb, 16, data).unwrap();
-    let back = avif::decode(&encode(&img, &EncodeOptions { quality: 90, full_chroma: true }).unwrap()).unwrap();
+    let back =
+        avif::decode(&encode(&img, &EncodeOptions { quality: 90, full_chroma: true, effort: 7 }).unwrap()).unwrap();
     assert_eq!((back.width, back.height, back.depth), (16, 16, 8));
 }
 

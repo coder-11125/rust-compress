@@ -192,7 +192,15 @@ impl<C: Coder> TileCoder<'_, C> {
         }
         ranked.sort();
         let mut cands: Vec<(u8, i8)> = Vec::new();
-        for &(_, mode) in ranked.iter().take(3) {
+        let effort = self.enc_src.as_ref().map_or(9, |e| e.effort);
+        let n_modes = if effort >= 6 {
+            3
+        } else if effort >= 3 {
+            2
+        } else {
+            1
+        };
+        for &(_, mode) in ranked.iter().take(n_modes) {
             if is_directional(mode) && base.bsize >= BLOCK_8X8 {
                 // Refine the angle by prediction error.
                 let mut best = (u64::MAX, 0i8);
@@ -228,7 +236,7 @@ impl<C: Coder> TileCoder<'_, C> {
         let (_, mut blk) = best.expect("at least one candidate");
 
         // --- Transform size for the winner.
-        if self.f.hdr.tx_mode_select && bsize > BLOCK_4X4 && !blk.lossless {
+        if self.f.hdr.tx_mode_select && bsize > BLOCK_4X4 && !blk.lossless && effort >= 4 {
             let max_depth = if MAX_TX_DEPTH[bsize as usize] == 1 { 1 } else { 2 };
             let mut t = max_rect;
             let mut best_tx = (f64::MAX, max_rect);
@@ -414,7 +422,7 @@ impl<C: Coder> TileCoder<'_, C> {
         }
         let mut options: Vec<u8> = Vec::new();
         if has_rows && has_cols {
-            options.extend([PARTITION_NONE, PARTITION_HORZ, PARTITION_VERT, PARTITION_SPLIT]);
+            options.extend([PARTITION_NONE, PARTITION_SPLIT, PARTITION_HORZ, PARTITION_VERT]);
             if bsize == BLOCK_8X8 {
                 // 8x4 / 4x8 halves are allowed, but are rarely worth the extra evaluation.
             }
@@ -425,9 +433,18 @@ impl<C: Coder> TileCoder<'_, C> {
         } else {
             options.push(PARTITION_SPLIT);
         }
+        let effort = self.enc_src.as_ref().map_or(9, |e| e.effort);
+        let (mut none_j, mut split_j): (Option<f64>, Option<f64>) = (None, None);
         let mut best: Option<Node> = None;
         let mut last: Option<Node> = None;
         for &p in &options {
+            if effort < 8 && (p == PARTITION_HORZ || p == PARTITION_VERT) {
+                // Rectangular shapes only pay off when the square options are close; otherwise skip the work.
+                let (jn, js) = (none_j.unwrap_or(f64::MAX), split_j.unwrap_or(f64::MAX));
+                if (jn - js).abs() > 0.15 * jn.min(js) {
+                    continue;
+                }
+            }
             let pbits = self.partition_bits(r, c, bsize, p, has_rows, has_cols);
             let mut node = Node { j: lambda * pbits as f64 / 256.0, parts: vec![p], blks: Vec::new() };
             let sub = partition_subsize(p, bsize);
@@ -467,10 +484,20 @@ impl<C: Coder> TileCoder<'_, C> {
                     }
                 }
             }
+            if p == PARTITION_NONE {
+                none_j = Some(node.j);
+            } else if p == PARTITION_SPLIT {
+                split_j = Some(node.j);
+            }
+            let skipped_whole = p == PARTITION_NONE && effort < 8 && bsize >= BLOCK_16X16 && node.blks[0].skip;
             if best.as_ref().is_none_or(|b| node.j < b.j) {
                 best = Some(node.clone());
             }
             last = Some(node);
+            if skipped_whole {
+                // A flat block that codes no residual: finer partitions cannot beat it by enough to matter.
+                break;
+            }
         }
         let best = best.expect("a partition option");
         // Leave the frame buffer in the state of the winning option.

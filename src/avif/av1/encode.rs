@@ -22,6 +22,8 @@ pub struct EncSrc {
     pub fixed_bsize: u8,
     /// Rounding offset of the quantizer, 0..=256 (256 = round to nearest).
     pub quant_round: i64,
+    /// Search effort 0..=9: higher examines more partitions and modes.
+    pub effort: u8,
 }
 
 /// Pad (replicating edges) the planes of a picture to the size of the frame buffers in `fs`.
@@ -180,24 +182,33 @@ impl<C: Coder> TileCoder<'_, C> {
             }
         }
         let setup = self.txb_setup(b, plane, x, y, tx_sz);
+        let effort = self.enc_src.as_ref().map_or(9, |e| e.effort);
         let types: &[u8] = if let Some(t) = setup.fixed_type {
             &[t][..]
+        } else if effort < 2 {
+            &[DCT_DCT]
+        } else if effort < 5 {
+            &[DCT_DCT, ADST_ADST, IDTX]
         } else if setup.tx_set == 1 {
             &[DCT_DCT, ADST_DCT, DCT_ADST, ADST_ADST, IDTX, V_DCT, H_DCT]
         } else {
             &[DCT_DCT, ADST_DCT, DCT_ADST, ADST_ADST, IDTX]
         };
-        let mut best: Option<(f64, u8, usize, Box<[i32; 1024]>, u64, f64)> = None;
+        let (cw, ch) = (tw.min(32), th.min(32));
+        let mut cb = CoefBlock { eob: 0, tx_type: 0, quant: [0; 1024] };
+        let mut coefs = vec![0i32; tw * th];
+        let mut recon = vec![0u16; tw * th];
+        // (cost, type, eob, quantized levels, bits, squared error) of the best candidate so far.
+        let mut best: Option<(f64, u8, usize, Vec<i32>, u64, f64)> = None;
         for &tx_type in types {
-            let mut coefs = vec![0i32; tw * th];
             itx::forward_transform(&residual, tw, tx_sz, tx_type, b.lossless, bit_depth, &mut coefs);
-            let mut quant = Box::new([0i32; 1024]);
-            let eob = quantize(&coefs, tx_sz, tx_type, dc_q as i64, ac_q as i64, round, &mut quant);
-            let mut cb = CoefBlock { eob, tx_type, quant: *quant };
+            let eob = quantize(&coefs, tx_sz, tx_type, dc_q as i64, ac_q as i64, round, &mut cb.quant);
+            cb.eob = eob;
+            cb.tx_type = tx_type;
             let bits = self.txb_cost(b, plane, x, y, tx_sz, &mut cb);
-            let mut recon = pred.clone();
+            recon.copy_from_slice(&pred);
             if eob > 0 {
-                let (mut dq, nzr, nzc) = self.dequant_block(b, plane, tx_sz, tx_type, &quant[..]);
+                let (mut dq, nzr, nzc) = self.dequant_block(b, plane, tx_sz, tx_type, &cb.quant[..]);
                 itx::inverse_transform_add(&mut dq, tx_sz, tx_type, b.lossless, bit_depth, nzr, nzc, &mut recon, tw);
             }
             let src = &self.enc_src.as_ref().expect("encoder source").planes[plane];
@@ -210,7 +221,10 @@ impl<C: Coder> TileCoder<'_, C> {
             }
             let j = sse + lambda * bits as f64 / 256.0;
             if best.as_ref().is_none_or(|b| j < b.0) {
-                best = Some((j, tx_type, eob, quant, bits, sse));
+                best = Some((j, tx_type, eob, cb.quant[..cw * ch].to_vec(), bits, sse));
+            }
+            if tx_type == DCT_DCT && eob == 0 {
+                break;
             }
         }
         let (_, tx_type, eob, quant, bits, sse) = best.expect("at least one transform type");
@@ -218,7 +232,6 @@ impl<C: Coder> TileCoder<'_, C> {
         self.an_dist += sse;
         let mut sc = StoredCoefs { tx_type, eob, coefs: Vec::new() };
         if eob > 0 {
-            let (cw, ch) = (tw.min(32), th.min(32));
             for pos in 0..cw * ch {
                 if quant[pos] != 0 {
                     sc.coefs.push((pos as u16, quant[pos]));
@@ -251,11 +264,13 @@ pub struct EncodeParams {
     pub fixed_bsize: u8,
     pub quant_round: i64,
     pub lambda_scale: f64,
+    /// Search effort 0..=9 (default 7): 8 and 9 examine every partition, lower values prune the search.
+    pub effort: u8,
 }
 
 impl Default for EncodeParams {
     fn default() -> Self {
-        EncodeParams { base_q_idx: 100, fixed_bsize: BLOCK_16X16, quant_round: 120, lambda_scale: 0.09 }
+        EncodeParams { base_q_idx: 100, fixed_bsize: BLOCK_16X16, quant_round: 120, lambda_scale: 0.09, effort: 7 }
     }
 }
 
@@ -361,6 +376,7 @@ pub fn encode_picture(src: &Frame, color: &ColorConfig, p: &EncodeParams) -> Res
             lambda: p.lambda_scale * q * q,
             fixed_bsize: p.fixed_bsize,
             quant_round: p.quant_round,
+            effort: p.effort,
         });
         tc.decode_tile()?;
         if std::env::var_os("AV1_STATS").is_some() {
