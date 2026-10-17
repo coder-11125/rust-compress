@@ -12,6 +12,9 @@
   `--resize` (Lanczos-3 downscale), and stdin/stdout support (`-` as input, `-o -`).
 - Lossy WebP (VP8), written from scratch: a decoder that matches libwebp bit for bit and a
   rate-distortion encoder (`-f webp --lossy -q N`) with a lossless `ALPH` alpha channel.
+- AVIF, written from scratch: an AV1 still-picture decoder (bit-exact with dav1d), a HEIF container reader and
+  writer (grids, alpha, transforms, ICC/EXIF/XMP) and a rate-distortion intra encoder (`-f avif -q N`). See
+  `THIRD_PARTY_NOTICES.md` for the generated tables.
 - Hostile-input mutation tests for every decoder.
 
 ## 0.1.0

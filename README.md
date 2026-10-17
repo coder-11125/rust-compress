@@ -1,6 +1,6 @@
 # rust-compress
 
-A fast command-line image compressor for **PNG**, **JPEG** and **lossless WebP** (GIF files can be converted). The compression engine is written from scratch in Rust — DEFLATE, PNG, JPEG, GIF and WebP-lossless codecs, Huffman coding, DCT, color quantization — with no codec crates. Only [`clap`](https://crates.io/crates/clap) (argument parsing) and [`rayon`](https://crates.io/crates/rayon) (parallelism) are dependencies.
+A fast command-line image compressor for **PNG**, **JPEG**, **WebP** and **AVIF** (GIF files can be converted). The compression engine is written from scratch in Rust — DEFLATE, PNG, JPEG, GIF, WebP (lossless and lossy) and AVIF (AV1) codecs, Huffman coding, DCT, color quantization — with no codec crates. Only [`clap`](https://crates.io/crates/clap) (argument parsing) and [`rayon`](https://crates.io/crates/rayon) (parallelism) are dependencies.
 
 ```
 rust-compress photo.jpg                 # -> photo.min.jpg next to the original
@@ -35,6 +35,12 @@ cat in.png | rust-compress - > out.png  # stdin to stdout
 - The encoder does rate-distortion mode decisions (16x16, 4x4 and chroma intra modes), quantizes with deadzone biasing, tunes the token probabilities from first-pass statistics, and searches the loop-filter level. Its streams decode to the identical picture in libwebp. At the same `-q` on twelve real images it lands within a few percent of libwebp's size at equal or slightly higher PSNR.
 - Transparency is stored losslessly in an `ALPH` chunk (best of four prediction filters, coded with the VP8L encoder); hidden pixels are smoothed to be cheap. Lossy WebP inputs are only re-encoded with `--lossy`; otherwise they are left untouched.
 
+**AVIF** — a from-scratch AV1 still-picture decoder and intra encoder inside a HEIF container (`-f avif -q N`):
+- The decoder implements the AV1 intra-frame toolset: all partition types, intra modes (directional with edge filtering and upsampling, smooth, Paeth, filter-intra, chroma-from-luma, palette), every transform size and type, segmentation, delta-q/lf, quantizer matrices, the deblocking filter, CDEF, loop restoration (Wiener and self-guided), super-resolution and film grain, in 8/10/12 bits and 4:0:0/4:2:0/4:2:2/4:4:4. Output matches dav1d bit for bit on streams from libaom, SVT-AV1, rav1e and ffmpeg, and libavif/Pillow pixel for pixel (±1 from chroma upsampling). Containers: single images, grids, alpha auxiliary images (also premultiplied), `clap`/`irot`/`imir`, `colr` nclx and ICC, EXIF and XMP. Inter prediction and intra block copy are not implemented: for an animated (`avis`) file only the first, intra-coded picture is decoded. Bit depths above 8 and 4:2:2 are implemented but have had less cross-checking than 8-bit 4:2:0 / 4:4:4.
+- The encoder is lossy only. It searches partitions, intra modes with angle deltas, chroma-from-luma and transform sizes per superblock by rate-distortion cost using the real adaptive entropy-coder state, then picks the deblocking level and CDEF strengths by measured error. Output is 8-bit 4:2:0 (4:4:4 at `-q 90` and up, or `--subsampling 444`) or monochrome for gray images; transparency is a monochrome auxiliary image. ICC, EXIF (with `--keep-metadata`) and XMP are stored. Streams decode identically in dav1d, libaom and Pillow.
+- AVIF inputs are left untouched unless `--lossy` is given, since re-encoding only adds generation loss.
+- The encoder is considerably slower than the JPEG/WebP ones and about 1.5× the size of libaom at equal PSNR (see the numbers below); loop restoration, inter tools and 10-bit output are not implemented in the encoder.
+
 **WebP (lossless)** — full VP8L encoder and decoder:
 - Encoder tries a palette transform (bundling up to 8 pixels per symbol) or subtract-green + per-tile predictor + cross-color decorrelation, ranks the pipelines with a cheap estimate and fully encodes the best ones.
 - LZ77 with the format's 2-D distance codes, an optimal (cost-model driven) parse, a colour cache sized by trial, and **entropy-clustered prefix-code groups**: image tiles with similar statistics share one set of codes.
@@ -62,9 +68,9 @@ rust-compress [OPTIONS] <INPUT>...
   -o, --output <PATH>     output file (one input file) or directory (mirrors the input tree)
       --in-place          replace originals, only when the result is smaller
   -q, --quality <1-100>   JPEG quality ceiling (default 80)
-  -f, --format <FMT>      keep | png | jpeg | webp (default keep)
+  -f, --format <FMT>      keep | png | jpeg | webp | avif (default keep)
       --subsampling <S>   auto | 444 | 420
-      --lossy             PNG palette quantization, or lossy WebP with -f webp (-q = quality)
+      --lossy             PNG palette quantization, lossy WebP with -f webp, or re-encode an AVIF input (-q = quality)
       --colors <2-256>    with --lossy (default 256)
       --dither <0.0-1.0>  with --lossy (default 0.5)
   -l, --level <0-9>       PNG / WebP effort (default 7; PNG: 1-6 fast, 7-9 optimal parsing, 9 slowest)
@@ -126,6 +132,7 @@ src/util/       bit I/O, CRC-32 / Adler-32, canonical Huffman (shared by DEFLATE
 src/deflate/    inflate, LZ77 matchers (hash chains; binary tree for levels 7-9), block encoder, optimal parser (levels 7-9)
 src/png/        decoder (all color types/depths, Adam7), filters, encoder (reduction + strategy search), quantizer
 src/jpeg/       decoder (baseline + progressive), DCT, baseline/progressive encoders, trellis quantization, quality search
+src/avif/       HEIF/ISOBMFF container, AV1 decoder (entropy, intra prediction, transforms, loop filters, CDEF, restoration, film grain) and intra encoder
 src/webp/       RIFF container, VP8L decoder and encoder (transforms, LZ77 + optimal parse, tile-group clustering)
 src/gif.rs      GIF decoder (still images)
 src/exif.rs     EXIF editing for kept metadata (orientation, dimensions, thumbnail)
@@ -138,8 +145,8 @@ tests/          codec round trips, reference-decoder cross-checks, hostile input
 
 ## Limitations
 
-- Formats: PNG, JPEG and WebP (lossless and lossy) in and out; GIF in (stills). No AVIF, no animated output. JPEG: 8-bit Huffman, 1, 3 or 4 components (no arithmetic coding or 12-bit).
-- WebP is 8-bit: 16-bit sources lose precision on conversion.
+- Formats: PNG, JPEG, WebP (lossless and lossy) and AVIF in and out; GIF in (stills). No animated output. JPEG: 8-bit Huffman, 1, 3 or 4 components (no arithmetic coding or 12-bit).
+- WebP and AVIF output are 8-bit: 16-bit sources lose precision on conversion.
 - CMYK JPEGs are never requantized (`-q` does not apply to them); YCCK decoding is covered by unit tests but has no real-file fixture.
 - EXIF/XMP/comments are dropped unless `--keep-metadata` is given. An EXIF block too large for a JPEG segment (over 64 KB) cannot be carried into a JPEG.
 - Resizing only shrinks and filters in gamma-encoded space.

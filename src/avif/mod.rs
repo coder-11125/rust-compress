@@ -3,6 +3,7 @@
 pub mod av1;
 pub mod container;
 pub mod convert;
+pub mod encode;
 
 use crate::error::{Error, Result};
 use crate::image::{ColorType, Image};

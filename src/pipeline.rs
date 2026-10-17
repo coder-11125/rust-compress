@@ -100,6 +100,7 @@ fn decode(data: &[u8], fmt: Format) -> Result<Image> {
         Format::Png => png::decode::decode(data),
         Format::Gif => crate::gif::decode(data),
         Format::Webp => crate::webp::decode(data),
+        Format::Avif => crate::avif::decode(data),
         // The orientation is baked into the pixels, so the tag must not rotate them a second time.
         Format::Jpeg => Ok(upright(jpeg::decode::decode(data)?, jpeg::decode::exif_orientation(data))),
     }
@@ -211,6 +212,19 @@ fn encode(img: &Image, fmt: Format, cli: &Cli) -> Result<Encoded> {
             }
             Ok(encoded)
         }
+        Format::Avif => {
+            let full_chroma = match cli.subsampling {
+                SubsamplingArg::Auto => cli.quality >= 90,
+                SubsamplingArg::S444 => true,
+                SubsamplingArg::S420 => false,
+            };
+            let opts = crate::avif::encode::EncodeOptions { quality: cli.quality, full_chroma };
+            let mut encoded: Encoded = crate::avif::encode::encode(img, &opts)?.into();
+            if img.depth == 16 {
+                encoded.note = Some("16-bit reduced to 8-bit".into());
+            }
+            Ok(encoded)
+        }
         Format::Gif => Err(Error::unsupported("GIF output")),
     }
 }
@@ -248,7 +262,7 @@ fn write_output(path: &Path, data: &[u8]) -> Result<()> {
 
 fn run(job: &Job, cli: &Cli, data: &[u8]) -> Result<(Status, u64, Option<String>)> {
     let in_fmt = Format::sniff(data).or_else(|| Format::from_extension(&job.input)).ok_or_else(|| {
-        Error::unsupported("unrecognized image format (supported: PNG, JPEG, lossless WebP, and GIF as input)")
+        Error::unsupported("unrecognized image format (supported: PNG, JPEG, WebP, AVIF, and GIF as input)")
     })?;
     let out_fmt = target_format(cli, in_fmt);
     if out_fmt == Format::Gif {
@@ -267,6 +281,10 @@ fn run(job: &Job, cli: &Cli, data: &[u8]) -> Result<(Status, u64, Option<String>
         (Format::Webp, Format::Webp) => crate::webp::unsupported_reason(data)
             .filter(|r| !(cli.lossy && *r == "lossy WebP"))
             .map(|r| if r == "lossy WebP" { "lossy WebP left unchanged" } else { "animated WebP left unchanged" }),
+        // Re-encoding a lossy AVIF would only add generation loss, so it needs an explicit --lossy.
+        (Format::Avif, Format::Avif) if !cli.lossy && cli.resize.is_none() => {
+            Some("AVIF left unchanged (use --lossy to re-encode)")
+        }
         _ => None,
     };
     if let Some(note) = untouchable {
