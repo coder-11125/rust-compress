@@ -10,7 +10,7 @@ use super::consts::*;
 use super::entropy::Coder;
 use super::frame::Plane;
 use super::itx;
-use super::tile::{Blk, FrameState, StoredCoefs, TileCoder};
+use super::tile::{Blk, CoefBlock, FrameState, StoredCoefs, TileCoder};
 
 /// Source pictures and encoder tuning, attached to a [`TileCoder`] that encodes.
 pub struct EncSrc {
@@ -95,103 +95,55 @@ pub fn quantize(
 }
 
 impl<C: Coder> TileCoder<'_, C> {
-    /// Partition decision for the node at (r, c), or the next logged one when replaying.
-    pub(crate) fn next_partition(&mut self, r: usize, c: usize, bsize: u8, has_rows: bool, has_cols: bool) -> u8 {
-        let _ = (r, c);
+    /// Partition decision for the node at (r, c): from the superblock search, or the next logged one when replaying.
+    pub(crate) fn next_partition(&mut self, _r: usize, _c: usize, _bsize: u8, _has_rows: bool, _has_cols: bool) -> u8 {
         if self.replay {
             return self.part_queue.pop_front().unwrap_or(0);
         }
-        let fixed = self.enc_src.as_ref().map_or(BLOCK_8X8, |e| e.fixed_bsize);
-        let p = if bsize > fixed || (!has_rows && !has_cols) {
-            PARTITION_SPLIT
-        } else if has_rows && has_cols {
-            PARTITION_NONE
-        } else if has_cols {
-            PARTITION_HORZ
-        } else {
-            PARTITION_VERT
-        };
+        let p = self.part_cache.pop_front().unwrap_or(PARTITION_SPLIT);
         self.part_log.push(p);
         p
     }
 
-    /// Plan one block: choose its modes, run the analysis to obtain coefficients, queue them for the writer.
+    /// The planned block at (r, c): run the analysis to obtain its coefficients and queue them for the writer.
     pub(crate) fn next_block(&mut self, r: usize, c: usize, bsize: u8) -> Blk {
         if self.replay {
             return self.blk_queue.pop_front().unwrap_or_default();
         }
-        let mut b = Blk { mi_row: r, mi_col: c, bsize, ..Default::default() };
+        let mut b = self.blk_cache.pop_front().unwrap_or_default();
+        b.mi_row = r;
+        b.mi_col = c;
+        b.bsize = bsize;
         self.set_block_geometry(&mut b);
-        self.choose_modes(&mut b);
         let log = self.analyze_block(&mut b);
         b.skip = log.iter().all(|s| s.eob == 0);
-        for sc in &log {
-            self.coef_queue.push_back(sc.clone());
-            self.coef_log.push(sc.clone());
+        if std::env::var_os("AV1_CHECK").is_some() {
+            let np = if b.has_chroma { 3 } else { 1 };
+            let mut snap = Vec::new();
+            for plane in 0..np {
+                let (sx, sy) = self.plane_sub(plane);
+                let (x0, y0) = ((b.mi_col >> sx) * 4, (b.mi_row >> sy) * 4);
+                let (w, h) = ((block_width(b.bsize) >> sx).max(4), (block_height(b.bsize) >> sy).max(4));
+                let pl = &self.f.planes[plane];
+                let mut v = Vec::with_capacity(w * h);
+                for i in 0..h {
+                    for j in 0..w {
+                        v.push(pl.at(x0 + j, y0 + i));
+                    }
+                }
+                snap.push(v);
+            }
+            self.dbg_snap = Some(snap);
+        }
+        // A skipped block codes no coefficients at all, so nothing is queued for it.
+        if !b.skip {
+            for sc in &log {
+                self.coef_queue.push_back(sc.clone());
+                self.coef_log.push(sc.clone());
+            }
         }
         self.blk_log.push(b.clone());
         b
-    }
-
-    /// Stage-A mode choice: pick the luma and chroma modes with the lowest prediction SAD.
-    fn choose_modes(&mut self, b: &mut Blk) {
-        b.tx_size = if b.lossless { TX_4X4 } else { MAX_TX_SIZE_RECT[b.bsize as usize] };
-        let candidates = [
-            DC_PRED,
-            V_PRED,
-            H_PRED,
-            SMOOTH_PRED,
-            SMOOTH_V_PRED,
-            SMOOTH_H_PRED,
-            PAETH_PRED,
-            D45_PRED,
-            D135_PRED,
-            D113_PRED,
-            D157_PRED,
-            D203_PRED,
-            D67_PRED,
-        ];
-        let (x, y) = (b.mi_col * 4, b.mi_row * 4);
-        let tx = b.tx_size;
-        let mut best = (u64::MAX, DC_PRED);
-        for &mode in &candidates {
-            let mut t = b.clone();
-            t.y_mode = mode;
-            self.predict_intra_block(&t, 0, x, y, tx, b.avail_l, b.avail_u, false, false, mode);
-            let sad = self.block_sad(0, x, y, TX_W[tx as usize] as usize, TX_H[tx as usize] as usize);
-            if sad < best.0 {
-                best = (sad, mode);
-            }
-        }
-        b.y_mode = best.1;
-        if b.has_chroma {
-            let (sx, sy) = (self.f.sub_x, self.f.sub_y);
-            let uv_tx = self.get_tx_size(b, 1);
-            let (cx, cy) = ((b.mi_col >> sx) * 4, (b.mi_row >> sy) * 4);
-            let mut bestc = (u64::MAX, DC_PRED);
-            for &mode in &[DC_PRED, V_PRED, H_PRED, SMOOTH_PRED, PAETH_PRED] {
-                let mut t = b.clone();
-                t.uv_mode = mode;
-                self.predict_intra_block(&t, 1, cx, cy, uv_tx, b.avail_l_chroma, b.avail_u_chroma, false, false, mode);
-                let sad = self.block_sad(1, cx, cy, TX_W[uv_tx as usize] as usize, TX_H[uv_tx as usize] as usize);
-                if sad < bestc.0 {
-                    bestc = (sad, mode);
-                }
-            }
-            b.uv_mode = bestc.1;
-        }
-    }
-
-    fn block_sad(&self, plane: usize, x: usize, y: usize, w: usize, h: usize) -> u64 {
-        let src = &self.enc_src.as_ref().expect("encoder source").planes[plane];
-        let cur = &self.f.planes[plane];
-        let mut sad = 0u64;
-        for i in 0..h {
-            for j in 0..w {
-                sad += (src.at(x + j, y + i) as i64 - cur.at(x + j, y + i) as i64).unsigned_abs();
-            }
-        }
-        sad
     }
 
     /// Run the residual traversal in analysis mode: predict, transform, quantize and reconstruct every transform
@@ -237,6 +189,61 @@ impl<C: Coder> TileCoder<'_, C> {
         let mut quant = [0i32; 1024];
         let eob = quantize(&coefs, tx_sz, tx_type, dc_q as i64, ac_q as i64, round, &mut quant);
         let mut sc = StoredCoefs { tx_type, eob, coefs: Vec::new() };
+        if let (Ok(dx), Ok(dy)) = (std::env::var("AV1_DBG_X"), std::env::var("AV1_DBG_Y")) {
+            let (dx, dy): (usize, usize) = (dx.parse().unwrap(), dy.parse().unwrap());
+            if plane == std::env::var("AV1_DBG_PLANE").ok().and_then(|v| v.parse().ok()).unwrap_or(0usize)
+                && self.analyzing
+                && self.an_planes == 7
+                && dx >= x
+                && dx < x + tw
+                && dy >= y
+                && dy < y + th
+            {
+                eprintln!("tx at ({x},{y}) {tw}x{th} type {tx_type} eob {eob} dcq {dc_q} acq {ac_q}");
+                eprintln!("residual row {}: {:?}", dy - y, &residual[(dy - y) * tw..(dy - y) * tw + tw]);
+                eprintln!("coefs[0..8]: {:?} quant[0..8] {:?}", &coefs[..tw.min(8)], &quant[..tw.min(8)]);
+            }
+        }
+        {
+            // Distortion and rate of this choice, for the search.
+            let mut cb = CoefBlock { eob, tx_type, quant };
+            let bits = self.txb_cost(b, plane, x, y, tx_sz, &mut cb);
+            self.an_bits += bits;
+            let mut recon = vec![0u16; tw * th];
+            for i in 0..th {
+                for j in 0..tw {
+                    recon[i * tw + j] = self.f.planes[plane].at(x + j, y + i);
+                }
+            }
+            if eob > 0 {
+                let (mut dq, nzr, nzc) = self.dequant_block(b, plane, tx_sz, tx_type, &quant);
+                itx::inverse_transform_add(&mut dq, tx_sz, tx_type, b.lossless, bit_depth, nzr, nzc, &mut recon, tw);
+            }
+            let src = &self.enc_src.as_ref().expect("encoder source").planes[plane];
+            let mut sse = 0f64;
+            for i in 0..th {
+                for j in 0..tw {
+                    let d = src.at(x + j, y + i) as i64 - recon[i * tw + j] as i64;
+                    sse += (d * d) as f64;
+                }
+            }
+            self.an_dist += sse;
+            if let (Ok(dx), Ok(dy)) = (std::env::var("AV1_DBG_X"), std::env::var("AV1_DBG_Y")) {
+                let (dx, dy): (usize, usize) = (dx.parse().unwrap(), dy.parse().unwrap());
+                if plane == std::env::var("AV1_DBG_PLANE").ok().and_then(|v| v.parse().ok()).unwrap_or(0usize)
+                    && self.analyzing
+                    && self.an_planes == 7
+                    && dx >= x
+                    && dx < x + tw
+                    && dy >= y
+                    && dy < y + th
+                {
+                    eprintln!("  -> sse {sse} first recon row {:?}", &recon[(dy - y) * tw..(dy - y) * tw + tw]);
+                    let srow: Vec<u16> = (0..tw).map(|j| src.at(x + j, dy)).collect();
+                    eprintln!("     src row {:?}", srow);
+                }
+            }
+        }
         if eob > 0 {
             let (cw, ch) = (tw.min(32), th.min(32));
             for pos in 0..cw * ch {
@@ -269,11 +276,12 @@ pub struct EncodeParams {
     pub base_q_idx: u8,
     pub fixed_bsize: u8,
     pub quant_round: i64,
+    pub lambda_scale: f64,
 }
 
 impl Default for EncodeParams {
     fn default() -> Self {
-        EncodeParams { base_q_idx: 100, fixed_bsize: BLOCK_16X16, quant_round: 120 }
+        EncodeParams { base_q_idx: 100, fixed_bsize: BLOCK_16X16, quant_round: 120, lambda_scale: 0.12 }
     }
 }
 
@@ -288,17 +296,10 @@ pub struct Encoded {
 }
 
 fn level_for(width: usize, height: usize) -> u8 {
+    const LIMITS: [(usize, u8); 7] =
+        [(147_456, 0), (278_784, 1), (665_856, 4), (1_065_024, 5), (2_359_296, 8), (8_912_896, 12), (35_651_584, 16)];
     let area = width * height;
-    match area {
-        0..=147_456 => 0,
-        ..=278_784 => 1,
-        ..=665_856 => 4,
-        ..=1_065_024 => 5,
-        ..=2_359_296 => 8,
-        ..=8_912_896 => 12,
-        ..=35_651_584 => 16,
-        _ => 31,
-    }
+    LIMITS.iter().find(|(max, _)| area <= *max).map_or(31, |&(_, level)| level)
 }
 
 pub fn make_sequence_header(color: &ColorConfig, width: usize, height: usize) -> SequenceHeader {
@@ -362,7 +363,7 @@ pub fn encode_picture(src: &Frame, color: &ColorConfig, p: &EncodeParams) -> Res
     hdr.lossless_array = [p.base_q_idx == 0; 8];
     hdr.loop_filter.ref_deltas = [1, 0, 0, 0, -1, 0, -1, -1];
     hdr.cdef.damping = 3;
-    hdr.tx_mode_select = false;
+    hdr.tx_mode_select = true;
 
     let mut fs = FrameState::new(&seq, &hdr)?;
     let planes = pad_source(&fs, src);
@@ -372,8 +373,40 @@ pub fn encode_picture(src: &Frame, color: &ColorConfig, p: &EncodeParams) -> Res
     let (rows, cols) = ((ti.mi_row_starts[0], ti.mi_row_starts[1]), (ti.mi_col_starts[0], ti.mi_col_starts[1]));
     let tile_bytes = {
         let mut tc = TileCoder::new(&mut fs, cdf, enc, rows, cols);
-        tc.enc_src = Some(EncSrc { planes, lambda: 0.0, fixed_bsize: p.fixed_bsize, quant_round: p.quant_round });
+        let q = ac_q_for(p.base_q_idx, color.bit_depth) / 8.0;
+        tc.enc_src = Some(EncSrc {
+            planes,
+            lambda: p.lambda_scale * q * q,
+            fixed_bsize: p.fixed_bsize,
+            quant_round: p.quant_round,
+        });
         tc.decode_tile()?;
+        if std::env::var_os("AV1_STATS").is_some() {
+            let mut sizes = [0usize; 22];
+            let mut skips = 0;
+            let mut modes = [0usize; 14];
+            let mut txs = [0usize; 19];
+            let mut uvm = [0usize; 14];
+            for b in &tc.blk_log {
+                sizes[b.bsize as usize] += 1;
+                skips += b.skip as usize;
+                modes[b.y_mode as usize] += 1;
+                if b.has_chroma {
+                    uvm[b.uv_mode as usize] += 1;
+                }
+                txs[b.tx_size as usize] += 1;
+            }
+            eprintln!(
+                "blocks {} skip {skips}\nsizes {sizes:?}\nymodes {modes:?}\nuvmodes {uvm:?}\ntx {txs:?}",
+                tc.blk_log.len()
+            );
+            let (mut nz, mut tot) = (0usize, 0usize);
+            for c in &tc.coef_log {
+                nz += c.coefs.len();
+                tot += 1;
+            }
+            eprintln!("tx blocks {tot}, nonzero coefs {nz}");
+        }
         tc.c.finish()
     };
     choose_filters(&mut fs, src, p.base_q_idx);
@@ -412,7 +445,7 @@ fn choose_filters(fs: &mut FrameState, src: &Frame, base_q_idx: u8) {
     use super::cdef::{CdefParams, cdef_frame};
     use super::deblock::deblock_frame;
     use super::decoder::{build_deblock, coded_frame};
-    if fs.hdr.coded_lossless {
+    if fs.hdr.coded_lossless || std::env::var_os("AV1_NOFILT").is_some() {
         return;
     }
     let np = fs.num_planes;
@@ -477,14 +510,7 @@ fn choose_filters(fs: &mut FrameState, src: &Frame, base_q_idx: u8) {
     let skip: Vec<bool> = fs.skip.iter().map(|&s| s != 0).collect();
     let mut out = deblocked.clone();
     let mut cdef_cost = |y: (u8, u8), uv: (u8, u8), plane: usize| -> f64 {
-        let p = CdefParams {
-            damping,
-            bits: 0,
-            y_pri: [y.0; 8],
-            y_sec: [y.1; 8],
-            uv_pri: [uv.0; 8],
-            uv_sec: [uv.1; 8],
-        };
+        let p = CdefParams { damping, bits: 0, y_pri: [y.0; 8], y_sec: [y.1; 8], uv_pri: [uv.0; 8], uv_sec: [uv.1; 8] };
         cdef_frame(&deblocked, &mut out, &p, &fs.cdef_idx, fs.cdef_stride, &skip, fs.mi_cols, fs.mi_rows);
         plane_sse(&out, src, plane)
     };
@@ -517,4 +543,14 @@ fn choose_filters(fs: &mut FrameState, src: &Frame, base_q_idx: u8) {
     fs.hdr.cdef.y_sec[0] = yb.1.1;
     fs.hdr.cdef.uv_pri[0] = uvb.1.0;
     fs.hdr.cdef.uv_sec[0] = uvb.1.1;
+}
+
+fn ac_q_for(qidx: u8, bit_depth: u8) -> f64 {
+    use super::coef_tables::{AC_Q, AC_Q_10, AC_Q_12};
+    let t = match bit_depth {
+        8 => &AC_Q,
+        10 => &AC_Q_10,
+        _ => &AC_Q_12,
+    };
+    t[qidx as usize] as f64
 }

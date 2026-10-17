@@ -17,5 +17,6 @@ pub mod lr;
 pub mod obu;
 pub mod obu_write;
 pub mod qm_tables;
+pub mod rdo;
 pub mod superres;
 pub mod tile;

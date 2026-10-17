@@ -135,6 +135,24 @@ fn decode_tile_group(fs: &mut FrameState, hdr: &FrameHeader, data: &[u8], done: 
         let cols = (ti.mi_col_starts[tile_col], ti.mi_col_starts[tile_col + 1]);
         let mut tc = TileCoder::new(fs, cdf, dec, rows, cols);
         tc.decode_tile()?;
+        if tc.stats {
+            let mut sizes = [0usize; 22];
+            let (mut skips, mut modes, mut txs) = (0, [0usize; 14], [0usize; 19]);
+            let mut uvm = [0usize; 14];
+            for b in &tc.blk_log {
+                sizes[b.bsize as usize] += 1;
+                skips += b.skip as usize;
+                modes[b.y_mode as usize] += 1;
+                if b.has_chroma {
+                    uvm[b.uv_mode as usize] += 1;
+                }
+                txs[b.tx_size as usize] += 1;
+            }
+            eprintln!(
+                "blocks {} skip {skips}\nsizes {sizes:?}\nymodes {modes:?}\nuvmodes {uvm:?}\ntx {txs:?}",
+                tc.blk_log.len()
+            );
+        }
         *done += 1;
     }
     Ok(())
@@ -161,7 +179,6 @@ pub(crate) fn coded_frame(fs: &FrameState) -> Frame {
         height: fs.hdr.frame_height,
     }
 }
-
 
 /// Deblocking parameters and per-block data of a decoded (or encoded) frame.
 pub(crate) fn build_deblock(fs: &FrameState) -> (DeblockParams, DeblockMi) {

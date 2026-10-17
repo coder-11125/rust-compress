@@ -204,6 +204,7 @@ mod tests {
     fn matches_incremental_reference() {
         let mut rng = Rng(0x1234_5678_9abc_def1);
         let mut cases = 0;
+        #[allow(clippy::explicit_counter_loop)]
         for _ in 0..300 {
             let denom = 9 + (rng.next() % 8) as usize;
             let up = 16 + (rng.next() % 200) as usize;
@@ -212,7 +213,7 @@ mod tests {
             let bd = [8u8, 10, 12][(rng.next() % 3) as usize];
             let (sx, sy) = [(1, 1), (1, 0), (0, 0)][(rng.next() % 3) as usize];
             let h = 1 + (rng.next() % 9) as usize;
-            let mono = rng.next() % 5 == 0;
+            let mono = rng.next().is_multiple_of(5);
             let src = random_frame(&mut rng, down, h, bd, sx, sy, mono);
             let out = upscale_frame(&src, up, denom as u8);
             assert_eq!(out.width, up);

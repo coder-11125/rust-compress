@@ -415,7 +415,7 @@ mod tests {
         let mut out = Vec::new();
         for p in 0..planes {
             let (sx, sy) = if p == 0 { (0, 0) } else { sub };
-            let (cw, ch) = (w.div_ceil(8) * 8 >> sx, h.div_ceil(8) * 8 >> sy);
+            let (cw, ch) = ((w.div_ceil(8) * 8) >> sx, (h.div_ceil(8) * 8) >> sy);
             let mut plane = Plane::new(cw, ch);
             let base = rng.range(0, max);
             let amp = (max >> 4).max(1);
@@ -432,6 +432,7 @@ mod tests {
     }
 
     /// `mode`: 0 = Wiener everywhere, 1 = self-guided everywhere (set cycles through all 16), 2 = a mix with `None`.
+    #[allow(clippy::too_many_arguments)]
     fn golden_case(
         seed: u64,
         bd: u32,
@@ -498,6 +499,7 @@ mod tests {
     }
 
     /// (seed, bit depth, subsampling, planes, width, height, unit size, mode)
+    #[allow(clippy::type_complexity)]
     const GOLDEN_CASES: [(u64, u32, (u8, u8), usize, usize, usize, usize, u8); 8] = [
         (1, 8, (1, 1), 3, 67, 70, 64, 0),
         (2, 8, (1, 1), 3, 150, 200, 64, 1),

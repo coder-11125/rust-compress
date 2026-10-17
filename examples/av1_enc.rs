@@ -52,6 +52,12 @@ fn main() {
     if let Some(b) = a.get(5) {
         p.fixed_bsize = b.parse().unwrap();
     }
+    if let Ok(v) = std::env::var("AV1_LAMBDA") {
+        p.lambda_scale = v.parse().unwrap();
+    }
+    if let Ok(v) = std::env::var("AV1_ROUND") {
+        p.quant_round = v.parse().unwrap();
+    }
     let e = encode_picture(&frame, &color, &p).unwrap();
     let mut obu = vec![0x12, 0x00];
     obu.extend_from_slice(&e.data);

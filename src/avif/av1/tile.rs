@@ -224,6 +224,15 @@ pub struct TileCoder<'a, C: Coder> {
     pub blk_log: Vec<Blk>,
     pub coef_log: Vec<StoredCoefs>,
     pub enc_src: Option<super::encode::EncSrc>,
+    /// Decisions of the superblock being coded, produced by the search.
+    pub part_cache: std::collections::VecDeque<u8>,
+    pub blk_cache: std::collections::VecDeque<Blk>,
+    /// Analysis accumulators: planes to analyse (bit mask), distortion and coefficient bits (1/256 bit).
+    pub stats: bool,
+    pub dbg_snap: Option<Vec<Vec<u16>>>,
+    pub an_planes: u8,
+    pub an_dist: f64,
+    pub an_bits: u64,
 }
 
 impl<'a, C: Coder> TileCoder<'a, C> {
@@ -274,6 +283,13 @@ impl<'a, C: Coder> TileCoder<'a, C> {
             blk_log: Vec::new(),
             coef_log: Vec::new(),
             enc_src: None,
+            part_cache: Default::default(),
+            blk_cache: Default::default(),
+            stats: std::env::var_os("AV1_STATS").is_some(),
+            dbg_snap: None,
+            an_planes: 7,
+            an_dist: 0.0,
+            an_bits: 0,
         }
         .with_planes(np)
     }
@@ -310,6 +326,9 @@ impl<'a, C: Coder> TileCoder<'a, C> {
                 self.clear_cdef(r, c);
                 self.clear_block_decoded_flags(r, c, sb4);
                 self.read_lr(r, c, self.sb_size())?;
+                if !C::DECODING && !self.replay && self.enc_src.is_some() {
+                    self.plan_sb(r, c);
+                }
                 self.decode_partition(r, c, self.sb_size())?;
                 c += sb4;
             }
@@ -736,7 +755,41 @@ impl<'a, C: Coder> TileCoder<'a, C> {
                 self.left_pal[1][r + y] = b.pal_u;
             }
         }
+        if C::DECODING && self.stats {
+            self.blk_log.push(b.clone());
+        }
         self.residual(&b)?;
+        if let Some(snap) = self.dbg_snap.take() {
+            // Encoder self-check: the real pass must reproduce the analysis reconstruction.
+            let np = if b.has_chroma { 3 } else { 1 };
+            for plane in 0..np {
+                let (sx, sy) = self.plane_sub(plane);
+                let (x0, y0) = ((b.mi_col >> sx) * 4, (b.mi_row >> sy) * 4);
+                let (w, h) = ((block_width(b.bsize) >> sx).max(4), (block_height(b.bsize) >> sy).max(4));
+                let pl = &self.f.planes[plane];
+                let mut bad = 0;
+                for i in 0..h {
+                    for j in 0..w {
+                        if snap[plane][i * w + j] != pl.at(x0 + j, y0 + i) {
+                            bad += 1;
+                        }
+                    }
+                }
+                if bad > 0 && std::env::var_os("AV1_CHECK_V").is_some() {
+                    for i in 0..h {
+                        let a: Vec<u16> = (0..w).map(|j| snap[plane][i * w + j]).collect();
+                        let c: Vec<u16> = (0..w).map(|j| pl.at(x0 + j, y0 + i)).collect();
+                        eprintln!("  at ({x0},{y0}) row {i}: analysis {a:?} real {c:?}");
+                    }
+                }
+                if bad > 0 {
+                    eprintln!(
+                        "MISMATCH plane {plane} block r{} c{} bsize {} skip {} ymode {} uvmode {} tx {}: {bad} px",
+                        b.mi_row, b.mi_col, b.bsize, b.skip, b.y_mode, b.uv_mode, b.tx_size
+                    );
+                }
+            }
+        }
         Ok(())
     }
 
@@ -797,14 +850,18 @@ impl<'a, C: Coder> TileCoder<'a, C> {
         let (ac, lc) =
             (INTRA_MODE_CONTEXT[above_mode as usize] as usize, INTRA_MODE_CONTEXT[left_mode as usize] as usize);
         b.y_mode = self.c.symbol(&mut self.cdf.kf_y_mode[ac][lc], b.y_mode as usize) as u8;
-        // intra_angle_info_y
-        b.angle_y = 0;
+        // intra_angle_info_y (the encoder arrives with the planned values already set)
+        if C::DECODING {
+            b.angle_y = 0;
+        }
         if b.bsize >= BLOCK_8X8 && is_directional(b.y_mode) {
             let s = self.c.symbol(&mut self.cdf.angle_delta[(b.y_mode - V_PRED) as usize], (b.angle_y + 3) as usize);
             b.angle_y = s as i8 - 3;
         }
-        b.uv_mode = DC_PRED;
-        b.angle_uv = 0;
+        if C::DECODING || !b.has_chroma {
+            b.uv_mode = DC_PRED;
+            b.angle_uv = 0;
+        }
         if b.has_chroma {
             let cfl_allowed = if b.lossless {
                 subsampled_size(b.bsize, self.f.sub_x as u8, self.f.sub_y as u8) == BLOCK_4X4
@@ -836,6 +893,7 @@ impl<'a, C: Coder> TileCoder<'a, C> {
             self.palette_mode_info(b);
         }
         // filter_intra_mode_info
+        let want_filter = b.use_filter_intra;
         b.use_filter_intra = false;
         if self.f.seq.enable_filter_intra
             && b.y_mode == DC_PRED
@@ -843,7 +901,7 @@ impl<'a, C: Coder> TileCoder<'a, C> {
             && block_width(b.bsize).max(block_height(b.bsize)) <= 32
         {
             b.use_filter_intra =
-                self.c.symbol(&mut self.cdf.use_filter_intra[b.bsize as usize], b.use_filter_intra as usize) != 0;
+                self.c.symbol(&mut self.cdf.use_filter_intra[b.bsize as usize], want_filter as usize) != 0;
             if b.use_filter_intra {
                 b.filter_intra_mode =
                     self.c.symbol(&mut self.cdf.filter_intra_mode, b.filter_intra_mode as usize) as u8;
@@ -868,16 +926,17 @@ impl<'a, C: Coder> TileCoder<'a, C> {
         let joint = self.c.symbol(&mut self.cdf.cfl_sign, joint as usize) + 1;
         let sign_u = joint / 3;
         let sign_v = joint % 3;
+        let (want_u, want_v) = (b.cfl_alpha_u.unsigned_abs() as usize, b.cfl_alpha_v.unsigned_abs() as usize);
         b.cfl_alpha_u = 0;
         b.cfl_alpha_v = 0;
         if sign_u != 0 {
             let ctx = (sign_u - 1) * 3 + sign_v;
-            let a = self.c.symbol(&mut self.cdf.cfl_alpha[ctx], (b.cfl_alpha_u.unsigned_abs() as usize).max(1) - 1) + 1;
+            let a = self.c.symbol(&mut self.cdf.cfl_alpha[ctx], want_u.max(1) - 1) + 1;
             b.cfl_alpha_u = if sign_u == 1 { -(a as i8) } else { a as i8 };
         }
         if sign_v != 0 {
             let ctx = (sign_v - 1) * 3 + sign_u;
-            let a = self.c.symbol(&mut self.cdf.cfl_alpha[ctx], (b.cfl_alpha_v.unsigned_abs() as usize).max(1) - 1) + 1;
+            let a = self.c.symbol(&mut self.cdf.cfl_alpha[ctx], want_v.max(1) - 1) + 1;
             b.cfl_alpha_v = if sign_v == 1 { -(a as i8) } else { a as i8 };
         }
     }
@@ -1351,6 +1410,9 @@ impl<C: Coder> TileCoder<'_, C> {
         for chunk_y in 0..height_chunks {
             for chunk_x in 0..width_chunks {
                 for plane in 0..planes {
+                    if self.analyzing && (self.an_planes >> plane) & 1 == 0 {
+                        continue;
+                    }
                     let tx_sz = if b.lossless { TX_4X4 } else { self.get_tx_size(b, plane) };
                     let step_x = (TX_W[tx_sz as usize] >> 2) as usize;
                     let step_y = (TX_H[tx_sz as usize] >> 2) as usize;
@@ -1740,12 +1802,23 @@ impl<C: Coder> TileCoder<'_, C> {
                 }
             }
         }
-        let intra_dir = if b.use_filter_intra {
-            FILTER_INTRA_MODE_TO_INTRA_DIR[b.filter_intra_mode as usize]
-        } else {
-            b.y_mode
-        };
-        TxbSetup { tx_sz, ptype, tx_sz_ctx, all_zero_ctx, dc_sign_ctx, tx_set: set, read_type, fixed_type, intra_dir, x4, y4, w4, h4 }
+        let intra_dir =
+            if b.use_filter_intra { FILTER_INTRA_MODE_TO_INTRA_DIR[b.filter_intra_mode as usize] } else { b.y_mode };
+        TxbSetup {
+            tx_sz,
+            ptype,
+            tx_sz_ctx,
+            all_zero_ctx,
+            dc_sign_ctx,
+            tx_set: set,
+            read_type,
+            fixed_type,
+            intra_dir,
+            x4,
+            y4,
+            w4,
+            h4,
+        }
     }
 
     fn coeffs(&mut self, b: &Blk, plane: usize, start_x: usize, start_y: usize, tx_sz: u8) -> usize {
@@ -1771,7 +1844,15 @@ impl<C: Coder> TileCoder<'_, C> {
     }
 
     /// Estimated cost, in 1/256 bit, of coding `cb` as a transform block here (contexts are not modified).
-    pub(crate) fn txb_cost(&mut self, b: &Blk, plane: usize, start_x: usize, start_y: usize, tx_sz: u8, cb: &mut CoefBlock) -> u64 {
+    pub(crate) fn txb_cost(
+        &mut self,
+        b: &Blk,
+        plane: usize,
+        start_x: usize,
+        start_y: usize,
+        tx_sz: u8,
+        cb: &mut CoefBlock,
+    ) -> u64 {
         let s = self.txb_setup(b, plane, start_x, start_y, tx_sz);
         let mut cost = super::entropy::CostCoder::new(false);
         code_txb(&mut cost, &mut self.cdf, &s, cb);
@@ -1853,7 +1934,6 @@ impl<C: Coder> TileCoder<'_, C> {
         }
     }
 }
-
 
 /// Setup of one transform block's coefficient syntax (contexts derived from the neighbourhood).
 pub(crate) struct TxbSetup {
@@ -1962,7 +2042,7 @@ pub(crate) fn code_txb<K: Coder>(k: &mut K, cdf: &mut Cdfs, s: &TxbSetup, cb: &m
             let pos = scan[c] as usize;
             let row = pos >> bwl;
             let col = pos & (cw - 1);
-            let want_level = if K::DECODING { 0 } else { want_abs(pos, &cb).min(15) as usize };
+            let want_level = if K::DECODING { 0 } else { want_abs(pos, cb).min(15) as usize };
             let mut level;
             if c == eob - 1 {
                 let ctx = if c == 0 {
@@ -1974,8 +2054,7 @@ pub(crate) fn code_txb<K: Coder>(k: &mut K, cdf: &mut Cdfs, s: &TxbSetup, cb: &m
                 } else {
                     3
                 };
-                let s =
-                    k.symbol(&mut cdf.coeff_base_eob[tx_sz_ctx][ptype][ctx], want_level.clamp(1, 3) - 1);
+                let s = k.symbol(&mut cdf.coeff_base_eob[tx_sz_ctx][ptype][ctx], want_level.clamp(1, 3) - 1);
                 level = s + 1;
             } else {
                 let ctx = coeff_base_ctx(&levels, stride, tx_sz, class, row, col);
