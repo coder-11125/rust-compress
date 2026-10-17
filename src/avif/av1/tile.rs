@@ -1,0 +1,2018 @@
+//! Tile decoding: partitions, mode info, coefficients and reconstruction of intra frames
+//! (AV1 spec sections 5.11 and 7).
+//!
+//! The syntax is written once, generically over [`Coder`]: with a [`SymbolDecoder`] it parses a
+//! stream, with a [`SymbolEncoder`] the same code writes the syntax elements held in [`Blk`] and the
+//! coefficient blocks supplied by the encoder, so both sides always agree.
+
+use super::cdf_tables::Cdfs;
+use super::coef_tables::*;
+use super::consts::*;
+use super::entropy::Coder;
+use super::frame::Plane;
+use super::ipred;
+use super::itx;
+use super::obu::{FrameHeader, SequenceHeader};
+use super::obu::{RESTORE_NONE, RESTORE_SGRPROJ, RESTORE_SWITCHABLE, RESTORE_WIENER};
+use crate::error::{Error, Result};
+
+/// One restoration unit's parameters as read from the stream.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct LrUnitParams {
+    /// RESTORE_NONE / RESTORE_WIENER / RESTORE_SGRPROJ
+    pub kind: u8,
+    pub wiener: [[i8; 3]; 2],
+    pub sgr_set: u8,
+    pub sgr_xqd: [i8; 2],
+}
+
+/// Everything decoded for a frame that later stages (loop filters, output) need.
+pub struct FrameState {
+    pub seq: SequenceHeader,
+    pub hdr: FrameHeader,
+    pub planes: Vec<Plane>,
+    pub mi_cols: usize,
+    pub mi_rows: usize,
+    pub mi_size: Vec<u8>,
+    pub skip: Vec<u8>,
+    pub y_mode: Vec<u8>,
+    pub uv_mode: Vec<u8>,
+    pub seg_id: Vec<u8>,
+    pub tx_size: Vec<u8>,
+    pub is_inter: Vec<u8>,
+    pub pal_size: [Vec<u8>; 2],
+    pub delta_lf: Vec<[i8; 4]>,
+    /// Loop-filter transform sizes per plane, at the plane's 4x4 grid (`lf_stride[plane]` wide).
+    pub lf_tx: [Vec<u8>; 3],
+    pub lf_stride: [usize; 3],
+    /// `cdef_idx` per 64x64 luma block, -1 = not coded.
+    pub cdef_idx: Vec<i8>,
+    pub cdef_stride: usize,
+    /// Restoration units per plane: (units_per_row, units_per_col, params).
+    pub lr_units: [(usize, usize, Vec<LrUnitParams>); 3],
+    /// Palette colours of the block covering each position of the row above / column to the left.
+    pub num_planes: usize,
+    pub sub_x: usize,
+    pub sub_y: usize,
+}
+
+impl FrameState {
+    pub fn new(seq: &SequenceHeader, hdr: &FrameHeader) -> Result<FrameState> {
+        let c = &seq.color;
+        let (mi_cols, mi_rows) = (hdr.mi_cols, hdr.mi_rows);
+        let num_planes = c.num_planes();
+        let (sub_x, sub_y) = (c.sub_x as usize, c.sub_y as usize);
+        // Blocks may overhang the picture by up to a superblock; pad the buffers to a multiple of 128.
+        let aw = (mi_cols * 4).next_multiple_of(128);
+        let ah = (mi_rows * 4).next_multiple_of(128);
+        let mut planes = Vec::new();
+        for p in 0..num_planes {
+            let (w, h) = if p == 0 { (aw, ah) } else { (aw >> sub_x, ah >> sub_y) };
+            planes.push(Plane::new(w, h));
+        }
+        let n = mi_cols * mi_rows;
+        let mut lf_stride = [0usize; 3];
+        let mut lf_tx: [Vec<u8>; 3] = Default::default();
+        for p in 0..num_planes {
+            let (sx, sy) = if p == 0 { (0, 0) } else { (sub_x, sub_y) };
+            let w = (mi_cols + sx) >> sx;
+            let h = (mi_rows + sy) >> sy;
+            lf_stride[p] = w;
+            lf_tx[p] = vec![0; w * h];
+        }
+        let cdef_stride = mi_cols.div_ceil(16);
+        let cdef_rows = mi_rows.div_ceil(16);
+        let mut lr_units: [(usize, usize, Vec<LrUnitParams>); 3] = Default::default();
+        for p in 0..num_planes {
+            if hdr.lr.kind[p] != RESTORE_NONE {
+                let (sx, sy) = if p == 0 { (0, 0) } else { (sub_x, sub_y) };
+                let unit = hdr.lr.unit_size[p];
+                let rows = count_units(unit, (hdr.frame_height + sy) >> sy);
+                let cols = count_units(unit, (hdr.upscaled_width + sx) >> sx);
+                lr_units[p] = (cols, rows, vec![LrUnitParams::default(); rows * cols]);
+            }
+        }
+        Ok(FrameState {
+            seq: seq.clone(),
+            hdr: hdr.clone(),
+            planes,
+            mi_cols,
+            mi_rows,
+            mi_size: vec![0; n],
+            skip: vec![0; n],
+            y_mode: vec![0; n],
+            uv_mode: vec![0; n],
+            seg_id: vec![0; n],
+            tx_size: vec![0; n],
+            is_inter: vec![0; n],
+            pal_size: [vec![0; n], vec![0; n]],
+            delta_lf: vec![[0; 4]; n],
+            lf_tx,
+            lf_stride,
+            cdef_idx: vec![-1; cdef_stride * cdef_rows],
+            cdef_stride,
+            lr_units,
+            num_planes,
+            sub_x,
+            sub_y,
+        })
+    }
+}
+
+pub fn count_units(unit_size: usize, frame_size: usize) -> usize {
+    ((frame_size + (unit_size >> 1)) / unit_size).max(1)
+}
+
+/// Syntax elements of the block being coded.
+#[derive(Clone, Debug, Default)]
+pub struct Blk {
+    pub mi_row: usize,
+    pub mi_col: usize,
+    pub bsize: u8,
+    pub has_chroma: bool,
+    pub avail_u: bool,
+    pub avail_l: bool,
+    pub avail_u_chroma: bool,
+    pub avail_l_chroma: bool,
+    pub skip: bool,
+    pub segment_id: u8,
+    pub lossless: bool,
+    pub use_intrabc: bool,
+    pub y_mode: u8,
+    pub uv_mode: u8,
+    pub angle_y: i8,
+    pub angle_uv: i8,
+    pub use_filter_intra: bool,
+    pub filter_intra_mode: u8,
+    pub cfl_alpha_u: i8,
+    pub cfl_alpha_v: i8,
+    pub pal_size_y: u8,
+    pub pal_size_uv: u8,
+    pub pal_y: [u16; 8],
+    pub pal_u: [u16; 8],
+    pub pal_v: [u16; 8],
+    pub pal_v_delta_encode: bool,
+    pub tx_size: u8,
+    /// Encoder inputs (ignored when decoding): the `cdef_idx` and the reduced delta-q / delta-lf values.
+    pub cdef_value: u32,
+    pub delta_q: i32,
+    pub delta_lf_values: [i32; 4],
+}
+
+/// Quantized coefficients of one transform block in the specification's raster order
+/// (`quant[row * w + col]` over the coded, at most 32x32, area).
+pub struct CoefBlock {
+    pub quant: [i32; 1024],
+    pub eob: usize,
+    pub tx_type: u8,
+}
+
+impl Default for CoefBlock {
+    fn default() -> Self {
+        CoefBlock { quant: [0; 1024], eob: 0, tx_type: 0 }
+    }
+}
+
+const SB_MI_MAX: usize = 32;
+
+pub struct TileCoder<'a, C: Coder> {
+    pub f: &'a mut FrameState,
+    pub cdf: Box<Cdfs>,
+    pub c: C,
+    pub mi_row_start: usize,
+    pub mi_row_end: usize,
+    pub mi_col_start: usize,
+    pub mi_col_end: usize,
+    above_level: [Vec<u8>; 3],
+    above_dc: [Vec<u8>; 3],
+    left_level: [Vec<u8>; 3],
+    left_dc: [Vec<u8>; 3],
+    above_pal: [Vec<[u16; 8]>; 2],
+    left_pal: [Vec<[u16; 8]>; 2],
+    /// `BlockDecoded[plane][y + 1][x + 1]` for the current superblock.
+    block_decoded: [[[bool; SB_MI_MAX + 3]; SB_MI_MAX + 3]; 3],
+    pub current_q_index: i32,
+    pub delta_lf: [i32; 4],
+    pub read_deltas: bool,
+    ref_sgr_xqd: [[i32; 2]; 3],
+    ref_lr_wiener: [[[i32; 3]; 2]; 3],
+    max_luma_w: usize,
+    max_luma_h: usize,
+    color_map_y: Vec<u8>,
+    color_map_uv: Vec<u8>,
+    pub cb: Box<CoefBlock>,
+}
+
+impl<'a, C: Coder> TileCoder<'a, C> {
+    pub fn new(
+        f: &'a mut FrameState,
+        cdf: Box<Cdfs>,
+        c: C,
+        rows: (usize, usize),
+        cols: (usize, usize),
+    ) -> TileCoder<'a, C> {
+        let mi_cols = f.mi_cols;
+        let mi_rows = f.mi_rows;
+        let np = f.num_planes;
+        let mk = |n: usize| [vec![0u8; n + 64], vec![0u8; n + 64], vec![0u8; n + 64]];
+        let q = f.hdr.quant.base_q_idx as i32;
+        TileCoder {
+            f,
+            cdf,
+            c,
+            mi_row_start: rows.0,
+            mi_row_end: rows.1,
+            mi_col_start: cols.0,
+            mi_col_end: cols.1,
+            above_level: mk(mi_cols),
+            above_dc: mk(mi_cols),
+            left_level: mk(mi_rows),
+            left_dc: mk(mi_rows),
+            above_pal: [vec![[0; 8]; mi_cols + 32], vec![[0; 8]; mi_cols + 32]],
+            left_pal: [vec![[0; 8]; mi_rows + 32], vec![[0; 8]; mi_rows + 32]],
+            block_decoded: [[[false; SB_MI_MAX + 3]; SB_MI_MAX + 3]; 3],
+            current_q_index: q,
+            delta_lf: [0; 4],
+            read_deltas: false,
+            ref_sgr_xqd: [[-32, 31]; 3],
+            ref_lr_wiener: [[[3, -7, 15]; 2]; 3],
+            max_luma_w: 0,
+            max_luma_h: 0,
+            color_map_y: vec![0; 64 * 64],
+            color_map_uv: vec![0; 64 * 64],
+            cb: Box::default(),
+        }
+        .with_planes(np)
+    }
+
+    fn with_planes(self, _np: usize) -> Self {
+        self
+    }
+
+    fn sb_size(&self) -> u8 {
+        if self.f.seq.use_128x128_superblock { BLOCK_128X128 } else { BLOCK_64X64 }
+    }
+
+    fn is_inside(&self, r: isize, c: isize) -> bool {
+        c >= self.mi_col_start as isize
+            && c < self.mi_col_end as isize
+            && r >= self.mi_row_start as isize
+            && r < self.mi_row_end as isize
+    }
+
+    #[inline]
+    fn mi(&self, r: usize, c: usize) -> usize {
+        r * self.f.mi_cols + c
+    }
+
+    /// Decode all superblocks of the tile (spec `decode_tile`).
+    pub fn decode_tile(&mut self) -> Result<()> {
+        let sb4 = NUM_4X4_WIDE[self.sb_size() as usize] as usize;
+        let mut r = self.mi_row_start;
+        while r < self.mi_row_end {
+            self.clear_left_context();
+            let mut c = self.mi_col_start;
+            while c < self.mi_col_end {
+                self.read_deltas = self.f.hdr.delta_q_present;
+                self.clear_cdef(r, c);
+                self.clear_block_decoded_flags(r, c, sb4);
+                self.read_lr(r, c, self.sb_size())?;
+                self.decode_partition(r, c, self.sb_size())?;
+                c += sb4;
+            }
+            r += sb4;
+        }
+        Ok(())
+    }
+
+    fn clear_left_context(&mut self) {
+        for p in 0..3 {
+            self.left_level[p].fill(0);
+            self.left_dc[p].fill(0);
+        }
+        for p in 0..2 {
+            self.left_pal[p].fill([0; 8]);
+        }
+    }
+
+    /// Spec `clear_above_context` is implicit: the contexts start zeroed for every tile.
+    fn clear_cdef(&mut self, r: usize, c: usize) {
+        let st = self.f.cdef_stride;
+        let (r64, c64) = (r >> 4, c >> 4);
+        self.f.cdef_idx[r64 * st + c64] = -1;
+        if self.f.seq.use_128x128_superblock {
+            let rows = self.f.cdef_idx.len() / st;
+            if c64 + 1 < st {
+                self.f.cdef_idx[r64 * st + c64 + 1] = -1;
+            }
+            if r64 + 1 < rows {
+                self.f.cdef_idx[(r64 + 1) * st + c64] = -1;
+                if c64 + 1 < st {
+                    self.f.cdef_idx[(r64 + 1) * st + c64 + 1] = -1;
+                }
+            }
+        }
+    }
+
+    fn clear_block_decoded_flags(&mut self, r: usize, c: usize, sb4: usize) {
+        for plane in 0..self.f.num_planes {
+            let (sx, sy) = self.plane_sub(plane);
+            let sb_w4 = ((self.mi_col_end - c) >> sx) as isize;
+            let sb_h4 = ((self.mi_row_end - r) >> sy) as isize;
+            let bd = &mut self.block_decoded[plane];
+            for y in -1..=((sb4 >> sy) as isize) {
+                for x in -1..=((sb4 >> sx) as isize) {
+                    let v = if y < 0 && x < sb_w4 { true } else { x < 0 && y < sb_h4 };
+                    bd[(y + 1) as usize][(x + 1) as usize] = v;
+                }
+            }
+            bd[(sb4 >> sy) + 1][0] = false;
+        }
+    }
+
+    fn plane_sub(&self, plane: usize) -> (usize, usize) {
+        if plane == 0 { (0, 0) } else { (self.f.sub_x, self.f.sub_y) }
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // Loop restoration syntax
+    // ---------------------------------------------------------------------------------------------
+
+    fn read_lr(&mut self, r: usize, c: usize, bsize: u8) -> Result<()> {
+        if self.f.hdr.allow_intrabc {
+            return Ok(());
+        }
+        let w = NUM_4X4_WIDE[bsize as usize] as usize;
+        let h = NUM_4X4_HIGH[bsize as usize] as usize;
+        for plane in 0..self.f.num_planes {
+            if self.f.hdr.lr.kind[plane] == RESTORE_NONE {
+                continue;
+            }
+            let (sx, sy) = self.plane_sub(plane);
+            let unit_size = self.f.hdr.lr.unit_size[plane];
+            let (unit_cols, unit_rows, _) = {
+                let u = &self.f.lr_units[plane];
+                (u.0, u.1, ())
+            };
+            let row_start = (r * (4 >> sy) + unit_size - 1) / unit_size;
+            let row_end = unit_rows.min(((r + h) * (4 >> sy) + unit_size - 1) / unit_size);
+            let (num, den) = if self.f.hdr.use_superres {
+                ((4 >> sx) * self.f.hdr.superres_denom, unit_size * 8)
+            } else {
+                (4 >> sx, unit_size)
+            };
+            let col_start = (c * num + den - 1) / den;
+            let col_end = unit_cols.min(((c + w) * num + den - 1) / den);
+            for ur in row_start..row_end {
+                for uc in col_start..col_end {
+                    self.read_lr_unit(plane, ur, uc);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn read_lr_unit(&mut self, plane: usize, ur: usize, uc: usize) {
+        let frame_kind = self.f.hdr.lr.kind[plane];
+        let mut p = LrUnitParams::default();
+        let restoration_type = match frame_kind {
+            RESTORE_WIENER => {
+                let s = self.c.symbol(&mut self.cdf.lr_wiener, 0);
+                if s != 0 { RESTORE_WIENER } else { RESTORE_NONE }
+            }
+            RESTORE_SGRPROJ => {
+                let s = self.c.symbol(&mut self.cdf.lr_sgrproj, 0);
+                if s != 0 { RESTORE_SGRPROJ } else { RESTORE_NONE }
+            }
+            _ => {
+                debug_assert_eq!(frame_kind, RESTORE_SWITCHABLE);
+                match self.c.symbol(&mut self.cdf.lr_switchable, 0) {
+                    0 => RESTORE_NONE,
+                    1 => RESTORE_WIENER,
+                    _ => RESTORE_SGRPROJ,
+                }
+            }
+        };
+        p.kind = restoration_type;
+        if restoration_type == RESTORE_WIENER {
+            const MIN: [i32; 3] = [-5, -23, -17];
+            const MAX: [i32; 3] = [10, 8, 46];
+            const K: [u32; 3] = [1, 2, 3];
+            for pass in 0..2 {
+                let first = if plane > 0 { 1 } else { 0 };
+                if plane > 0 {
+                    p.wiener[pass][0] = 0;
+                }
+                for j in first..3 {
+                    let v = self.decode_signed_subexp_with_ref(
+                        MIN[j],
+                        MAX[j] + 1,
+                        K[j],
+                        self.ref_lr_wiener[plane][pass][j],
+                    );
+                    p.wiener[pass][j] = v as i8;
+                    self.ref_lr_wiener[plane][pass][j] = v;
+                }
+            }
+        } else if restoration_type == RESTORE_SGRPROJ {
+            let set = self.c.literal(4, 0) as usize;
+            p.sgr_set = set as u8;
+            const MIN: [i32; 2] = [-96, -32];
+            const MAX: [i32; 2] = [31, 95];
+            for i in 0..2 {
+                let radius = SGR_RADII[set][i];
+                let v = if radius != 0 {
+                    self.decode_signed_subexp_with_ref(MIN[i], MAX[i] + 1, 4, self.ref_sgr_xqd[plane][i])
+                } else if i == 1 {
+                    ((1 << 7) - self.ref_sgr_xqd[plane][0]).clamp(MIN[i], MAX[i])
+                } else {
+                    0
+                };
+                p.sgr_xqd[i] = v as i8;
+                self.ref_sgr_xqd[plane][i] = v;
+            }
+        }
+        let cols = self.f.lr_units[plane].0;
+        self.f.lr_units[plane].2[ur * cols + uc] = p;
+    }
+
+    fn decode_signed_subexp_with_ref(&mut self, low: i32, high: i32, k: u32, r: i32) -> i32 {
+        let x = self.decode_unsigned_subexp_with_ref(high - low, k, r - low);
+        x + low
+    }
+
+    fn decode_unsigned_subexp_with_ref(&mut self, mx: i32, k: u32, r: i32) -> i32 {
+        let v = self.decode_subexp(mx, k);
+        if (r << 1) <= mx { inverse_recenter(r, v) } else { mx - 1 - inverse_recenter(mx - 1 - r, v) }
+    }
+
+    fn decode_subexp(&mut self, num_syms: i32, k: u32) -> i32 {
+        let mut i = 0;
+        let mut mk = 0;
+        loop {
+            let b2 = if i != 0 { k + i - 1 } else { k };
+            let a = 1 << b2;
+            if num_syms <= mk + 3 * a {
+                let v = self.literal_ns((num_syms - mk) as u32);
+                return v as i32 + mk;
+            }
+            let more = self.c.literal(1, 0) != 0;
+            if more {
+                i += 1;
+                mk += a;
+            } else {
+                let v = self.c.literal(b2, 0);
+                return v as i32 + mk;
+            }
+        }
+    }
+
+    /// `NS(n)` coded with literal bits.
+    fn literal_ns(&mut self, n: u32) -> u32 {
+        if n <= 1 {
+            return 0;
+        }
+        let w = 32 - n.leading_zeros();
+        let m = (1u32 << w) - n;
+        let v = self.c.literal(w - 1, 0);
+        if v < m {
+            return v;
+        }
+        let extra = self.c.literal(1, 0);
+        (v << 1) - m + extra
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // Partition
+    // ---------------------------------------------------------------------------------------------
+
+    pub fn decode_partition(&mut self, r: usize, c: usize, bsize: u8) -> Result<()> {
+        if r >= self.f.mi_rows || c >= self.f.mi_cols {
+            return Ok(());
+        }
+        let avail_u = self.is_inside(r as isize - 1, c as isize);
+        let avail_l = self.is_inside(r as isize, c as isize - 1);
+        let num4 = NUM_4X4_WIDE[bsize as usize] as usize;
+        let half = num4 >> 1;
+        let quarter = half >> 1;
+        let has_rows = (r + half) < self.f.mi_rows;
+        let has_cols = (c + half) < self.f.mi_cols;
+        let partition = if bsize < BLOCK_8X8 {
+            PARTITION_NONE
+        } else {
+            let bsl = (NUM_4X4_WIDE[bsize as usize] as usize).ilog2() as usize; // 8x8 -> 1
+            let above =
+                avail_u && (NUM_4X4_WIDE[self.f.mi_size[self.mi(r - 1, c)] as usize] as usize).ilog2() < bsl as u32;
+            let left =
+                avail_l && (NUM_4X4_HIGH[self.f.mi_size[self.mi(r, c - 1)] as usize] as usize).ilog2() < bsl as u32;
+            let ctx = left as usize * 2 + above as usize;
+            if has_rows && has_cols {
+                let cdf: &mut [u16] = match bsl {
+                    1 => &mut self.cdf.partition_w8[ctx],
+                    5 => &mut self.cdf.partition_w128[ctx],
+                    n => &mut self.cdf.partition[(n - 2) * 4 + ctx],
+                };
+                self.c.symbol(cdf, 0) as u8
+            } else if has_cols || has_rows {
+                // Only a split (or the one partition that fits) is possible: a binary choice whose
+                // probability is derived from the full partition CDF.
+                let cdf: &[u16] = match bsl {
+                    1 => &self.cdf.partition_w8[ctx],
+                    5 => &self.cdf.partition_w128[ctx],
+                    n => &self.cdf.partition[(n - 2) * 4 + ctx],
+                };
+                let p = |i: u8| -> u32 {
+                    let hi = cdf[i as usize] as u32;
+                    let lo = if i > 0 { cdf[i as usize - 1] as u32 } else { 0 };
+                    hi - lo
+                };
+                let mut psum;
+                if has_cols {
+                    // split_or_horz
+                    psum = p(PARTITION_VERT) + p(PARTITION_SPLIT);
+                    if bsl > 1 {
+                        psum += p(PARTITION_HORZ_A) + p(PARTITION_VERT_A) + p(PARTITION_VERT_B);
+                        if bsl < 5 {
+                            psum += p(PARTITION_VERT_4);
+                        }
+                    }
+                } else {
+                    // split_or_vert
+                    psum = p(PARTITION_HORZ) + p(PARTITION_SPLIT);
+                    if bsl > 1 {
+                        psum += p(PARTITION_HORZ_A) + p(PARTITION_HORZ_B) + p(PARTITION_VERT_A);
+                        if bsl < 5 {
+                            psum += p(PARTITION_HORZ_4);
+                        }
+                    }
+                }
+                let tmp = [(32768 - psum).min(32768) as u16, 32768, 0];
+                let split = self.c.symbol_fixed(&tmp, 0) != 0;
+                if split {
+                    PARTITION_SPLIT
+                } else if has_cols {
+                    PARTITION_HORZ
+                } else {
+                    PARTITION_VERT
+                }
+            } else {
+                PARTITION_SPLIT
+            }
+        };
+        let sub = partition_subsize(partition, bsize);
+        let split_size = partition_subsize(PARTITION_SPLIT, bsize);
+        match partition {
+            PARTITION_NONE => self.decode_block(r, c, sub)?,
+            PARTITION_HORZ => {
+                self.decode_block(r, c, sub)?;
+                if has_rows {
+                    self.decode_block(r + half, c, sub)?;
+                }
+            }
+            PARTITION_VERT => {
+                self.decode_block(r, c, sub)?;
+                if has_cols {
+                    self.decode_block(r, c + half, sub)?;
+                }
+            }
+            PARTITION_SPLIT => {
+                self.decode_partition(r, c, sub)?;
+                self.decode_partition(r, c + half, sub)?;
+                self.decode_partition(r + half, c, sub)?;
+                self.decode_partition(r + half, c + half, sub)?;
+            }
+            PARTITION_HORZ_A => {
+                self.decode_block(r, c, split_size)?;
+                self.decode_block(r, c + half, split_size)?;
+                self.decode_block(r + half, c, sub)?;
+            }
+            PARTITION_HORZ_B => {
+                self.decode_block(r, c, sub)?;
+                self.decode_block(r + half, c, split_size)?;
+                self.decode_block(r + half, c + half, split_size)?;
+            }
+            PARTITION_VERT_A => {
+                self.decode_block(r, c, split_size)?;
+                self.decode_block(r + half, c, split_size)?;
+                self.decode_block(r, c + half, sub)?;
+            }
+            PARTITION_VERT_B => {
+                self.decode_block(r, c, sub)?;
+                self.decode_block(r, c + half, split_size)?;
+                self.decode_block(r + half, c + half, split_size)?;
+            }
+            PARTITION_HORZ_4 => {
+                self.decode_block(r, c, sub)?;
+                self.decode_block(r + quarter, c, sub)?;
+                self.decode_block(r + quarter * 2, c, sub)?;
+                if r + quarter * 3 < self.f.mi_rows {
+                    self.decode_block(r + quarter * 3, c, sub)?;
+                }
+            }
+            PARTITION_VERT_4 => {
+                self.decode_block(r, c, sub)?;
+                self.decode_block(r, c + quarter, sub)?;
+                self.decode_block(r, c + quarter * 2, sub)?;
+                if c + quarter * 3 < self.f.mi_cols {
+                    self.decode_block(r, c + quarter * 3, sub)?;
+                }
+            }
+            _ => return Err(Error::invalid("bad AV1 partition")),
+        }
+        Ok(())
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // Block
+    // ---------------------------------------------------------------------------------------------
+
+    fn decode_block(&mut self, r: usize, c: usize, bsize: u8) -> Result<()> {
+        let mut b = Blk { mi_row: r, mi_col: c, bsize, ..Default::default() };
+        let bw4 = NUM_4X4_WIDE[bsize as usize] as usize;
+        let bh4 = NUM_4X4_HIGH[bsize as usize] as usize;
+        let (ssx, ssy) = (self.f.sub_x, self.f.sub_y);
+        b.has_chroma = if bh4 == 1 && ssy == 1 && (r & 1) == 0 {
+            false
+        } else if bw4 == 1 && ssx == 1 && (c & 1) == 0 {
+            false
+        } else {
+            self.f.num_planes > 1
+        };
+        b.avail_u = self.is_inside(r as isize - 1, c as isize);
+        b.avail_l = self.is_inside(r as isize, c as isize - 1);
+        b.avail_u_chroma = b.avail_u;
+        b.avail_l_chroma = b.avail_l;
+        if b.has_chroma {
+            if ssy == 1 && bh4 == 1 {
+                b.avail_u_chroma = self.is_inside(r as isize - 2, c as isize);
+            }
+            if ssx == 1 && bw4 == 1 {
+                b.avail_l_chroma = self.is_inside(r as isize, c as isize - 2);
+            }
+        } else {
+            b.avail_u_chroma = false;
+            b.avail_l_chroma = false;
+        }
+        self.intra_frame_mode_info(&mut b)?;
+        self.palette_tokens(&b);
+        self.read_block_tx_size(&mut b);
+        if b.skip {
+            self.reset_block_context(&b);
+        }
+        // Store per-block information.
+        let (rows, cols) = (self.f.mi_rows, self.f.mi_cols);
+        let dlf = [self.delta_lf[0] as i8, self.delta_lf[1] as i8, self.delta_lf[2] as i8, self.delta_lf[3] as i8];
+        for y in 0..bh4 {
+            if r + y >= rows {
+                break;
+            }
+            for x in 0..bw4 {
+                if c + x >= cols {
+                    break;
+                }
+                let i = (r + y) * cols + c + x;
+                self.f.mi_size[i] = bsize;
+                self.f.skip[i] = b.skip as u8;
+                self.f.y_mode[i] = b.y_mode;
+                self.f.uv_mode[i] = b.uv_mode;
+                self.f.seg_id[i] = b.segment_id;
+                self.f.tx_size[i] = b.tx_size;
+                self.f.is_inter[i] = b.use_intrabc as u8;
+                self.f.pal_size[0][i] = b.pal_size_y;
+                self.f.pal_size[1][i] = b.pal_size_uv;
+                self.f.delta_lf[i] = dlf;
+            }
+        }
+        for x in 0..bw4 {
+            if c + x < cols + 32 {
+                self.above_pal[0][c + x] = b.pal_y;
+                self.above_pal[1][c + x] = b.pal_u;
+            }
+        }
+        for y in 0..bh4 {
+            if r + y < rows + 32 {
+                self.left_pal[0][r + y] = b.pal_y;
+                self.left_pal[1][r + y] = b.pal_u;
+            }
+        }
+        self.residual(&b)?;
+        Ok(())
+    }
+
+    fn reset_block_context(&mut self, b: &Blk) {
+        let bw4 = NUM_4X4_WIDE[b.bsize as usize] as usize;
+        let bh4 = NUM_4X4_HIGH[b.bsize as usize] as usize;
+        let planes = if b.has_chroma { 3 } else { 1 };
+        for plane in 0..planes {
+            let (sx, sy) = self.plane_sub(plane);
+            for i in (b.mi_col >> sx)..=((b.mi_col + bw4 - 1) >> sx) {
+                self.above_level[plane][i] = 0;
+                self.above_dc[plane][i] = 0;
+            }
+            for i in (b.mi_row >> sy)..=((b.mi_row + bh4 - 1) >> sy) {
+                self.left_level[plane][i] = 0;
+                self.left_dc[plane][i] = 0;
+            }
+        }
+    }
+
+    fn intra_frame_mode_info(&mut self, b: &mut Blk) -> Result<()> {
+        let seg_pre_skip = self.f.hdr.seg.seg_id_pre_skip;
+        b.skip = false;
+        if seg_pre_skip {
+            self.intra_segment_id(b);
+        }
+        // read_skip
+        if seg_pre_skip && self.f.hdr.seg_feature_active(b.segment_id as usize, SEG_LVL_SKIP) {
+            b.skip = true;
+        } else {
+            let mut ctx = 0;
+            if b.avail_u {
+                ctx += self.f.skip[self.mi(b.mi_row - 1, b.mi_col)] as usize;
+            }
+            if b.avail_l {
+                ctx += self.f.skip[self.mi(b.mi_row, b.mi_col - 1)] as usize;
+            }
+            b.skip = self.c.symbol(&mut self.cdf.skip[ctx], b.skip as usize) != 0;
+        }
+        if !seg_pre_skip {
+            self.intra_segment_id(b);
+        }
+        b.lossless = self.f.hdr.lossless_array[b.segment_id as usize];
+        self.read_cdef(b);
+        self.read_delta_qindex(b);
+        self.read_delta_lf(b);
+        self.read_deltas = false;
+        b.use_intrabc = false;
+        if self.f.hdr.allow_intrabc {
+            b.use_intrabc = self.c.symbol(&mut self.cdf.intrabc, b.use_intrabc as usize) != 0;
+        }
+        if b.use_intrabc {
+            return Err(Error::unsupported("AV1 intra block copy"));
+        }
+        // intra_frame_y_mode
+        let above_mode = if b.avail_u { self.f.y_mode[self.mi(b.mi_row - 1, b.mi_col)] } else { DC_PRED };
+        let left_mode = if b.avail_l { self.f.y_mode[self.mi(b.mi_row, b.mi_col - 1)] } else { DC_PRED };
+        let (ac, lc) =
+            (INTRA_MODE_CONTEXT[above_mode as usize] as usize, INTRA_MODE_CONTEXT[left_mode as usize] as usize);
+        b.y_mode = self.c.symbol(&mut self.cdf.kf_y_mode[ac][lc], b.y_mode as usize) as u8;
+        // intra_angle_info_y
+        b.angle_y = 0;
+        if b.bsize >= BLOCK_8X8 && is_directional(b.y_mode) {
+            let s = self.c.symbol(&mut self.cdf.angle_delta[(b.y_mode - V_PRED) as usize], (b.angle_y + 3) as usize);
+            b.angle_y = s as i8 - 3;
+        }
+        b.uv_mode = DC_PRED;
+        b.angle_uv = 0;
+        if b.has_chroma {
+            let cfl_allowed = if b.lossless {
+                subsampled_size(b.bsize, self.f.sub_x as u8, self.f.sub_y as u8) == BLOCK_4X4
+            } else {
+                block_width(b.bsize).max(block_height(b.bsize)) <= 32
+            };
+            let ym = b.y_mode as usize;
+            b.uv_mode = if cfl_allowed {
+                self.c.symbol(&mut self.cdf.uv_mode_cfl[ym], b.uv_mode as usize) as u8
+            } else {
+                self.c.symbol(&mut self.cdf.uv_mode[ym], b.uv_mode as usize) as u8
+            };
+            if b.uv_mode == UV_CFL_PRED {
+                self.read_cfl_alphas(b);
+            }
+            if b.bsize >= BLOCK_8X8 && is_directional(b.uv_mode) {
+                let s =
+                    self.c.symbol(&mut self.cdf.angle_delta[(b.uv_mode - V_PRED) as usize], (b.angle_uv + 3) as usize);
+                b.angle_uv = s as i8 - 3;
+            }
+        }
+        b.pal_size_y = 0;
+        b.pal_size_uv = 0;
+        if b.bsize >= BLOCK_8X8
+            && block_width(b.bsize) <= 64
+            && block_height(b.bsize) <= 64
+            && self.f.hdr.allow_screen_content_tools
+        {
+            self.palette_mode_info(b);
+        }
+        // filter_intra_mode_info
+        b.use_filter_intra = false;
+        if self.f.seq.enable_filter_intra
+            && b.y_mode == DC_PRED
+            && b.pal_size_y == 0
+            && block_width(b.bsize).max(block_height(b.bsize)) <= 32
+        {
+            b.use_filter_intra =
+                self.c.symbol(&mut self.cdf.use_filter_intra[b.bsize as usize], b.use_filter_intra as usize) != 0;
+            if b.use_filter_intra {
+                b.filter_intra_mode =
+                    self.c.symbol(&mut self.cdf.filter_intra_mode, b.filter_intra_mode as usize) as u8;
+            }
+        }
+        Ok(())
+    }
+
+    fn read_cfl_alphas(&mut self, b: &mut Blk) {
+        // Encode the pair back into the joint sign symbol when writing.
+        let sign_of = |a: i8| {
+            if a == 0 {
+                0
+            } else if a < 0 {
+                1
+            } else {
+                2
+            }
+        };
+        let (su, sv) = (sign_of(b.cfl_alpha_u), sign_of(b.cfl_alpha_v));
+        let joint = (su * 3 + sv).max(1) - 1;
+        let joint = self.c.symbol(&mut self.cdf.cfl_sign, joint as usize) + 1;
+        let sign_u = joint / 3;
+        let sign_v = joint % 3;
+        b.cfl_alpha_u = 0;
+        b.cfl_alpha_v = 0;
+        if sign_u != 0 {
+            let ctx = (sign_u - 1) * 3 + sign_v;
+            let a = self.c.symbol(&mut self.cdf.cfl_alpha[ctx], (b.cfl_alpha_u.unsigned_abs() as usize).max(1) - 1) + 1;
+            b.cfl_alpha_u = if sign_u == 1 { -(a as i8) } else { a as i8 };
+        }
+        if sign_v != 0 {
+            let ctx = (sign_v - 1) * 3 + sign_u;
+            let a = self.c.symbol(&mut self.cdf.cfl_alpha[ctx], (b.cfl_alpha_v.unsigned_abs() as usize).max(1) - 1) + 1;
+            b.cfl_alpha_v = if sign_v == 1 { -(a as i8) } else { a as i8 };
+        }
+    }
+
+    fn intra_segment_id(&mut self, b: &mut Blk) {
+        if !self.f.hdr.seg.enabled {
+            b.segment_id = 0;
+            return;
+        }
+        let (r, c) = (b.mi_row, b.mi_col);
+        let prev_ul = if b.avail_u && b.avail_l { self.f.seg_id[self.mi(r - 1, c - 1)] as i32 } else { -1 };
+        let prev_u = if b.avail_u { self.f.seg_id[self.mi(r - 1, c)] as i32 } else { -1 };
+        let prev_l = if b.avail_l { self.f.seg_id[self.mi(r, c - 1)] as i32 } else { -1 };
+        let pred = if prev_u == -1 {
+            if prev_l == -1 { 0 } else { prev_l }
+        } else if prev_l == -1 {
+            prev_u
+        } else if prev_ul == prev_u {
+            prev_u
+        } else {
+            prev_l
+        };
+        let last = self.f.hdr.seg.last_active_seg_id as i32;
+        if b.skip {
+            b.segment_id = pred as u8;
+        } else {
+            let ctx = if prev_ul < 0 {
+                0
+            } else if prev_ul == prev_u && prev_ul == prev_l {
+                2
+            } else if prev_ul == prev_u || prev_ul == prev_l || prev_u == prev_l {
+                1
+            } else {
+                0
+            };
+            let coded = interleave(b.segment_id as i32, pred, last + 1);
+            let s = self.c.symbol(&mut self.cdf.segment_id[ctx], coded as usize) as i32;
+            let id = neg_deinterleave(s, pred, last + 1);
+            b.segment_id = id.clamp(0, last) as u8;
+        }
+    }
+
+    fn read_cdef(&mut self, b: &Blk) {
+        let hdr = &self.f.hdr;
+        if b.skip || hdr.coded_lossless || !self.f.seq.enable_cdef || hdr.allow_intrabc {
+            return;
+        }
+        let st = self.f.cdef_stride;
+        let (r64, c64) = (b.mi_row >> 4, b.mi_col >> 4);
+        if self.f.cdef_idx[r64 * st + c64] == -1 {
+            let bits = self.f.hdr.cdef.bits as u32;
+            let cur = self.c.literal(bits, b.cdef_value);
+            let w4 = NUM_4X4_WIDE[b.bsize as usize] as usize;
+            let h4 = NUM_4X4_HIGH[b.bsize as usize] as usize;
+            let rows = self.f.cdef_idx.len() / st;
+            for y in r64..r64 + h4.div_ceil(16) {
+                for x in c64..c64 + w4.div_ceil(16) {
+                    if y < rows && x < st {
+                        self.f.cdef_idx[y * st + x] = cur as i8;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Code the magnitude of a delta-q / delta-lf value; `which` selects the CDF (0 = delta q, 1 = delta lf,
+    /// 2.. = multi delta lf).
+    fn code_delta_abs(&mut self, which: usize, want: u32) -> i32 {
+        let mut abs = {
+            let cdf: &mut [u16] = match which {
+                0 => &mut self.cdf.delta_q,
+                1 => &mut self.cdf.delta_lf,
+                n => &mut self.cdf.delta_lf_multi[n - 2],
+            };
+            self.c.symbol(cdf, want.min(3) as usize) as i32
+        };
+        if abs == 3 {
+            let rem_bits_want = if want >= 3 { (want - 1).ilog2() } else { 1 };
+            let rem_bits = self.c.literal(3, rem_bits_want - 1) + 1;
+            let bits_want = want.wrapping_sub(1 + (1 << rem_bits));
+            let abs_bits = self.c.literal(rem_bits, bits_want);
+            abs = abs_bits as i32 + (1 << rem_bits) + 1;
+        }
+        abs
+    }
+
+    fn read_delta_qindex(&mut self, b: &Blk) {
+        if b.bsize == self.sb_size() && b.skip {
+            return;
+        }
+        if self.read_deltas {
+            let abs = self.code_delta_abs(0, b.delta_q.unsigned_abs());
+            if abs != 0 {
+                let sign = self.c.literal(1, (b.delta_q < 0) as u32) != 0;
+                let reduced = if sign { -abs } else { abs };
+                self.current_q_index = (self.current_q_index + (reduced << self.f.hdr.delta_q_res)).clamp(1, 255);
+            }
+        }
+    }
+
+    fn read_delta_lf(&mut self, b: &Blk) {
+        if b.bsize == self.sb_size() && b.skip {
+            return;
+        }
+        if self.read_deltas && self.f.hdr.delta_lf_present {
+            let multi = self.f.hdr.delta_lf_multi;
+            let count = if multi { if self.f.num_planes > 1 { 4 } else { 2 } } else { 1 };
+            for i in 0..count {
+                let want = b.delta_lf_values[i];
+                let abs = self.code_delta_abs(if multi { 2 + i } else { 1 }, want.unsigned_abs());
+                if abs != 0 {
+                    let sign = self.c.literal(1, (want < 0) as u32) != 0;
+                    let reduced = if sign { -abs } else { abs };
+                    self.delta_lf[i] = (self.delta_lf[i] + (reduced << self.f.hdr.delta_lf_res)).clamp(-63, 63);
+                }
+            }
+        }
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // Palette
+    // ---------------------------------------------------------------------------------------------
+
+    fn palette_cache(&self, b: &Blk, plane: usize) -> Vec<u16> {
+        let (r, c) = (b.mi_row, b.mi_col);
+        let above_n =
+            if (r * 4) % 64 != 0 && b.avail_u { self.f.pal_size[plane][self.mi(r - 1, c)] as usize } else { 0 };
+        let left_n = if b.avail_l { self.f.pal_size[plane][self.mi(r, c - 1)] as usize } else { 0 };
+        let above = if above_n > 0 { self.above_pal[plane][c] } else { [0; 8] };
+        let left = if left_n > 0 { self.left_pal[plane][r] } else { [0; 8] };
+        let (mut ai, mut li) = (0, 0);
+        let mut cache: Vec<u16> = Vec::new();
+        while ai < above_n && li < left_n {
+            let (ac, lc) = (above[ai], left[li]);
+            if lc < ac {
+                if cache.last() != Some(&lc) {
+                    cache.push(lc);
+                }
+                li += 1;
+            } else {
+                if cache.last() != Some(&ac) {
+                    cache.push(ac);
+                }
+                ai += 1;
+                if lc == ac {
+                    li += 1;
+                }
+            }
+        }
+        while ai < above_n {
+            let v = above[ai];
+            ai += 1;
+            if cache.last() != Some(&v) {
+                cache.push(v);
+            }
+        }
+        while li < left_n {
+            let v = left[li];
+            li += 1;
+            if cache.last() != Some(&v) {
+                cache.push(v);
+            }
+        }
+        cache
+    }
+
+    fn palette_mode_info(&mut self, b: &mut Blk) {
+        let bd = self.f.seq.color.bit_depth as u32;
+        let ctx_idx = (NUM_4X4_WIDE[b.bsize as usize].ilog2() + NUM_4X4_HIGH[b.bsize as usize].ilog2()) as usize - 2;
+        let (r, c) = (b.mi_row, b.mi_col);
+        if b.y_mode == DC_PRED {
+            let ctx = (b.avail_u && self.f.pal_size[0][self.mi(r - 1, c)] > 0) as usize
+                + (b.avail_l && self.f.pal_size[0][self.mi(r, c - 1)] > 0) as usize;
+            let has = self.c.symbol(&mut self.cdf.palette_y_mode[ctx_idx][ctx], (b.pal_size_y > 0) as usize) != 0;
+            if has {
+                let n = self.c.symbol(&mut self.cdf.palette_size_y[ctx_idx], (b.pal_size_y as usize).max(2) - 2) + 2;
+                b.pal_size_y = n as u8;
+                let cache = self.palette_cache(b, 0);
+                let mut colors = b.pal_y;
+                self.read_palette_colors(&mut colors, n, &cache, bd, true);
+                b.pal_y = colors;
+            }
+        }
+        if b.has_chroma && b.uv_mode == DC_PRED {
+            let ctx = (b.pal_size_y > 0) as usize;
+            let has = self.c.symbol(&mut self.cdf.palette_uv_mode[ctx], (b.pal_size_uv > 0) as usize) != 0;
+            if has {
+                let n = self.c.symbol(&mut self.cdf.palette_size_uv[ctx_idx], (b.pal_size_uv as usize).max(2) - 2) + 2;
+                b.pal_size_uv = n as u8;
+                let cache = self.palette_cache(b, 1);
+                let mut colors = b.pal_u;
+                self.read_palette_colors(&mut colors, n, &cache, bd, false);
+                b.pal_u = colors;
+                // V colours
+                let maxv = 1i32 << bd;
+                let delta_encode = self.c.literal(1, b.pal_v_delta_encode as u32) != 0;
+                if delta_encode {
+                    let min_bits = bd - 4;
+                    let bits = min_bits + self.c.literal(2, 0);
+                    b.pal_v[0] = self.c.literal(bd, b.pal_v[0] as u32) as u16;
+                    for idx in 1..n {
+                        let mut delta = self.c.literal(bits, 0) as i32;
+                        if delta != 0 && self.c.literal(1, 0) != 0 {
+                            delta = -delta;
+                        }
+                        let mut val = b.pal_v[idx - 1] as i32 + delta;
+                        if val < 0 {
+                            val += maxv;
+                        }
+                        if val >= maxv {
+                            val -= maxv;
+                        }
+                        b.pal_v[idx] = val.clamp(0, maxv - 1) as u16;
+                    }
+                } else {
+                    for idx in 0..n {
+                        b.pal_v[idx] = self.c.literal(bd, b.pal_v[idx] as u32) as u16;
+                    }
+                }
+            }
+        }
+    }
+
+    fn read_palette_colors(&mut self, colors: &mut [u16; 8], n: usize, cache: &[u16], bd: u32, luma: bool) {
+        let mut idx = 0;
+        for &cv in cache {
+            if idx >= n {
+                break;
+            }
+            let use_cache = self.c.literal(1, 0) != 0;
+            if use_cache {
+                colors[idx] = cv;
+                idx += 1;
+            }
+        }
+        if idx < n {
+            colors[idx] = self.c.literal(bd, colors[idx] as u32) as u16;
+            idx += 1;
+        }
+        let mut palette_bits = 0;
+        if idx < n {
+            let min_bits = bd - 3;
+            palette_bits = min_bits + self.c.literal(2, 0);
+        }
+        let maxv = (1i32 << bd) - 1;
+        while idx < n {
+            let mut delta = self.c.literal(palette_bits, 0) as i32;
+            if luma {
+                delta += 1;
+            }
+            let prev = colors[idx - 1] as i32;
+            colors[idx] = (prev + delta).clamp(0, maxv) as u16;
+            let range = (1i32 << bd) - colors[idx] as i32 - if luma { 1 } else { 0 };
+            palette_bits = palette_bits.min(ceil_log2(range.max(0) as u32));
+            idx += 1;
+        }
+        colors[..n].sort_unstable();
+    }
+
+    fn palette_tokens(&mut self, b: &Blk) {
+        if b.pal_size_y == 0 && b.pal_size_uv == 0 {
+            return;
+        }
+        let bw = block_width(b.bsize);
+        let bh = block_height(b.bsize);
+        let on_h = bh.min((self.f.mi_rows - b.mi_row) * 4);
+        let on_w = bw.min((self.f.mi_cols - b.mi_col) * 4);
+        if b.pal_size_y > 0 {
+            let mut map = std::mem::take(&mut self.color_map_y);
+            self.read_color_map(&mut map, b.pal_size_y as usize, bw, bh, on_w, on_h, true);
+            self.color_map_y = map;
+        }
+        if b.pal_size_uv > 0 {
+            let (sx, sy) = (self.f.sub_x, self.f.sub_y);
+            let (mut bw, mut bh, mut on_w, mut on_h) = (bw >> sx, bh >> sy, on_w >> sx, on_h >> sy);
+            if bw < 4 {
+                bw += 2;
+                on_w += 2;
+            }
+            if bh < 4 {
+                bh += 2;
+                on_h += 2;
+            }
+            let mut map = std::mem::take(&mut self.color_map_uv);
+            self.read_color_map(&mut map, b.pal_size_uv as usize, bw, bh, on_w, on_h, false);
+            self.color_map_uv = map;
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn read_color_map(&mut self, map: &mut [u8], n: usize, bw: usize, bh: usize, on_w: usize, on_h: usize, luma: bool) {
+        // The index map is stored with a fixed stride of 64.
+        let stride = 64;
+        debug_assert!(C::DECODING, "palette blocks are not produced by the encoder");
+        let first = self.literal_ns(n as u32) as u8;
+        map[0] = first;
+        for i in 1..(on_h + on_w - 1) {
+            let jmax = i.min(on_w - 1);
+            let jmin = (i + 1).saturating_sub(on_h);
+            let mut j = jmax as isize;
+            while j >= jmin as isize {
+                let (row, col) = (i - j as usize, j as usize);
+                let (order, ctx) = palette_color_context(map, stride, row, col, n);
+                let want =
+                    if C::DECODING { 0 } else { order.iter().position(|&o| o == map[row * stride + col]).unwrap_or(0) };
+                let sym = {
+                    let cdf: &mut [u16] = match (luma, n) {
+                        (true, 2) => &mut self.cdf.palette_color_y_2[ctx],
+                        (true, 3) => &mut self.cdf.palette_color_y_3[ctx],
+                        (true, 4) => &mut self.cdf.palette_color_y_4[ctx],
+                        (true, 5) => &mut self.cdf.palette_color_y_5[ctx],
+                        (true, 6) => &mut self.cdf.palette_color_y_6[ctx],
+                        (true, 7) => &mut self.cdf.palette_color_y_7[ctx],
+                        (true, _) => &mut self.cdf.palette_color_y_8[ctx],
+                        (false, 2) => &mut self.cdf.palette_color_uv_2[ctx],
+                        (false, 3) => &mut self.cdf.palette_color_uv_3[ctx],
+                        (false, 4) => &mut self.cdf.palette_color_uv_4[ctx],
+                        (false, 5) => &mut self.cdf.palette_color_uv_5[ctx],
+                        (false, 6) => &mut self.cdf.palette_color_uv_6[ctx],
+                        (false, 7) => &mut self.cdf.palette_color_uv_7[ctx],
+                        (false, _) => &mut self.cdf.palette_color_uv_8[ctx],
+                    };
+                    self.c.symbol(cdf, want)
+                };
+                map[row * stride + col] = order[sym];
+                j -= 1;
+            }
+        }
+        for i in 0..on_h {
+            for j in on_w..bw {
+                map[i * stride + j] = map[i * stride + on_w - 1];
+            }
+        }
+        for i in on_h..bh {
+            for j in 0..bw {
+                map[i * stride + j] = map[(on_h - 1) * stride + j];
+            }
+        }
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // Transform size
+    // ---------------------------------------------------------------------------------------------
+
+    fn read_block_tx_size(&mut self, b: &mut Blk) {
+        if b.lossless {
+            b.tx_size = TX_4X4;
+            return;
+        }
+        let max_rect = MAX_TX_SIZE_RECT[b.bsize as usize];
+        let want = b.tx_size;
+        b.tx_size = max_rect;
+        if b.bsize > BLOCK_4X4 && self.f.hdr.tx_mode_select {
+            // The context compares neighbouring transform extents with the largest transform.
+            let max_w = TX_W[max_rect as usize] as usize;
+            let max_h = TX_H[max_rect as usize] as usize;
+            let above_w =
+                if b.avail_u { TX_W[self.f.tx_size[self.mi(b.mi_row - 1, b.mi_col)] as usize] as usize } else { 0 };
+            let left_h =
+                if b.avail_l { TX_H[self.f.tx_size[self.mi(b.mi_row, b.mi_col - 1)] as usize] as usize } else { 0 };
+            let ctx = (above_w >= max_w) as usize + (left_h >= max_h) as usize;
+            let mut depth = 0usize;
+            let mut t = max_rect;
+            while t != want && depth < 2 && !C::DECODING {
+                t = SPLIT_TX_SIZE[t as usize];
+                depth += 1;
+            }
+            let d = match MAX_TX_DEPTH[b.bsize as usize] {
+                1 => self.c.symbol(&mut self.cdf.tx_size_8x8[ctx], depth),
+                2 => self.c.symbol(&mut self.cdf.tx_size[0][ctx], depth),
+                3 => self.c.symbol(&mut self.cdf.tx_size[1][ctx], depth),
+                _ => self.c.symbol(&mut self.cdf.tx_size[2][ctx], depth),
+            };
+            for _ in 0..d {
+                b.tx_size = SPLIT_TX_SIZE[b.tx_size as usize];
+            }
+        }
+    }
+}
+
+fn inverse_recenter(r: i32, v: i32) -> i32 {
+    if v > 2 * r {
+        v
+    } else if v & 1 != 0 {
+        r - ((v + 1) >> 1)
+    } else {
+        r + (v >> 1)
+    }
+}
+
+fn ceil_log2(x: u32) -> u32 {
+    if x < 2 { 0 } else { 32 - (x - 1).leading_zeros() }
+}
+
+fn neg_deinterleave(diff: i32, r: i32, max: i32) -> i32 {
+    if r == 0 {
+        return diff;
+    }
+    if r >= max - 1 {
+        return max - diff - 1;
+    }
+    if 2 * r < max {
+        if diff <= 2 * r {
+            return if diff & 1 != 0 { r + ((diff + 1) >> 1) } else { r - (diff >> 1) };
+        }
+        diff
+    } else {
+        if diff <= 2 * (max - r - 1) {
+            return if diff & 1 != 0 { r + ((diff + 1) >> 1) } else { r - (diff >> 1) };
+        }
+        max - (diff + 1)
+    }
+}
+
+/// Inverse of [`neg_deinterleave`] for the encoder.
+fn interleave(id: i32, r: i32, max: i32) -> i32 {
+    (0..max.max(1)).find(|&d| neg_deinterleave(d, r, max) == id).unwrap_or(0)
+}
+
+/// `get_palette_color_context`: the colour order and CDF context for position (r, c) of the map.
+fn palette_color_context(map: &[u8], stride: usize, r: usize, c: usize, n: usize) -> ([u8; 8], usize) {
+    let mut scores = [0u32; 8];
+    let mut order = [0u8, 1, 2, 3, 4, 5, 6, 7];
+    if c > 0 {
+        scores[map[r * stride + c - 1] as usize] += 2;
+    }
+    if r > 0 && c > 0 {
+        scores[map[(r - 1) * stride + c - 1] as usize] += 1;
+    }
+    if r > 0 {
+        scores[map[(r - 1) * stride + c] as usize] += 2;
+    }
+    for i in 0..3 {
+        let mut max_score = scores[i];
+        let mut max_idx = i;
+        for j in i + 1..n {
+            if scores[j] > max_score {
+                max_score = scores[j];
+                max_idx = j;
+            }
+        }
+        if max_idx != i {
+            let max_score = scores[max_idx];
+            let max_order = order[max_idx];
+            for k in (i + 1..=max_idx).rev() {
+                scores[k] = scores[k - 1];
+                order[k] = order[k - 1];
+            }
+            scores[i] = max_score;
+            order[i] = max_order;
+        }
+    }
+    let mut hash = 0u32;
+    for i in 0..3 {
+        hash += scores[i] * PALETTE_COLOR_HASH_MULTIPLIERS[i];
+    }
+    (order, PALETTE_COLOR_CONTEXT[hash as usize].max(0) as usize)
+}
+
+// -------------------------------------------------------------------------------------------------
+// Residual: transform blocks, coefficients and reconstruction
+// -------------------------------------------------------------------------------------------------
+
+impl<C: Coder> TileCoder<'_, C> {
+    fn residual(&mut self, b: &Blk) -> Result<()> {
+        let sb_mask = if self.f.seq.use_128x128_superblock { 31 } else { 15 };
+        let _ = sb_mask;
+        let bw = block_width(b.bsize);
+        let bh = block_height(b.bsize);
+        let width_chunks = (bw >> 6).max(1);
+        let height_chunks = (bh >> 6).max(1);
+        let planes = if b.has_chroma { 3 } else { 1 };
+        for chunk_y in 0..height_chunks {
+            for chunk_x in 0..width_chunks {
+                for plane in 0..planes {
+                    let tx_sz = if b.lossless { TX_4X4 } else { self.get_tx_size(b, plane) };
+                    let step_x = (TX_W[tx_sz as usize] >> 2) as usize;
+                    let step_y = (TX_H[tx_sz as usize] >> 2) as usize;
+                    let (sx, sy) = self.plane_sub(plane);
+                    let plane_sz = if plane == 0 { b.bsize } else { subsampled_size(b.bsize, sx as u8, sy as u8) };
+                    let n4w = NUM_4X4_WIDE[plane_sz as usize] as usize;
+                    let n4h = NUM_4X4_HIGH[plane_sz as usize] as usize;
+                    let base_x = (b.mi_col >> sx) * 4;
+                    let base_y = (b.mi_row >> sy) * 4;
+                    let max_y4 = n4h.min(16 >> sy);
+                    let max_x4 = n4w.min(16 >> sx);
+                    let mut y = 0;
+                    while y < max_y4 {
+                        let mut x = 0;
+                        while x < max_x4 {
+                            self.transform_block(
+                                b,
+                                plane,
+                                base_x,
+                                base_y,
+                                tx_sz,
+                                x + ((chunk_x << 4) >> sx),
+                                y + ((chunk_y << 4) >> sy),
+                            );
+                            x += step_x;
+                        }
+                        y += step_y;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn get_tx_size(&self, b: &Blk, plane: usize) -> u8 {
+        if plane == 0 {
+            return b.tx_size;
+        }
+        let (sx, sy) = self.plane_sub(plane);
+        let uv_tx = MAX_TX_SIZE_RECT[subsampled_size(b.bsize, sx as u8, sy as u8) as usize];
+        if TX_W[uv_tx as usize] == 64 || TX_H[uv_tx as usize] == 64 {
+            if TX_W[uv_tx as usize] == 16 {
+                return TX_16X32;
+            }
+            if TX_H[uv_tx as usize] == 16 {
+                return TX_32X16;
+            }
+            return TX_32X32;
+        }
+        uv_tx
+    }
+
+    fn transform_block(&mut self, b: &Blk, plane: usize, base_x: usize, base_y: usize, tx_sz: u8, x: usize, y: usize) {
+        let start_x = base_x + 4 * x;
+        let start_y = base_y + 4 * y;
+        let (sx, sy) = self.plane_sub(plane);
+        let row = (start_y << sy) >> 2;
+        let col = (start_x << sx) >> 2;
+        let sb_mask = if self.f.seq.use_128x128_superblock { 31 } else { 15 };
+        let sub_row = row & sb_mask;
+        let sub_col = col & sb_mask;
+        let step_x = (TX_W[tx_sz as usize] >> 2) as usize;
+        let step_y = (TX_H[tx_sz as usize] >> 2) as usize;
+        let max_x = (self.f.mi_cols * 4) >> sx;
+        let max_y = (self.f.mi_rows * 4) >> sy;
+        if start_x >= max_x || start_y >= max_y {
+            return;
+        }
+        // Intra prediction (or palette) of this transform block.
+        let is_palette = (plane == 0 && b.pal_size_y > 0) || (plane != 0 && b.pal_size_uv > 0);
+        if is_palette {
+            self.predict_palette(b, plane, start_x, start_y, x, y, tx_sz);
+        } else {
+            let is_cfl = plane > 0 && b.uv_mode == UV_CFL_PRED;
+            let mode = if plane == 0 {
+                b.y_mode
+            } else if is_cfl {
+                DC_PRED
+            } else {
+                b.uv_mode
+            };
+            let have_left = (if plane == 0 { b.avail_l } else { b.avail_l_chroma }) || x > 0;
+            let have_above = (if plane == 0 { b.avail_u } else { b.avail_u_chroma }) || y > 0;
+            let bd = &self.block_decoded[plane];
+            let have_ar = bd[(sub_row >> sy)][(sub_col >> sx) + step_x + 1];
+            let have_bl = bd[(sub_row >> sy) + step_y + 1][(sub_col >> sx)];
+            self.predict_intra_block(b, plane, start_x, start_y, tx_sz, have_left, have_above, have_ar, have_bl, mode);
+            if is_cfl {
+                self.predict_cfl(b, plane, start_x, start_y, tx_sz);
+            }
+        }
+        if plane == 0 {
+            self.max_luma_w = start_x + step_x * 4;
+            self.max_luma_h = start_y + step_y * 4;
+        }
+        if !b.skip {
+            let eob = self.coeffs(b, plane, start_x, start_y, tx_sz);
+            if eob > 0 {
+                self.reconstruct(b, plane, start_x, start_y, tx_sz);
+            }
+        }
+        // Loop filter transform sizes and decoded flags.
+        let stride = self.f.lf_stride[plane];
+        let rows = self.f.lf_tx[plane].len() / stride;
+        for i in 0..step_y {
+            for j in 0..step_x {
+                let (rr, cc) = ((row >> sy) + i, (col >> sx) + j);
+                if rr < rows && cc < stride {
+                    self.f.lf_tx[plane][rr * stride + cc] = tx_sz;
+                }
+                self.block_decoded[plane][(sub_row >> sy) + i + 1][(sub_col >> sx) + j + 1] = true;
+            }
+        }
+    }
+
+    fn filter_type(&self, b: &Blk, plane: usize) -> bool {
+        let is_smooth = |r: usize, c: usize| -> bool {
+            let i = r * self.f.mi_cols + c;
+            let mode = if plane == 0 { self.f.y_mode[i] } else { self.f.uv_mode[i] };
+            mode == SMOOTH_PRED || mode == SMOOTH_V_PRED || mode == SMOOTH_H_PRED
+        };
+        let (sx, sy) = self.plane_sub(plane);
+        let mut above = false;
+        let mut left = false;
+        if if plane == 0 { b.avail_u } else { b.avail_u_chroma } {
+            let mut r = b.mi_row - 1;
+            let mut c = b.mi_col;
+            if plane > 0 {
+                if sx == 1 && (b.mi_col & 1) == 0 {
+                    c += 1;
+                }
+                if sy == 1 && (b.mi_row & 1) == 1 {
+                    r -= 1;
+                }
+            }
+            above = is_smooth(r, c.min(self.f.mi_cols - 1));
+        }
+        if if plane == 0 { b.avail_l } else { b.avail_l_chroma } {
+            let mut r = b.mi_row;
+            let mut c = b.mi_col - 1;
+            if plane > 0 {
+                if sx == 1 && (b.mi_col & 1) == 1 {
+                    c -= 1;
+                }
+                if sy == 1 && (b.mi_row & 1) == 0 {
+                    r += 1;
+                }
+            }
+            left = is_smooth(r.min(self.f.mi_rows - 1), c);
+        }
+        above || left
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn predict_intra_block(
+        &mut self,
+        b: &Blk,
+        plane: usize,
+        x: usize,
+        y: usize,
+        tx_sz: u8,
+        have_left: bool,
+        have_above: bool,
+        have_ar: bool,
+        have_bl: bool,
+        mode: u8,
+    ) {
+        let w = TX_W[tx_sz as usize] as usize;
+        let h = TX_H[tx_sz as usize] as usize;
+        let (sx, sy) = self.plane_sub(plane);
+        let bit_depth = self.f.seq.color.bit_depth;
+        let max_x = ((self.f.mi_cols * 4) >> sx) - 1;
+        let max_y = ((self.f.mi_rows * 4) >> sy) - 1;
+        let smooth_neighbor = self.filter_type(b, plane);
+        let mut edges = ipred::Edges::default();
+        let pl = &mut self.f.planes[plane];
+        ipred::build_edges(
+            &pl.data, pl.stride, x, y, w, h, have_left, have_above, have_ar, have_bl, max_x, max_y, bit_depth,
+            &mut edges,
+        );
+        let params = ipred::IntraParams {
+            mode,
+            angle_delta: if plane == 0 { b.angle_y } else { b.angle_uv },
+            filter_intra: if plane == 0 && b.use_filter_intra { Some(b.filter_intra_mode) } else { None },
+            w,
+            h,
+            have_left,
+            have_above,
+            enable_edge_filter: self.f.seq.enable_intra_edge_filter,
+            smooth_neighbor,
+            bit_depth,
+        };
+        let stride = pl.stride;
+        ipred::predict(&mut pl.data[y * stride + x..], stride, &mut edges, &params);
+    }
+
+    fn predict_cfl(&mut self, b: &Blk, plane: usize, x: usize, y: usize, tx_sz: u8) {
+        let w = TX_W[tx_sz as usize] as usize;
+        let h = TX_H[tx_sz as usize] as usize;
+        let (sx, sy) = (self.f.sub_x, self.f.sub_y);
+        let alpha = if plane == 1 { b.cfl_alpha_u } else { b.cfl_alpha_v } as i32;
+        let bit_depth = self.f.seq.color.bit_depth;
+        let luma_x = x << sx;
+        let luma_y = y << sy;
+        let avail_w = self.max_luma_w.saturating_sub(luma_x).max(1 << sx);
+        let avail_h = self.max_luma_h.saturating_sub(luma_y).max(1 << sy);
+        let (luma_plane, rest) = self.f.planes.split_at_mut(1);
+        let luma = &luma_plane[0];
+        let dst_plane = &mut rest[plane - 1];
+        let stride = dst_plane.stride;
+        ipred::cfl_predict(
+            &mut dst_plane.data[y * stride + x..],
+            stride,
+            w,
+            h,
+            &luma.data,
+            luma.stride,
+            luma_x,
+            luma_y,
+            avail_w,
+            avail_h,
+            sx as u8,
+            sy as u8,
+            alpha,
+            bit_depth,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn predict_palette(&mut self, b: &Blk, plane: usize, x: usize, y: usize, bx: usize, by: usize, tx_sz: u8) {
+        let w = TX_W[tx_sz as usize] as usize;
+        let h = TX_H[tx_sz as usize] as usize;
+        let palette = match plane {
+            0 => b.pal_y,
+            1 => b.pal_u,
+            _ => b.pal_v,
+        };
+        let map = if plane == 0 { &self.color_map_y } else { &self.color_map_uv };
+        let pl = &mut self.f.planes[plane];
+        for i in 0..h {
+            for j in 0..w {
+                let idx = map[(by * 4 + i) * 64 + bx * 4 + j] as usize;
+                pl.data[(y + i) * pl.stride + x + j] = palette[idx];
+            }
+        }
+    }
+
+    /// Quantizer step sizes (dc, ac) for a plane of the current block.
+    fn quant_steps(&self, b: &Blk, plane: usize) -> (i32, i32) {
+        let q = &self.f.hdr.quant;
+        let qidx = self.f.hdr.qidx(false, b.segment_id as usize, self.current_q_index);
+        let (ddc, dac) = match plane {
+            0 => (q.delta_q_y_dc, 0),
+            1 => (q.delta_q_u_dc, q.delta_q_u_ac),
+            _ => (q.delta_q_v_dc, q.delta_q_v_ac),
+        };
+        let bd = self.f.seq.color.bit_depth;
+        let (dct, act): (&[u16; 256], &[u16; 256]) = match bd {
+            8 => (&DC_Q, &AC_Q),
+            10 => (&DC_Q_10, &AC_Q_10),
+            _ => (&DC_Q_12, &AC_Q_12),
+        };
+        (dct[(qidx + ddc).clamp(0, 255) as usize] as i32, act[(qidx + dac).clamp(0, 255) as usize] as i32)
+    }
+
+    fn tx_set_intra(&self, tx_sz: u8) -> u8 {
+        // 0 = DCT only, 1 = 7-type set, 2 = 5-type set
+        let sqr_up = TX_SQR_UP[tx_sz as usize];
+        let sqr = TX_SQR[tx_sz as usize];
+        if sqr_up > TX_32X32 || sqr_up == TX_32X32 {
+            0
+        } else if self.f.hdr.reduced_tx_set || sqr == TX_16X16 {
+            2
+        } else {
+            1
+        }
+    }
+
+    fn coeffs(&mut self, b: &Blk, plane: usize, start_x: usize, start_y: usize, tx_sz: u8) -> usize {
+        let x4 = start_x >> 2;
+        let y4 = start_y >> 2;
+        let tw = TX_W[tx_sz as usize] as usize;
+        let th = TX_H[tx_sz as usize] as usize;
+        let w4 = tw >> 2;
+        let h4 = th >> 2;
+        let tx_sz_ctx = ((TX_SQR[tx_sz as usize] + TX_SQR_UP[tx_sz as usize] + 1) >> 1) as usize;
+        let ptype = (plane > 0) as usize;
+        let (sx, sy) = self.plane_sub(plane);
+        let max_x4 = (self.f.mi_cols + sx) >> sx;
+        let max_y4 = (self.f.mi_rows + sy) >> sy;
+
+        // all_zero context
+        let plane_sz = if plane == 0 { b.bsize } else { subsampled_size(b.bsize, sx as u8, sy as u8) };
+        let (bw, bh) = (block_width(plane_sz), block_height(plane_sz));
+        let ctx = if plane == 0 {
+            let mut top = 0u8;
+            let mut left = 0u8;
+            for k in 0..w4 {
+                if x4 + k < max_x4 {
+                    top = top.max(self.above_level[plane][x4 + k]);
+                }
+            }
+            for k in 0..h4 {
+                if y4 + k < max_y4 {
+                    left = left.max(self.left_level[plane][y4 + k]);
+                }
+            }
+            if bw == tw && bh == th {
+                0
+            } else if top == 0 && left == 0 {
+                1
+            } else if top == 0 || left == 0 {
+                2 + (top.max(left) > 3) as usize
+            } else if top.max(left) <= 3 {
+                4
+            } else if top.min(left) <= 3 {
+                5
+            } else {
+                6
+            }
+        } else {
+            let mut above = 0u8;
+            let mut left = 0u8;
+            for i in 0..w4 {
+                if x4 + i < max_x4 {
+                    above |= self.above_level[plane][x4 + i] | self.above_dc[plane][x4 + i];
+                }
+            }
+            for i in 0..h4 {
+                if y4 + i < max_y4 {
+                    left |= self.left_level[plane][y4 + i] | self.left_dc[plane][y4 + i];
+                }
+            }
+            let mut ctx = 7 + (above != 0) as usize + (left != 0) as usize;
+            if bw * bh > tw * th {
+                ctx += 3;
+            }
+            ctx
+        };
+        let all_zero = self.c.symbol(&mut self.cdf.txb_skip[tx_sz_ctx][ctx], (self.cb.eob == 0) as usize) != 0;
+        let mut cul_level = 0u32;
+        let mut dc_category = 0u8;
+        let mut eob = 0usize;
+        if all_zero {
+            self.cb.eob = 0;
+        } else {
+            // Transform type.
+            let tx_type = self.transform_type(b, plane, tx_sz);
+            self.cb.tx_type = tx_type;
+            let class = tx_class(tx_type);
+            let scan_kind = match class {
+                TX_CLASS_VERT => 1,
+                TX_CLASS_HORIZ => 2,
+                _ => 0,
+            };
+            let scan: &[u16] = SCAN_TABLE[tx_sz as usize][if tx_type == IDTX { 0 } else { scan_kind }];
+            let adj = ADJUSTED_TX_SIZE[tx_sz as usize] as usize;
+            let bwl = TX_W_LOG2[adj] as usize;
+            let cw = 1usize << bwl;
+            let ch = TX_H[adj] as usize;
+            let area = cw * ch;
+
+            // eob
+            let eob_multisize = (TX_W_LOG2[tx_sz as usize].min(5) + TX_H_LOG2[tx_sz as usize].min(5)) as usize - 4;
+            let ectx = if class == TX_CLASS_2D { 0 } else { 1 };
+            let want_eob = self.cb.eob;
+            let (want_pt, want_extra) = eob_to_pt(want_eob);
+            let pt_sym = match eob_multisize {
+                0 => self.c.symbol(&mut self.cdf.eob_pt_16[ptype][ectx], want_pt - 1),
+                1 => self.c.symbol(&mut self.cdf.eob_pt_32[ptype][ectx], want_pt - 1),
+                2 => self.c.symbol(&mut self.cdf.eob_pt_64[ptype][ectx], want_pt - 1),
+                3 => self.c.symbol(&mut self.cdf.eob_pt_128[ptype][ectx], want_pt - 1),
+                4 => self.c.symbol(&mut self.cdf.eob_pt_256[ptype][ectx], want_pt - 1),
+                5 => self.c.symbol(&mut self.cdf.eob_pt_512[ptype][ectx], want_pt - 1),
+                _ => self.c.symbol(&mut self.cdf.eob_pt_1024[ptype][ectx], want_pt - 1),
+            };
+            let eob_pt = pt_sym + 1;
+            eob = if eob_pt < 2 { eob_pt } else { (1 << (eob_pt - 2)) + 1 };
+            let mut eob_shift = eob_pt as isize - 3;
+            if eob_shift >= 0 {
+                let extra_want = (want_extra >> eob_shift) & 1;
+                let eob_extra = self.c.symbol(&mut self.cdf.eob_extra[tx_sz_ctx][ptype][eob_pt - 3], extra_want) != 0;
+                if eob_extra {
+                    eob += 1 << eob_shift;
+                }
+                let n = (eob_pt as isize - 2).max(0);
+                for i in 1..n {
+                    eob_shift = n - 1 - i;
+                    let bit = self.c.literal(1, ((want_extra >> eob_shift) & 1) as u32) != 0;
+                    if bit {
+                        eob += 1 << eob_shift;
+                    }
+                }
+            }
+            if eob > area {
+                // Corrupt stream; clamp so the rest of the block stays in bounds.
+                eob = area;
+            }
+
+            // Levels, in reverse scan order.
+            let stride = 36usize;
+            let mut levels = [0u8; 36 * 36];
+            let mut quant = [0u32; 1024];
+            let want_abs = |pos: usize, q: &CoefBlock| q.quant[pos].unsigned_abs();
+            for c in (0..eob).rev() {
+                let pos = scan[c] as usize;
+                let row = pos >> bwl;
+                let col = pos & (cw - 1);
+                let want_level = if C::DECODING { 0 } else { want_abs(pos, &self.cb).min(15) as usize };
+                let mut level;
+                if c == eob - 1 {
+                    let ctx = if c == 0 {
+                        0
+                    } else if c <= area / 8 {
+                        1
+                    } else if c <= area / 4 {
+                        2
+                    } else {
+                        3
+                    };
+                    let s = self.c.symbol(&mut self.cdf.coeff_base_eob[tx_sz_ctx][ptype][ctx], want_level.max(1) - 1);
+                    level = s + 1;
+                } else {
+                    let ctx = coeff_base_ctx(&levels, stride, tx_sz, class, row, col);
+                    level = self.c.symbol(&mut self.cdf.coeff_base[tx_sz_ctx][ptype][ctx], want_level.min(3));
+                }
+                if level > 2 {
+                    let ctx = coeff_br_ctx(&levels, stride, class, row, col, pos);
+                    let mut want_rest = want_level.saturating_sub(3);
+                    for _ in 0..4 {
+                        let sym = self.c.symbol(&mut self.cdf.coeff_br[tx_sz_ctx.min(3)][ptype][ctx], want_rest.min(3));
+                        want_rest = want_rest.saturating_sub(3);
+                        level += sym;
+                        if sym < 3 {
+                            break;
+                        }
+                    }
+                }
+                levels[row * stride + col] = level as u8;
+                quant[pos] = level as u32;
+            }
+            // Signs and Golomb-coded remainders, in scan order.
+            for c in 0..eob {
+                let pos = scan[c] as usize;
+                let want = self.cb.quant[pos];
+                let mut sign = false;
+                if quant[pos] != 0 {
+                    if c == 0 {
+                        let mut dc_sign_ctx = 0i32;
+                        for k in 0..w4 {
+                            if x4 + k < max_x4 {
+                                match self.above_dc[plane][x4 + k] {
+                                    1 => dc_sign_ctx -= 1,
+                                    2 => dc_sign_ctx += 1,
+                                    _ => {}
+                                }
+                            }
+                        }
+                        for k in 0..h4 {
+                            if y4 + k < max_y4 {
+                                match self.left_dc[plane][y4 + k] {
+                                    1 => dc_sign_ctx -= 1,
+                                    2 => dc_sign_ctx += 1,
+                                    _ => {}
+                                }
+                            }
+                        }
+                        let ctx = if dc_sign_ctx < 0 {
+                            1
+                        } else if dc_sign_ctx > 0 {
+                            2
+                        } else {
+                            0
+                        };
+                        sign = self.c.symbol(&mut self.cdf.dc_sign[ptype][ctx], (want < 0) as usize) != 0;
+                    } else {
+                        sign = self.c.literal(1, (want < 0) as u32) != 0;
+                    }
+                }
+                if quant[pos] > 14 {
+                    // Golomb code for the amount above 14.
+                    let value = want.unsigned_abs();
+                    let x_want = value.wrapping_sub(14);
+                    let length_want = 32 - x_want.leading_zeros();
+                    let mut length = 0u32;
+                    loop {
+                        length += 1;
+                        let bit = self.c.literal(1, (length == length_want) as u32) != 0;
+                        if bit || length >= 32 {
+                            break;
+                        }
+                        if length > 20 {
+                            break;
+                        }
+                    }
+                    let mut x = 1u32;
+                    for i in (0..length.saturating_sub(1)).rev() {
+                        let bit = self.c.literal(1, (x_want >> i) & 1);
+                        x = (x << 1) | bit;
+                    }
+                    quant[pos] = x.wrapping_add(14);
+                }
+                if pos == 0 && quant[pos] > 0 {
+                    dc_category = if sign { 1 } else { 2 };
+                }
+                quant[pos] &= 0xfffff;
+                cul_level = cul_level.wrapping_add(quant[pos]);
+                self.cb.quant[pos] = if sign { -(quant[pos] as i32) } else { quant[pos] as i32 };
+            }
+            cul_level = cul_level.min(63);
+            self.cb.eob = eob;
+        }
+        for i in 0..w4 {
+            self.above_level[plane][x4 + i] = cul_level as u8;
+            self.above_dc[plane][x4 + i] = dc_category;
+        }
+        for i in 0..h4 {
+            self.left_level[plane][y4 + i] = cul_level as u8;
+            self.left_dc[plane][y4 + i] = dc_category;
+        }
+        eob
+    }
+
+    fn transform_type(&mut self, b: &Blk, plane: usize, tx_sz: u8) -> u8 {
+        if b.lossless || TX_SQR_UP[tx_sz as usize] > TX_32X32 {
+            return 0;
+        }
+        let set = self.tx_set_intra(tx_sz);
+        if plane > 0 {
+            let t = MODE_TO_TXFM[b.uv_mode as usize];
+            // The chroma type must belong to the set; 16x16 and reduced sets contain all four DCT/ADST pairs.
+            return if set == 0 { 0 } else { t };
+        }
+        let qidx = if self.f.hdr.seg.enabled {
+            self.f.hdr.qidx(true, b.segment_id as usize, 0)
+        } else {
+            self.f.hdr.quant.base_q_idx as i32
+        };
+        if set > 0 && qidx > 0 {
+            let intra_dir = if b.use_filter_intra {
+                FILTER_INTRA_MODE_TO_INTRA_DIR[b.filter_intra_mode as usize]
+            } else {
+                b.y_mode
+            };
+            let sqr = TX_SQR[tx_sz as usize] as usize;
+            let want = self.cb.tx_type;
+            if set == 1 {
+                let want_sym = TX_TYPE_INTRA_INV_SET1.iter().position(|&t| t == want).unwrap_or(1);
+                let s = self.c.symbol(&mut self.cdf.intra_tx_set1[sqr][intra_dir as usize], want_sym);
+                TX_TYPE_INTRA_INV_SET1[s]
+            } else {
+                let want_sym = TX_TYPE_INTRA_INV_SET2.iter().position(|&t| t == want).unwrap_or(1);
+                let s = self.c.symbol(&mut self.cdf.intra_tx_set2[sqr][intra_dir as usize], want_sym);
+                TX_TYPE_INTRA_INV_SET2[s]
+            }
+        } else {
+            0
+        }
+    }
+
+    fn reconstruct(&mut self, b: &Blk, plane: usize, start_x: usize, start_y: usize, tx_sz: u8) {
+        let tw = TX_W[tx_sz as usize] as usize;
+        let th = TX_H[tx_sz as usize] as usize;
+        let cw = tw.min(32);
+        let ch = th.min(32);
+        let tx_sz_ctx = ((TX_SQR[tx_sz as usize] + TX_SQR_UP[tx_sz as usize] + 1) >> 1) as i32;
+        let dq_shift = (tx_sz_ctx - 2).max(0);
+        let bit_depth = self.f.seq.color.bit_depth as i32;
+        let (dc_q, ac_q) = self.quant_steps(b, plane);
+        let limit = 1i64 << (7 + bit_depth);
+        let mut coefs = vec![0i32; tw * th];
+        let mut nz_rows = 0;
+        let mut nz_cols = 0;
+        for pos in 0..cw * ch {
+            let q = self.cb.quant[pos];
+            if q == 0 {
+                continue;
+            }
+            let (i, j) = (pos / cw, pos % cw);
+            let step = if pos == 0 { dc_q } else { ac_q } as i64;
+            let mut dq = ((q.unsigned_abs() as i64 * step) & 0xff_ffff) >> dq_shift;
+            if q < 0 {
+                dq = -dq;
+            }
+            coefs[i * tw + j] = dq.clamp(-limit, limit - 1) as i32;
+            nz_rows = nz_rows.max(i + 1);
+            nz_cols = nz_cols.max(j + 1);
+        }
+        let stride = self.f.planes[plane].stride;
+        let dst = &mut self.f.planes[plane].data[start_y * stride + start_x..];
+        itx::inverse_transform_add(
+            &mut coefs,
+            tx_sz,
+            self.cb.tx_type,
+            b.lossless,
+            bit_depth as u8,
+            nz_rows,
+            nz_cols,
+            dst,
+            stride,
+        );
+        // Reset the quantized coefficients for the next block.
+        for pos in 0..cw * ch {
+            self.cb.quant[pos] = 0;
+        }
+    }
+}
+
+/// `eob` → (eob_pt, extra bits) as in the encoder's `eob` binarization.
+fn eob_to_pt(eob: usize) -> (usize, usize) {
+    if eob <= 2 {
+        return (eob.max(1), 0);
+    }
+    // eob_pt such that (1 << (eob_pt - 2)) + 1 <= eob < (1 << (eob_pt - 1)) + 1
+    let pt = (usize::BITS - (eob - 1).leading_zeros()) as usize + 1;
+    (pt, eob - ((1 << (pt - 2)) + 1))
+}
+
+#[inline]
+fn lv(levels: &[u8], stride: usize, row: usize, col: usize) -> usize {
+    levels[row * stride + col] as usize
+}
+
+fn coeff_base_ctx(levels: &[u8], stride: usize, tx_sz: u8, class: u8, row: usize, col: usize) -> usize {
+    let mut mag;
+    match class {
+        TX_CLASS_2D => {
+            mag = lv(levels, stride, row, col + 1).min(3)
+                + lv(levels, stride, row + 1, col).min(3)
+                + lv(levels, stride, row + 1, col + 1).min(3)
+                + lv(levels, stride, row, col + 2).min(3)
+                + lv(levels, stride, row + 2, col).min(3);
+        }
+        TX_CLASS_HORIZ => {
+            mag = lv(levels, stride, row, col + 1).min(3)
+                + lv(levels, stride, row + 1, col).min(3)
+                + lv(levels, stride, row, col + 2).min(3)
+                + lv(levels, stride, row, col + 3).min(3)
+                + lv(levels, stride, row, col + 4).min(3);
+        }
+        _ => {
+            mag = lv(levels, stride, row, col + 1).min(3)
+                + lv(levels, stride, row + 1, col).min(3)
+                + lv(levels, stride, row + 2, col).min(3)
+                + lv(levels, stride, row + 3, col).min(3)
+                + lv(levels, stride, row + 4, col).min(3);
+        }
+    }
+    let ctx = ((mag + 1) >> 1).min(4);
+    mag = 0;
+    let _ = mag;
+    match class {
+        TX_CLASS_2D => {
+            if row == 0 && col == 0 {
+                return 0;
+            }
+            ctx + COEFF_BASE_CTX_OFFSET[tx_sz as usize][row.min(4)][col.min(4)] as usize
+        }
+        TX_CLASS_VERT => ctx + COEFF_BASE_POS_CTX_OFFSET_1D[row.min(31)] as usize,
+        _ => ctx + COEFF_BASE_POS_CTX_OFFSET_1D[col.min(31)] as usize,
+    }
+}
+
+fn coeff_br_ctx(levels: &[u8], stride: usize, class: u8, row: usize, col: usize, pos: usize) -> usize {
+    let mag = match class {
+        TX_CLASS_2D => {
+            lv(levels, stride, row, col + 1).min(15)
+                + lv(levels, stride, row + 1, col).min(15)
+                + lv(levels, stride, row + 1, col + 1).min(15)
+        }
+        TX_CLASS_HORIZ => {
+            lv(levels, stride, row, col + 1).min(15)
+                + lv(levels, stride, row + 1, col).min(15)
+                + lv(levels, stride, row, col + 2).min(15)
+        }
+        _ => {
+            lv(levels, stride, row, col + 1).min(15)
+                + lv(levels, stride, row + 1, col).min(15)
+                + lv(levels, stride, row + 2, col).min(15)
+        }
+    };
+    let mag = ((mag + 1) >> 1).min(6);
+    if pos == 0 {
+        return mag;
+    }
+    match class {
+        TX_CLASS_2D => {
+            if row < 2 && col < 2 {
+                return mag + 7;
+            }
+        }
+        TX_CLASS_HORIZ => {
+            if col == 0 {
+                return mag + 7;
+            }
+        }
+        _ => {
+            if row == 0 {
+                return mag + 7;
+            }
+        }
+    }
+    mag + 14
+}
