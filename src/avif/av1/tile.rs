@@ -27,6 +27,7 @@ pub struct LrUnitParams {
 }
 
 /// Everything decoded for a frame that later stages (loop filters, output) need.
+#[derive(Clone)]
 pub struct FrameState {
     pub seq: SequenceHeader,
     pub hdr: FrameHeader,

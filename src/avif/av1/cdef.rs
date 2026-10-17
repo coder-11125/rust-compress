@@ -82,7 +82,9 @@ pub fn cdef_frame(
             let all_skipped = skip_at(r, c) && skip_at(r + 1, c) && skip_at(r, c + 1) && skip_at(r + 1, c + 1);
             if idx >= 0 && !all_skipped {
                 let idx = idx as usize & 7;
-                let (y_dir, var) = find_direction(&pre.planes[0], c * 4, r * 4, pre.bit_depth as u32);
+                let any_pri = p.y_pri[idx] != 0 || (num_planes > 1 && p.uv_pri[idx] != 0);
+                let (y_dir, var) =
+                    if any_pri { find_direction(&pre.planes[0], c * 4, r * 4, pre.bit_depth as u32) } else { (0, 0) };
 
                 // Luma: the direction only matters with a primary strength, whose size follows the local variance.
                 let pri = (p.y_pri[idx] as i32) << coeff_shift;
@@ -92,7 +94,15 @@ pub fn cdef_frame(
                 let pri = if var != 0 { (pri * (4 + var_str) + 8) >> 4 } else { 0 };
                 let damping = p.damping as i32 + coeff_shift as i32;
                 let blk = Block { c, r, sx: 0, sy: 0, mi_cols, mi_rows };
-                filter_block(&pre.planes[0], &mut out.planes[0], &blk, [pri, sec, damping, dir as i32], coeff_shift);
+                if pri != 0 || sec != 0 {
+                    filter_block(
+                        &pre.planes[0],
+                        &mut out.planes[0],
+                        &blk,
+                        [pri, sec, damping, dir as i32],
+                        coeff_shift,
+                    );
+                }
 
                 if num_planes > 1 {
                     let pri = (p.uv_pri[idx] as i32) << coeff_shift;
@@ -106,7 +116,7 @@ pub fn cdef_frame(
                     };
                     let damping = damping - 1;
                     let blk = Block { c, r, sx, sy, mi_cols, mi_rows };
-                    for plane in 1..num_planes {
+                    for plane in (1..num_planes).filter(|_| pri != 0 || sec != 0) {
                         filter_block(
                             &pre.planes[plane],
                             &mut out.planes[plane],

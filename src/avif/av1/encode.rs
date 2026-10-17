@@ -9,7 +9,7 @@ use super::coef_tables::SCAN_TABLE;
 use super::consts::*;
 use super::entropy::Coder;
 use super::frame::Plane;
-use super::itx;
+use super::itx::{self, ADST_ADST, ADST_DCT, DCT_ADST, DCT_DCT};
 use super::tile::{Blk, CoefBlock, FrameState, StoredCoefs, TileCoder};
 
 /// Source pictures and encoder tuning, attached to a [`TileCoder`] that encodes.
@@ -117,7 +117,7 @@ impl<C: Coder> TileCoder<'_, C> {
         self.set_block_geometry(&mut b);
         let log = self.analyze_block(&mut b);
         b.skip = log.iter().all(|s| s.eob == 0);
-        if std::env::var_os("AV1_CHECK").is_some() {
+        if self_check() {
             let np = if b.has_chroma { 3 } else { 1 };
             let mut snap = Vec::new();
             for plane in 0..np {
@@ -165,58 +165,39 @@ impl<C: Coder> TileCoder<'_, C> {
         let th = TX_H[tx_sz as usize] as usize;
         let bit_depth = self.f.seq.color.bit_depth;
         let (dc_q, ac_q) = self.quant_steps(b, plane);
-        let round = self.enc_src.as_ref().map_or(128, |e| e.quant_round);
-        // Residual = source - prediction.
+        let (round, lambda) = self.enc_src.as_ref().map_or((128, 0.0), |e| (e.quant_round, e.lambda));
+        // Residual = source - prediction; `pred` is kept to rebuild each candidate's reconstruction.
         let mut residual = vec![0i32; tw * th];
+        let mut pred = vec![0u16; tw * th];
         {
             let src = &self.enc_src.as_ref().expect("encoder source").planes[plane];
             let cur = &self.f.planes[plane];
             for i in 0..th {
                 for j in 0..tw {
-                    residual[i * tw + j] = src.at(x + j, y + i) as i32 - cur.at(x + j, y + i) as i32;
+                    pred[i * tw + j] = cur.at(x + j, y + i);
+                    residual[i * tw + j] = src.at(x + j, y + i) as i32 - pred[i * tw + j] as i32;
                 }
             }
         }
-        let tx_type = if b.lossless || TX_SQR_UP[tx_sz as usize] > TX_32X32 {
-            0
-        } else if plane > 0 {
-            if self.tx_set_intra(tx_sz) == 0 { 0 } else { MODE_TO_TXFM[b.uv_mode as usize] }
+        let setup = self.txb_setup(b, plane, x, y, tx_sz);
+        let types: &[u8] = if let Some(t) = setup.fixed_type {
+            &[t][..]
+        } else if setup.tx_set == 1 {
+            &[DCT_DCT, ADST_DCT, DCT_ADST, ADST_ADST, IDTX, V_DCT, H_DCT]
         } else {
-            0
+            &[DCT_DCT, ADST_DCT, DCT_ADST, ADST_ADST, IDTX]
         };
-        let mut coefs = vec![0i32; tw * th];
-        itx::forward_transform(&residual, tw, tx_sz, tx_type, b.lossless, bit_depth, &mut coefs);
-        let mut quant = [0i32; 1024];
-        let eob = quantize(&coefs, tx_sz, tx_type, dc_q as i64, ac_q as i64, round, &mut quant);
-        let mut sc = StoredCoefs { tx_type, eob, coefs: Vec::new() };
-        if let (Ok(dx), Ok(dy)) = (std::env::var("AV1_DBG_X"), std::env::var("AV1_DBG_Y")) {
-            let (dx, dy): (usize, usize) = (dx.parse().unwrap(), dy.parse().unwrap());
-            if plane == std::env::var("AV1_DBG_PLANE").ok().and_then(|v| v.parse().ok()).unwrap_or(0usize)
-                && self.analyzing
-                && self.an_planes == 7
-                && dx >= x
-                && dx < x + tw
-                && dy >= y
-                && dy < y + th
-            {
-                eprintln!("tx at ({x},{y}) {tw}x{th} type {tx_type} eob {eob} dcq {dc_q} acq {ac_q}");
-                eprintln!("residual row {}: {:?}", dy - y, &residual[(dy - y) * tw..(dy - y) * tw + tw]);
-                eprintln!("coefs[0..8]: {:?} quant[0..8] {:?}", &coefs[..tw.min(8)], &quant[..tw.min(8)]);
-            }
-        }
-        {
-            // Distortion and rate of this choice, for the search.
-            let mut cb = CoefBlock { eob, tx_type, quant };
+        let mut best: Option<(f64, u8, usize, Box<[i32; 1024]>, u64, f64)> = None;
+        for &tx_type in types {
+            let mut coefs = vec![0i32; tw * th];
+            itx::forward_transform(&residual, tw, tx_sz, tx_type, b.lossless, bit_depth, &mut coefs);
+            let mut quant = Box::new([0i32; 1024]);
+            let eob = quantize(&coefs, tx_sz, tx_type, dc_q as i64, ac_q as i64, round, &mut quant);
+            let mut cb = CoefBlock { eob, tx_type, quant: *quant };
             let bits = self.txb_cost(b, plane, x, y, tx_sz, &mut cb);
-            self.an_bits += bits;
-            let mut recon = vec![0u16; tw * th];
-            for i in 0..th {
-                for j in 0..tw {
-                    recon[i * tw + j] = self.f.planes[plane].at(x + j, y + i);
-                }
-            }
+            let mut recon = pred.clone();
             if eob > 0 {
-                let (mut dq, nzr, nzc) = self.dequant_block(b, plane, tx_sz, tx_type, &quant);
+                let (mut dq, nzr, nzc) = self.dequant_block(b, plane, tx_sz, tx_type, &quant[..]);
                 itx::inverse_transform_add(&mut dq, tx_sz, tx_type, b.lossless, bit_depth, nzr, nzc, &mut recon, tw);
             }
             let src = &self.enc_src.as_ref().expect("encoder source").planes[plane];
@@ -227,23 +208,15 @@ impl<C: Coder> TileCoder<'_, C> {
                     sse += (d * d) as f64;
                 }
             }
-            self.an_dist += sse;
-            if let (Ok(dx), Ok(dy)) = (std::env::var("AV1_DBG_X"), std::env::var("AV1_DBG_Y")) {
-                let (dx, dy): (usize, usize) = (dx.parse().unwrap(), dy.parse().unwrap());
-                if plane == std::env::var("AV1_DBG_PLANE").ok().and_then(|v| v.parse().ok()).unwrap_or(0usize)
-                    && self.analyzing
-                    && self.an_planes == 7
-                    && dx >= x
-                    && dx < x + tw
-                    && dy >= y
-                    && dy < y + th
-                {
-                    eprintln!("  -> sse {sse} first recon row {:?}", &recon[(dy - y) * tw..(dy - y) * tw + tw]);
-                    let srow: Vec<u16> = (0..tw).map(|j| src.at(x + j, dy)).collect();
-                    eprintln!("     src row {:?}", srow);
-                }
+            let j = sse + lambda * bits as f64 / 256.0;
+            if best.as_ref().is_none_or(|b| j < b.0) {
+                best = Some((j, tx_type, eob, quant, bits, sse));
             }
         }
+        let (_, tx_type, eob, quant, bits, sse) = best.expect("at least one transform type");
+        self.an_bits += bits;
+        self.an_dist += sse;
+        let mut sc = StoredCoefs { tx_type, eob, coefs: Vec::new() };
         if eob > 0 {
             let (cw, ch) = (tw.min(32), th.min(32));
             for pos in 0..cw * ch {
@@ -270,6 +243,7 @@ use super::frame::Frame;
 use super::obu::{self, ColorConfig, FrameHeader, OperatingPoint, SequenceHeader};
 use super::obu_write;
 use crate::error::Result;
+use rayon::prelude::*;
 
 #[derive(Clone, Debug)]
 pub struct EncodeParams {
@@ -281,7 +255,7 @@ pub struct EncodeParams {
 
 impl Default for EncodeParams {
     fn default() -> Self {
-        EncodeParams { base_q_idx: 100, fixed_bsize: BLOCK_16X16, quant_round: 120, lambda_scale: 0.12 }
+        EncodeParams { base_q_idx: 100, fixed_bsize: BLOCK_16X16, quant_round: 120, lambda_scale: 0.09 }
     }
 }
 
@@ -356,7 +330,8 @@ pub fn encode_picture(src: &Frame, color: &ColorConfig, p: &EncodeParams) -> Res
         mi_rows: 2 * h.div_ceil(8),
         ..Default::default()
     };
-    hdr.tile_info = obu_write::uniform_tile_info(&seq, hdr.mi_cols, hdr.mi_rows, 0, 0);
+    let (cols_log2, rows_log2) = tile_layout(w, h);
+    hdr.tile_info = obu_write::uniform_tile_info(&seq, hdr.mi_cols, hdr.mi_rows, cols_log2, rows_log2);
     hdr.quant.base_q_idx = p.base_q_idx;
     hdr.coded_lossless = p.base_q_idx == 0;
     hdr.all_lossless = hdr.coded_lossless;
@@ -367,15 +342,22 @@ pub fn encode_picture(src: &Frame, color: &ColorConfig, p: &EncodeParams) -> Res
 
     let mut fs = FrameState::new(&seq, &hdr)?;
     let planes = pad_source(&fs, src);
-    let cdf = Cdfs::new(p.base_q_idx as u32);
-    let enc = SymbolEncoder::new(!hdr.disable_cdf_update);
     let ti = hdr.tile_info.clone();
-    let (rows, cols) = ((ti.mi_row_starts[0], ti.mi_row_starts[1]), (ti.mi_col_starts[0], ti.mi_col_starts[1]));
-    let tile_bytes = {
-        let mut tc = TileCoder::new(&mut fs, cdf, enc, rows, cols);
-        let q = ac_q_for(p.base_q_idx, color.bit_depth) / 8.0;
+    let tiles: Vec<((usize, usize), (usize, usize))> = (0..ti.rows)
+        .flat_map(|r| {
+            let ti = &ti;
+            (0..ti.cols).map(move |c| {
+                ((ti.mi_row_starts[r], ti.mi_row_starts[r + 1]), (ti.mi_col_starts[c], ti.mi_col_starts[c + 1]))
+            })
+        })
+        .collect();
+    let q = ac_q_for(p.base_q_idx, color.bit_depth) / 8.0;
+    let encode_tile = |fs: &mut FrameState, rows: (usize, usize), cols: (usize, usize)| -> Result<Vec<u8>> {
+        let cdf = Cdfs::new(p.base_q_idx as u32);
+        let enc = SymbolEncoder::new(!hdr.disable_cdf_update);
+        let mut tc = TileCoder::new(fs, cdf, enc, rows, cols);
         tc.enc_src = Some(EncSrc {
-            planes,
+            planes: planes.clone(),
             lambda: p.lambda_scale * q * q,
             fixed_bsize: p.fixed_bsize,
             quant_round: p.quant_round,
@@ -407,14 +389,45 @@ pub fn encode_picture(src: &Frame, color: &ColorConfig, p: &EncodeParams) -> Res
             }
             eprintln!("tx blocks {tot}, nonzero coefs {nz}");
         }
-        tc.c.finish()
+        Ok(tc.c.finish())
+    };
+    let tile_data: Vec<Vec<u8>> = if tiles.len() == 1 {
+        vec![encode_tile(&mut fs, tiles[0].0, tiles[0].1)?]
+    } else {
+        // Tiles are independent (no prediction or context crosses their edges), so each is coded on its own copy
+        // of the frame state and its region is merged back afterwards.
+        let results: Vec<Result<(Vec<u8>, FrameState)>> = tiles
+            .par_iter()
+            .map(|&(rows, cols)| {
+                let mut local = fs.clone();
+                let data = encode_tile(&mut local, rows, cols)?;
+                Ok((data, local))
+            })
+            .collect();
+        let mut out = Vec::with_capacity(tiles.len());
+        for (res, &(rows, cols)) in results.into_iter().zip(&tiles) {
+            let (data, local) = res?;
+            merge_tile(&mut fs, &local, rows, cols);
+            out.push(data);
+        }
+        out
     };
     choose_filters(&mut fs, src, p.base_q_idx);
     let hdr = fs.hdr.clone();
     let mut hw = BitWriter::new();
     obu_write::frame_header_bits(&seq, &hdr, &mut hw);
     let mut payload = hw.finish();
-    payload.extend_from_slice(&tile_bytes);
+    if tile_data.len() > 1 {
+        // tile_start_and_end_present_flag = 0, then byte alignment.
+        payload.push(0);
+    }
+    let last = tile_data.len() - 1;
+    for (i, t) in tile_data.iter().enumerate() {
+        if i != last {
+            payload.extend_from_slice(&((t.len() - 1) as u32).to_le_bytes());
+        }
+        payload.extend_from_slice(t);
+    }
     let mut data = obu_write::write_obu(obu::OBU_SEQUENCE_HEADER, &obu_write::sequence_header_payload(&seq));
     data.extend(obu_write::write_obu(obu::OBU_FRAME, &payload));
     let recon = super::decoder::finish_frame(fs)?;
@@ -460,46 +473,15 @@ fn choose_filters(fs: &mut FrameState, src: &Frame, base_q_idx: u8) {
         deblock_frame(&mut f, &p, &mi);
         f
     };
-    // Luma level: coarse scan then refinement.
-    let luma_cost = |l: u8| plane_sse(&deblocked_with([l, l, 0, 0]), src, 0);
-    let mut best = (luma_cost(0), 0u8);
-    for l in (4..=60).step_by(4) {
-        let c = luma_cost(l);
-        if c < best.0 {
-            best = (c, l);
-        }
-    }
-    for d in [-2i32, -1, 1, 2] {
-        let l = (best.1 as i32 + d).clamp(0, 63) as u8;
-        let c = luma_cost(l);
-        if c < best.0 {
-            best = (c, l);
-        }
-    }
-    let luma_level = best.1;
+    let luma_level = search_level(|l| plane_sse(&deblocked_with([l, l, 0, 0]), src, 0));
     let mut levels = [luma_level, luma_level, 0, 0];
     if luma_level > 0 && np > 1 {
         for pl in 1..3 {
-            let cost = |l: u8| {
+            levels[1 + pl] = search_level(|l| {
                 let mut lv = [luma_level, luma_level, 0, 0];
                 lv[1 + pl] = l;
                 plane_sse(&deblocked_with(lv), src, pl)
-            };
-            let mut b = (cost(0), 0u8);
-            for l in (4..=60).step_by(4) {
-                let c = cost(l);
-                if c < b.0 {
-                    b = (c, l);
-                }
-            }
-            for d in [-2i32, -1, 1, 2] {
-                let l = (b.1 as i32 + d).clamp(0, 63) as u8;
-                let c = cost(l);
-                if c < b.0 {
-                    b = (c, l);
-                }
-            }
-            levels[1 + pl] = b.1;
+            });
         }
     }
     fs.hdr.loop_filter.level = levels;
@@ -508,41 +490,124 @@ fn choose_filters(fs: &mut FrameState, src: &Frame, base_q_idx: u8) {
     // CDEF: one strength set for the whole frame.
     let damping = (3 + (base_q_idx >> 6)).min(6);
     let skip: Vec<bool> = fs.skip.iter().map(|&s| s != 0).collect();
-    let mut out = deblocked.clone();
-    let mut cdef_cost = |y: (u8, u8), uv: (u8, u8), plane: usize| -> f64 {
+    let cdef_cost = |y: (u8, u8), uv: (u8, u8), plane: usize| -> f64 {
         let p = CdefParams { damping, bits: 0, y_pri: [y.0; 8], y_sec: [y.1; 8], uv_pri: [uv.0; 8], uv_sec: [uv.1; 8] };
+        let mut out = deblocked.clone();
         cdef_frame(&deblocked, &mut out, &p, &fs.cdef_idx, fs.cdef_stride, &skip, fs.mi_cols, fs.mi_rows);
         plane_sse(&out, src, plane)
     };
     let pris = [0u8, 1, 2, 3, 4, 6, 8, 11, 15];
     let secs = [0u8, 1, 2, 4];
-    let mut yb = (f64::MAX, (0u8, 0u8));
-    for &pr in &pris {
-        for &sc in &secs {
-            let c = cdef_cost((pr, sc), (0, 0), 0);
-            if c < yb.0 {
-                yb = (c, (pr, sc));
+    // Primary strength first (no secondary), then the secondary strength on top of the best primary.
+    let climb = |cost: &(dyn Fn((u8, u8)) -> f64 + Sync)| -> (u8, u8) {
+        let prim: Vec<f64> = pris.par_iter().map(|&pr| cost((pr, 0))).collect();
+        let (pi, _) = prim.iter().enumerate().fold((0, f64::MAX), |b, (i, &c)| if c < b.1 { (i, c) } else { b });
+        let pri = pris[pi];
+        let sec: Vec<f64> = secs[1..].par_iter().map(|&sc| cost((pri, sc))).collect();
+        let mut best = ((pri, 0u8), prim[pi]);
+        for (&sc, &c) in secs[1..].iter().zip(&sec) {
+            if c < best.1 {
+                best = ((pri, sc), c);
             }
         }
-    }
-    let mut uvb = (0.0, (0u8, 0u8));
+        best.0
+    };
+    let ybest = climb(&|y| cdef_cost(y, (0, 0), 0));
+    let mut uvbest = (0u8, 0u8);
     if np > 1 {
-        uvb.0 = f64::MAX;
-        for &pr in &pris {
-            for &sc in &secs {
-                let c = cdef_cost(yb.1, (pr, sc), 1) + cdef_cost(yb.1, (pr, sc), 2);
-                if c < uvb.0 {
-                    uvb = (c, (pr, sc));
-                }
-            }
-        }
+        uvbest = climb(&|uv| cdef_cost(ybest, uv, 1) + cdef_cost(ybest, uv, 2));
     }
+    let (yb, uvb) = ((0.0, ybest), (0.0, uvbest));
     fs.hdr.cdef.damping = damping;
     fs.hdr.cdef.bits = 0;
     fs.hdr.cdef.y_pri[0] = yb.1.0;
     fs.hdr.cdef.y_sec[0] = yb.1.1;
     fs.hdr.cdef.uv_pri[0] = uvb.1.0;
     fs.hdr.cdef.uv_sec[0] = uvb.1.1;
+}
+
+/// Deblocking level minimising `cost`: a coarse parallel scan, then halving steps around the best.
+fn search_level(cost: impl Fn(u8) -> f64 + Sync) -> u8 {
+    let coarse: Vec<u8> = (0..=56).step_by(8).collect();
+    let costs: Vec<f64> = coarse.par_iter().map(|&l| cost(l)).collect();
+    let (mut level, mut best) = (0u8, f64::MAX);
+    for (&l, &c) in coarse.iter().zip(&costs) {
+        if c < best {
+            (level, best) = (l, c);
+        }
+    }
+    for step in [4i32, 2, 1] {
+        let cands: Vec<u8> =
+            [-step, step].iter().map(|d| (level as i32 + d).clamp(0, 63) as u8).filter(|&c| c != level).collect();
+        let cs: Vec<f64> = cands.par_iter().map(|&l| cost(l)).collect();
+        for (&l, &c) in cands.iter().zip(&cs) {
+            if c < best {
+                (level, best) = (l, c);
+            }
+        }
+    }
+    level
+}
+
+/// Tile columns / rows (as log2) for an image: about one tile per 400k pixels so that large pictures encode in
+/// parallel, never narrower than 256 pixels. Depends only on the picture size, so output is machine independent.
+fn tile_layout(w: usize, h: usize) -> (u32, u32) {
+    let n = (w * h / 400_000).clamp(1, 16);
+    let total = n.ilog2();
+    let mut cols = 0;
+    while cols < total.div_ceil(2) && (w >> (cols + 1)) >= 256 {
+        cols += 1;
+    }
+    let mut rows = 0;
+    while cols + rows < total && (h >> (rows + 1)) >= 256 {
+        rows += 1;
+    }
+    (cols, rows)
+}
+
+/// Copy the part of `src` that the tile `rows` x `cols` (in 4x4 units) produced into `dst`.
+fn merge_tile(dst: &mut FrameState, src: &FrameState, rows: (usize, usize), cols: (usize, usize)) {
+    let last_row = rows.1 == dst.mi_rows;
+    let last_col = cols.1 == dst.mi_cols;
+    for p in 0..dst.num_planes {
+        let (sx, sy) = if p == 0 { (0, 0) } else { (dst.sub_x, dst.sub_y) };
+        let (x0, y0) = ((cols.0 * 4) >> sx, (rows.0 * 4) >> sy);
+        let stride = dst.planes[p].stride;
+        let x1 = if last_col { stride } else { (cols.1 * 4) >> sx };
+        let y1 = if last_row { dst.planes[p].data.len() / stride } else { (rows.1 * 4) >> sy };
+        for y in y0..y1 {
+            dst.planes[p].data[y * stride + x0..y * stride + x1]
+                .copy_from_slice(&src.planes[p].data[y * stride + x0..y * stride + x1]);
+        }
+        let ls = dst.lf_stride[p];
+        let (lx0, lx1) = (cols.0 >> sx, ((cols.1 + sx) >> sx).min(ls));
+        let lrows = dst.lf_tx[p].len() / ls;
+        for y in (rows.0 >> sy)..((rows.1 + sy) >> sy).min(lrows) {
+            dst.lf_tx[p][y * ls + lx0..y * ls + lx1].copy_from_slice(&src.lf_tx[p][y * ls + lx0..y * ls + lx1]);
+        }
+    }
+    let w = dst.mi_cols;
+    fn copy<T: Copy>(d: &mut [T], s: &[T], w: usize, rows: (usize, usize), cols: (usize, usize)) {
+        for r in rows.0..rows.1 {
+            d[r * w + cols.0..r * w + cols.1].copy_from_slice(&s[r * w + cols.0..r * w + cols.1]);
+        }
+    }
+    copy(&mut dst.mi_size, &src.mi_size, w, rows, cols);
+    copy(&mut dst.skip, &src.skip, w, rows, cols);
+    copy(&mut dst.y_mode, &src.y_mode, w, rows, cols);
+    copy(&mut dst.uv_mode, &src.uv_mode, w, rows, cols);
+    copy(&mut dst.seg_id, &src.seg_id, w, rows, cols);
+    copy(&mut dst.tx_size, &src.tx_size, w, rows, cols);
+    copy(&mut dst.is_inter, &src.is_inter, w, rows, cols);
+    copy(&mut dst.pal_size[0], &src.pal_size[0], w, rows, cols);
+    copy(&mut dst.pal_size[1], &src.pal_size[1], w, rows, cols);
+    copy(&mut dst.delta_lf, &src.delta_lf, w, rows, cols);
+    let cs = dst.cdef_stride;
+    for r in (rows.0 / 16)..rows.1.div_ceil(16) {
+        for c in (cols.0 / 16)..cols.1.div_ceil(16) {
+            dst.cdef_idx[r * cs + c] = src.cdef_idx[r * cs + c];
+        }
+    }
 }
 
 fn ac_q_for(qidx: u8, bit_depth: u8) -> f64 {
@@ -553,4 +618,10 @@ fn ac_q_for(qidx: u8, bit_depth: u8) -> f64 {
         _ => &AC_Q_12,
     };
     t[qidx as usize] as f64
+}
+
+/// Whether the debug self-check (`AV1_CHECK`) is on; read once, since it is queried per block.
+fn self_check() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("AV1_CHECK").is_some())
 }
