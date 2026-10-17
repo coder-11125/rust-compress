@@ -12,6 +12,8 @@ pub enum Format {
     Gif,
     /// Lossless WebP.
     Webp,
+    /// AVIF (AV1 still picture in a HEIF container).
+    Avif,
 }
 
 impl Format {
@@ -21,6 +23,7 @@ impl Format {
             "jpg" | "jpeg" | "jpe" => Some(Format::Jpeg),
             "gif" => Some(Format::Gif),
             "webp" => Some(Format::Webp),
+            "avif" => Some(Format::Avif),
             _ => None,
         }
     }
@@ -34,6 +37,8 @@ impl Format {
             Some(Format::Gif)
         } else if crate::webp::is_webp(data) {
             Some(Format::Webp)
+        } else if crate::avif::is_avif(data) {
+            Some(Format::Avif)
         } else {
             None
         }
@@ -45,6 +50,7 @@ impl Format {
             Format::Jpeg => "jpg",
             Format::Gif => "gif",
             Format::Webp => "webp",
+            Format::Avif => "avif",
         }
     }
 }
@@ -68,6 +74,7 @@ pub fn target_format(cli: &Cli, input: Format) -> Format {
         FormatArg::Png => Format::Png,
         FormatArg::Jpeg => Format::Jpeg,
         FormatArg::Webp => Format::Webp,
+        FormatArg::Avif => Format::Avif,
     }
 }
 
@@ -88,10 +95,12 @@ fn output_path(cli: &Cli, input: &Path, rel: &Path, dir_mode: bool) -> PathBuf {
         (Some(_), FormatArg::Keep) => ext_in.unwrap_or_default(),
         (Some(Format::Png), FormatArg::Png)
         | (Some(Format::Jpeg), FormatArg::Jpeg)
-        | (Some(Format::Webp), FormatArg::Webp) => ext_in.unwrap_or_default(),
+        | (Some(Format::Webp), FormatArg::Webp)
+        | (Some(Format::Avif), FormatArg::Avif) => ext_in.unwrap_or_default(),
         (_, FormatArg::Png) => "png".to_string(),
         (_, FormatArg::Jpeg) => "jpg".to_string(),
         (_, FormatArg::Webp) => "webp".to_string(),
+        (_, FormatArg::Avif) => "avif".to_string(),
         (None, FormatArg::Keep) => String::new(),
     };
     if cli.in_place {

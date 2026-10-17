@@ -9,6 +9,8 @@ pub enum FormatArg {
     Jpeg,
     /// Lossless WebP.
     Webp,
+    /// AVIF (always lossy; -q sets the quality).
+    Avif,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
@@ -42,7 +44,7 @@ pub struct Cli {
     #[arg(long, conflicts_with = "output")]
     pub in_place: bool,
 
-    /// Quality (1-100): the JPEG quality ceiling (JPEG sources at or below it are transcoded losslessly; better ones are re-quantized down to it), or the lossy WebP quality with --lossy.
+    /// Quality (1-100): the JPEG quality ceiling (JPEG sources at or below it are transcoded losslessly; better ones are re-quantized down to it), the lossy WebP quality with --lossy, or the AVIF quality.
     #[arg(short, long, default_value_t = 80, value_parser = clap::value_parser!(u8).range(1..=100))]
     pub quality: u8,
 
@@ -54,7 +56,7 @@ pub struct Cli {
     #[arg(long, value_enum, default_value_t = SubsamplingArg::Auto)]
     pub subsampling: SubsamplingArg,
 
-    /// Allow lossy output: PNG palette quantization, or lossy (VP8) WebP when the output is WebP.
+    /// Allow lossy output: PNG palette quantization, lossy (VP8) WebP when the output is WebP, or re-encoding an AVIF source (AVIF is otherwise left unchanged).
     #[arg(long)]
     pub lossy: bool,
 
@@ -66,7 +68,7 @@ pub struct Cli {
     #[arg(long, default_value_t = 0.5)]
     pub dither: f32,
 
-    /// PNG / WebP effort (0-9). For PNG, 1-6 use greedy/lazy parsing (6 is fast) and 7-9 optimal parsing
+    /// PNG / WebP / AVIF effort (0-9). For PNG, 1-6 use greedy/lazy parsing (6 is fast) and 7-9 optimal parsing
     /// (7 default, 9 smallest and slowest).
     #[arg(short, long, default_value_t = 7, value_parser = clap::value_parser!(u8).range(0..=9))]
     pub level: u8,
