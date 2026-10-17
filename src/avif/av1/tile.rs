@@ -1883,6 +1883,14 @@ impl<C: Coder> TileCoder<'_, C> {
         let (dc_q, ac_q) = self.quant_steps(b, plane);
         let limit = 1i64 << (7 + bit_depth);
         let mut coefs = vec![0i32; tw * th];
+        let qm_level = self.f.hdr.seg_qm_level[plane][b.segment_id as usize];
+        let qm: Option<&[u8]> =
+            if self.f.hdr.quant.using_qmatrix && !b.lossless && self.cb.tx_type < IDTX && qm_level < 15 {
+                let off = super::qm_tables::QM_OFFSET[tx_sz as usize];
+                Some(&super::qm_tables::QM_DATA[qm_level as usize][(plane > 0) as usize][off..off + cw * ch])
+            } else {
+                None
+            };
         let mut nz_rows = 0;
         let mut nz_cols = 0;
         for pos in 0..cw * ch {
@@ -1891,7 +1899,10 @@ impl<C: Coder> TileCoder<'_, C> {
                 continue;
             }
             let (i, j) = (pos / cw, pos % cw);
-            let step = if pos == 0 { dc_q } else { ac_q } as i64;
+            let mut step = if pos == 0 { dc_q } else { ac_q } as i64;
+            if let Some(m) = qm {
+                step = (step * m[pos] as i64 + 16) >> 5;
+            }
             let mut dq = ((q.unsigned_abs() as i64 * step) & 0xff_ffff) >> dq_shift;
             if q < 0 {
                 dq = -dq;

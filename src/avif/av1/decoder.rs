@@ -1,7 +1,9 @@
 //! AV1 still-picture decoder: OBU stream in, picture out.
 
 use super::bits::BitReader;
+use super::cdef::{CdefParams, cdef_frame};
 use super::cdf_tables::Cdfs;
+use super::deblock::{DeblockMi, DeblockParams, deblock_frame};
 use super::entropy::SymbolDecoder;
 use super::frame::{Frame, Plane};
 use super::obu::{self, FrameHeader, SequenceHeader};
@@ -132,26 +134,97 @@ fn decode_tile_group(fs: &mut FrameState, hdr: &FrameHeader, data: &[u8], done: 
     Ok(())
 }
 
-/// Post-filter and crop the decoded frame to its visible size.
-fn finish_frame(fs: FrameState) -> Result<Frame> {
-    let hdr = &fs.hdr;
-    let seq = &fs.seq;
-    let (w, h) = (hdr.upscaled_width, hdr.frame_height);
+/// Copy the coded area of the decoded planes into a [`Frame`] whose planes are exactly `mi_cols * 4` wide.
+fn coded_frame(fs: &FrameState) -> Frame {
     let mut planes = Vec::new();
     for (p, plane) in fs.planes.iter().enumerate() {
         let (sx, sy) = if p == 0 { (0, 0) } else { (fs.sub_x, fs.sub_y) };
-        let (pw, ph) = ((w + sx) >> sx, (h + sy) >> sy);
+        let (pw, ph) = ((fs.mi_cols * 4) >> sx, (fs.mi_rows * 4) >> sy);
         let mut out = Plane::new(pw, ph);
         for y in 0..ph {
             out.row_mut(y).copy_from_slice(&plane.row(y)[..pw]);
         }
         planes.push(out);
     }
+    Frame {
+        planes,
+        bit_depth: fs.seq.color.bit_depth,
+        sub_x: fs.seq.color.sub_x,
+        sub_y: fs.seq.color.sub_y,
+        width: fs.hdr.frame_width,
+        height: fs.hdr.frame_height,
+    }
+}
+
+/// Post-filter and crop the decoded frame to its visible size.
+fn finish_frame(fs: FrameState) -> Result<Frame> {
+    let hdr = &fs.hdr;
+    let mut cur = coded_frame(&fs);
+    // Deblocking.
+    let lf = &hdr.loop_filter;
+    if lf.level[0] != 0 || lf.level[1] != 0 {
+        let mut mi = DeblockMi::new(fs.mi_cols, fs.mi_rows, fs.sub_x, fs.sub_y, fs.num_planes);
+        mi.mi_size.copy_from_slice(&fs.mi_size);
+        for (d, s) in mi.skip.iter_mut().zip(&fs.skip) {
+            *d = *s != 0;
+        }
+        mi.y_mode.copy_from_slice(&fs.y_mode);
+        mi.segment_id.copy_from_slice(&fs.seg_id);
+        mi.delta_lf.copy_from_slice(&fs.delta_lf);
+        for p in 0..fs.num_planes {
+            mi.tx_size[p].copy_from_slice(&fs.lf_tx[p]);
+        }
+        let mut seg_lf = [[0i8; 4]; 8];
+        for (seg, row) in seg_lf.iter_mut().enumerate() {
+            for (k, v) in row.iter_mut().enumerate() {
+                if hdr.seg_feature_active(seg, obu::SEG_LVL_ALT_LF_Y_V + k) {
+                    *v = hdr.seg.feature_data[seg][obu::SEG_LVL_ALT_LF_Y_V + k] as i8;
+                }
+            }
+        }
+        let params = DeblockParams {
+            filter_level: lf.level,
+            sharpness: lf.sharpness,
+            delta_enabled: lf.delta_enabled,
+            ref_deltas: lf.ref_deltas,
+            mode_deltas: lf.mode_deltas,
+            delta_lf_multi: hdr.delta_lf_multi,
+            seg_lf,
+        };
+        deblock_frame(&mut cur, &params, &mi);
+    }
+    // CDEF.
+    let mut filtered = cur.clone();
+    if fs.seq.enable_cdef && !hdr.coded_lossless && !hdr.allow_intrabc {
+        let c = &hdr.cdef;
+        let params = CdefParams {
+            damping: c.damping,
+            bits: c.bits,
+            y_pri: c.y_pri,
+            y_sec: c.y_sec,
+            uv_pri: c.uv_pri,
+            uv_sec: c.uv_sec,
+        };
+        let skip: Vec<bool> = fs.skip.iter().map(|&s| s != 0).collect();
+        cdef_frame(&cur, &mut filtered, &params, &fs.cdef_idx, fs.cdef_stride, &skip, fs.mi_cols, fs.mi_rows);
+    }
+    let out = filtered;
+    let (w, h) = (hdr.upscaled_width, hdr.frame_height);
+    let mut planes = Vec::new();
+    for (p, plane) in out.planes.iter().enumerate() {
+        let (sx, sy) = if p == 0 { (0, 0) } else { (fs.sub_x, fs.sub_y) };
+        let (pw, ph) = ((w + sx) >> sx, (h + sy) >> sy);
+        let mut o = Plane::new(pw, ph);
+        for y in 0..ph {
+            o.row_mut(y).copy_from_slice(&plane.row(y)[..pw]);
+        }
+        planes.push(o);
+    }
     Ok(Frame {
         planes,
-        bit_depth: seq.color.bit_depth,
-        sub_x: seq.color.sub_x,
-        sub_y: seq.color.sub_y,
+        bit_depth: fs.seq.color.bit_depth,
+        sub_x: fs.seq.color.sub_x,
+        sub_y: fs.seq.color.sub_y,
         width: w,
         height: h,
     })
