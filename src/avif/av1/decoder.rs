@@ -6,10 +6,10 @@ use super::cdf_tables::Cdfs;
 use super::deblock::{DeblockMi, DeblockParams, deblock_frame};
 use super::entropy::SymbolDecoder;
 use super::filmgrain::{FilmGrainParams, apply_film_grain};
-use super::lr::{LrPlane, LrType, LrUnit, loop_restoration_frame};
-use super::superres::upscale_frame;
 use super::frame::{Frame, Plane};
+use super::lr::{LrPlane, LrType, LrUnit, loop_restoration_frame};
 use super::obu::{self, FrameHeader, SequenceHeader};
+use super::superres::upscale_frame;
 use super::tile::{FrameState, TileCoder};
 use crate::error::{Error, Result};
 
@@ -163,7 +163,7 @@ fn coded_frame(fs: &FrameState) -> Frame {
 }
 
 /// Post-filter and crop the decoded frame to its visible size.
-fn finish_frame(fs: FrameState) -> Result<Frame> {
+pub(crate) fn finish_frame(fs: FrameState) -> Result<Frame> {
     let hdr = &fs.hdr;
     let mut cur = coded_frame(&fs);
     // Deblocking.
@@ -223,7 +223,12 @@ fn finish_frame(fs: FrameState) -> Result<Frame> {
         let mut lr_planes = Vec::new();
         for p in 0..fs.num_planes {
             let (cols, rows, params) = &fs.lr_units[p];
-            let mut lp = LrPlane { unit_size: hdr.lr.unit_size[p].max(1), units_per_row: *cols, units_per_col: *rows, units: Vec::new() };
+            let mut lp = LrPlane {
+                unit_size: hdr.lr.unit_size[p].max(1),
+                units_per_row: *cols,
+                units_per_col: *rows,
+                units: Vec::new(),
+            };
             for u in params {
                 lp.units.push(LrUnit {
                     kind: match u.kind {

@@ -173,6 +173,15 @@ impl Default for CoefBlock {
     }
 }
 
+/// Quantized coefficients of one transform block in compact form, for replay by the encoder.
+#[derive(Clone, Debug, Default)]
+pub struct StoredCoefs {
+    pub tx_type: u8,
+    pub eob: usize,
+    /// Non-zero coefficients as (position, value).
+    pub coefs: Vec<(u16, i32)>,
+}
+
 const SB_MI_MAX: usize = 32;
 
 pub struct TileCoder<'a, C: Coder> {
@@ -190,17 +199,31 @@ pub struct TileCoder<'a, C: Coder> {
     above_pal: [Vec<[u16; 8]>; 2],
     left_pal: [Vec<[u16; 8]>; 2],
     /// `BlockDecoded[plane][y + 1][x + 1]` for the current superblock.
-    block_decoded: [[[bool; SB_MI_MAX + 3]; SB_MI_MAX + 3]; 3],
+    pub(crate) block_decoded: [[[bool; SB_MI_MAX + 3]; SB_MI_MAX + 3]; 3],
     pub current_q_index: i32,
     pub delta_lf: [i32; 4],
     pub read_deltas: bool,
-    ref_sgr_xqd: [[i32; 2]; 3],
-    ref_lr_wiener: [[[i32; 3]; 2]; 3],
-    max_luma_w: usize,
-    max_luma_h: usize,
+    pub(crate) ref_sgr_xqd: [[i32; 2]; 3],
+    pub(crate) ref_lr_wiener: [[[i32; 3]; 2]; 3],
+    pub(crate) max_luma_w: usize,
+    pub(crate) max_luma_h: usize,
     color_map_y: Vec<u8>,
     color_map_uv: Vec<u8>,
     pub cb: Box<CoefBlock>,
+    /// Encoder replay queues: partition decisions, blocks and per-transform-block coefficients, consumed in the
+    /// order the decoder would parse them.
+    pub part_queue: std::collections::VecDeque<u8>,
+    pub blk_queue: std::collections::VecDeque<Blk>,
+    pub coef_queue: std::collections::VecDeque<StoredCoefs>,
+    /// Encoder analysis: when set, transform blocks get their coefficients from `enc_src` instead of the bitstream.
+    pub analyzing: bool,
+    pub analysis_log: Vec<StoredCoefs>,
+    /// Replay the queues instead of planning; when planning, decisions are appended to the logs.
+    pub replay: bool,
+    pub part_log: Vec<u8>,
+    pub blk_log: Vec<Blk>,
+    pub coef_log: Vec<StoredCoefs>,
+    pub enc_src: Option<super::encode::EncSrc>,
 }
 
 impl<'a, C: Coder> TileCoder<'a, C> {
@@ -241,6 +264,16 @@ impl<'a, C: Coder> TileCoder<'a, C> {
             color_map_y: vec![0; 64 * 64],
             color_map_uv: vec![0; 64 * 64],
             cb: Box::default(),
+            part_queue: Default::default(),
+            blk_queue: Default::default(),
+            coef_queue: Default::default(),
+            analyzing: false,
+            analysis_log: Vec::new(),
+            replay: false,
+            part_log: Vec::new(),
+            blk_log: Vec::new(),
+            coef_log: Vec::new(),
+            enc_src: None,
         }
         .with_planes(np)
     }
@@ -249,7 +282,7 @@ impl<'a, C: Coder> TileCoder<'a, C> {
         self
     }
 
-    fn sb_size(&self) -> u8 {
+    pub(crate) fn sb_size(&self) -> u8 {
         if self.f.seq.use_128x128_superblock { BLOCK_128X128 } else { BLOCK_64X64 }
     }
 
@@ -261,7 +294,7 @@ impl<'a, C: Coder> TileCoder<'a, C> {
     }
 
     #[inline]
-    fn mi(&self, r: usize, c: usize) -> usize {
+    pub(crate) fn mi(&self, r: usize, c: usize) -> usize {
         r * self.f.mi_cols + c
     }
 
@@ -285,7 +318,7 @@ impl<'a, C: Coder> TileCoder<'a, C> {
         Ok(())
     }
 
-    fn clear_left_context(&mut self) {
+    pub(crate) fn clear_left_context(&mut self) {
         for p in 0..3 {
             self.left_level[p].fill(0);
             self.left_dc[p].fill(0);
@@ -296,7 +329,7 @@ impl<'a, C: Coder> TileCoder<'a, C> {
     }
 
     /// Spec `clear_above_context` is implicit: the contexts start zeroed for every tile.
-    fn clear_cdef(&mut self, r: usize, c: usize) {
+    pub(crate) fn clear_cdef(&mut self, r: usize, c: usize) {
         let st = self.f.cdef_stride;
         let (r64, c64) = (r >> 4, c >> 4);
         self.f.cdef_idx[r64 * st + c64] = -1;
@@ -314,7 +347,7 @@ impl<'a, C: Coder> TileCoder<'a, C> {
         }
     }
 
-    fn clear_block_decoded_flags(&mut self, r: usize, c: usize, sb4: usize) {
+    pub(crate) fn clear_block_decoded_flags(&mut self, r: usize, c: usize, sb4: usize) {
         for plane in 0..self.f.num_planes {
             let (sx, sy) = self.plane_sub(plane);
             let sb_w4 = ((self.mi_col_end - c) >> sx) as isize;
@@ -330,7 +363,7 @@ impl<'a, C: Coder> TileCoder<'a, C> {
         }
     }
 
-    fn plane_sub(&self, plane: usize) -> (usize, usize) {
+    pub(crate) fn plane_sub(&self, plane: usize) -> (usize, usize) {
         if plane == 0 { (0, 0) } else { (self.f.sub_x, self.f.sub_y) }
     }
 
@@ -338,7 +371,7 @@ impl<'a, C: Coder> TileCoder<'a, C> {
     // Loop restoration syntax
     // ---------------------------------------------------------------------------------------------
 
-    fn read_lr(&mut self, r: usize, c: usize, bsize: u8) -> Result<()> {
+    pub(crate) fn read_lr(&mut self, r: usize, c: usize, bsize: u8) -> Result<()> {
         if self.f.hdr.allow_intrabc {
             return Ok(());
         }
@@ -497,6 +530,8 @@ impl<'a, C: Coder> TileCoder<'a, C> {
         let quarter = half >> 1;
         let has_rows = (r + half) < self.f.mi_rows;
         let has_cols = (c + half) < self.f.mi_cols;
+        let want_part =
+            if !C::DECODING && bsize >= BLOCK_8X8 { self.next_partition(r, c, bsize, has_rows, has_cols) } else { 0 };
         let partition = if bsize < BLOCK_8X8 {
             PARTITION_NONE
         } else {
@@ -512,7 +547,7 @@ impl<'a, C: Coder> TileCoder<'a, C> {
                     5 => &mut self.cdf.partition_w128[ctx],
                     n => &mut self.cdf.partition[(n - 2) * 4 + ctx],
                 };
-                self.c.symbol(cdf, 0) as u8
+                self.c.symbol(cdf, want_part as usize) as u8
             } else if has_cols || has_rows {
                 // Only a split (or the one partition that fits) is possible: a binary choice whose
                 // probability is derived from the full partition CDF.
@@ -547,7 +582,7 @@ impl<'a, C: Coder> TileCoder<'a, C> {
                     }
                 }
                 let tmp = [(32768 - psum).min(32768) as u16, 32768, 0];
-                let split = self.c.symbol_fixed(&tmp, 0) != 0;
+                let split = self.c.symbol_fixed(&tmp, (want_part == PARTITION_SPLIT) as usize) != 0;
                 if split {
                     PARTITION_SPLIT
                 } else if has_cols {
@@ -626,8 +661,9 @@ impl<'a, C: Coder> TileCoder<'a, C> {
     // Block
     // ---------------------------------------------------------------------------------------------
 
-    fn decode_block(&mut self, r: usize, c: usize, bsize: u8) -> Result<()> {
-        let mut b = Blk { mi_row: r, mi_col: c, bsize, ..Default::default() };
+    /// Fill the position-derived fields of a block (chroma presence and neighbour availability).
+    pub(crate) fn set_block_geometry(&self, b: &mut Blk) {
+        let (r, c, bsize) = (b.mi_row, b.mi_col, b.bsize);
         let bw4 = NUM_4X4_WIDE[bsize as usize] as usize;
         let bh4 = NUM_4X4_HIGH[bsize as usize] as usize;
         let (ssx, ssy) = (self.f.sub_x, self.f.sub_y);
@@ -648,6 +684,16 @@ impl<'a, C: Coder> TileCoder<'a, C> {
             b.avail_u_chroma = false;
             b.avail_l_chroma = false;
         }
+    }
+
+    pub(crate) fn decode_block(&mut self, r: usize, c: usize, bsize: u8) -> Result<()> {
+        let mut b = if C::DECODING { Blk::default() } else { self.next_block(r, c, bsize) };
+        b.mi_row = r;
+        b.mi_col = c;
+        b.bsize = bsize;
+        self.set_block_geometry(&mut b);
+        let bw4 = NUM_4X4_WIDE[bsize as usize] as usize;
+        let bh4 = NUM_4X4_HIGH[bsize as usize] as usize;
         self.intra_frame_mode_info(&mut b)?;
         self.palette_tokens(&b);
         self.read_block_tx_size(&mut b);
@@ -1294,7 +1340,7 @@ fn palette_color_context(map: &[u8], stride: usize, r: usize, c: usize, n: usize
 // -------------------------------------------------------------------------------------------------
 
 impl<C: Coder> TileCoder<'_, C> {
-    fn residual(&mut self, b: &Blk) -> Result<()> {
+    pub(crate) fn residual(&mut self, b: &Blk) -> Result<()> {
         let sb_mask = if self.f.seq.use_128x128_superblock { 31 } else { 15 };
         let _ = sb_mask;
         let bw = block_width(b.bsize);
@@ -1339,7 +1385,7 @@ impl<C: Coder> TileCoder<'_, C> {
         Ok(())
     }
 
-    fn get_tx_size(&self, b: &Blk, plane: usize) -> u8 {
+    pub(crate) fn get_tx_size(&self, b: &Blk, plane: usize) -> u8 {
         if plane == 0 {
             return b.tx_size;
         }
@@ -1401,7 +1447,10 @@ impl<C: Coder> TileCoder<'_, C> {
             self.max_luma_w = start_x + step_x * 4;
             self.max_luma_h = start_y + step_y * 4;
         }
-        if !b.skip {
+        if self.analyzing {
+            let sc = self.analyze_tx(b, plane, start_x, start_y, tx_sz);
+            self.analysis_log.push(sc);
+        } else if !b.skip {
             let eob = self.coeffs(b, plane, start_x, start_y, tx_sz);
             if eob > 0 {
                 self.reconstruct(b, plane, start_x, start_y, tx_sz);
@@ -1460,7 +1509,7 @@ impl<C: Coder> TileCoder<'_, C> {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn predict_intra_block(
+    pub(crate) fn predict_intra_block(
         &mut self,
         b: &Blk,
         plane: usize,
@@ -1502,7 +1551,7 @@ impl<C: Coder> TileCoder<'_, C> {
         ipred::predict(&mut pl.data[y * stride + x..], stride, &edges, &params);
     }
 
-    fn predict_cfl(&mut self, b: &Blk, plane: usize, x: usize, y: usize, tx_sz: u8) {
+    pub(crate) fn predict_cfl(&mut self, b: &Blk, plane: usize, x: usize, y: usize, tx_sz: u8) {
         let w = TX_W[tx_sz as usize] as usize;
         let h = TX_H[tx_sz as usize] as usize;
         let (sx, sy) = (self.f.sub_x, self.f.sub_y);
@@ -1554,7 +1603,7 @@ impl<C: Coder> TileCoder<'_, C> {
     }
 
     /// Quantizer step sizes (dc, ac) for a plane of the current block.
-    fn quant_steps(&self, b: &Blk, plane: usize) -> (i32, i32) {
+    pub(crate) fn quant_steps(&self, b: &Blk, plane: usize) -> (i32, i32) {
         let q = &self.f.hdr.quant;
         let qidx = self.f.hdr.qidx(false, b.segment_id as usize, self.current_q_index);
         let (ddc, dac) = match plane {
@@ -1571,7 +1620,7 @@ impl<C: Coder> TileCoder<'_, C> {
         (dct[(qidx + ddc).clamp(0, 255) as usize] as i32, act[(qidx + dac).clamp(0, 255) as usize] as i32)
     }
 
-    fn tx_set_intra(&self, tx_sz: u8) -> u8 {
+    pub(crate) fn tx_set_intra(&self, tx_sz: u8) -> u8 {
         // 0 = DCT only, 1 = 7-type set, 2 = 5-type set
         let sqr_up = TX_SQR_UP[tx_sz as usize];
         let sqr = TX_SQR[tx_sz as usize];
@@ -1645,6 +1694,14 @@ impl<C: Coder> TileCoder<'_, C> {
             }
             ctx
         };
+        if !C::DECODING {
+            let sc = self.coef_queue.pop_front().unwrap_or_default();
+            self.cb.eob = sc.eob;
+            self.cb.tx_type = sc.tx_type;
+            for &(pos, v) in &sc.coefs {
+                self.cb.quant[pos as usize] = v;
+            }
+        }
         let all_zero = self.c.symbol(&mut self.cdf.txb_skip[tx_sz_ctx][ctx], (self.cb.eob == 0) as usize) != 0;
         let mut cul_level = 0u32;
         let mut dc_category = 0u8;
@@ -1726,7 +1783,8 @@ impl<C: Coder> TileCoder<'_, C> {
                     } else {
                         3
                     };
-                    let s = self.c.symbol(&mut self.cdf.coeff_base_eob[tx_sz_ctx][ptype][ctx], want_level.max(1) - 1);
+                    let s =
+                        self.c.symbol(&mut self.cdf.coeff_base_eob[tx_sz_ctx][ptype][ctx], want_level.clamp(1, 3) - 1);
                     level = s + 1;
                 } else {
                     let ctx = coeff_base_ctx(&levels, stride, tx_sz, class, row, col);
@@ -1866,7 +1924,16 @@ impl<C: Coder> TileCoder<'_, C> {
         }
     }
 
-    fn reconstruct(&mut self, b: &Blk, plane: usize, start_x: usize, start_y: usize, tx_sz: u8) {
+    /// Dequantize `quant` (specification raster order) for a transform block, returning the coefficient array in
+    /// the layout the inverse transform expects and the number of non-zero rows and columns.
+    pub(crate) fn dequant_block(
+        &self,
+        b: &Blk,
+        plane: usize,
+        tx_sz: u8,
+        tx_type: u8,
+        quant: &[i32],
+    ) -> (Vec<i32>, usize, usize) {
         let tw = TX_W[tx_sz as usize] as usize;
         let th = TX_H[tx_sz as usize] as usize;
         let cw = tw.min(32);
@@ -1878,17 +1945,16 @@ impl<C: Coder> TileCoder<'_, C> {
         let limit = 1i64 << (7 + bit_depth);
         let mut coefs = vec![0i32; tw * th];
         let qm_level = self.f.hdr.seg_qm_level[plane][b.segment_id as usize];
-        let qm: Option<&[u8]> =
-            if self.f.hdr.quant.using_qmatrix && !b.lossless && self.cb.tx_type < IDTX && qm_level < 15 {
-                let off = super::qm_tables::QM_OFFSET[tx_sz as usize];
-                Some(&super::qm_tables::QM_DATA[qm_level as usize][(plane > 0) as usize][off..off + cw * ch])
-            } else {
-                None
-            };
+        let qm: Option<&[u8]> = if self.f.hdr.quant.using_qmatrix && !b.lossless && tx_type < IDTX && qm_level < 15 {
+            let off = super::qm_tables::QM_OFFSET[tx_sz as usize];
+            Some(&super::qm_tables::QM_DATA[qm_level as usize][(plane > 0) as usize][off..off + cw * ch])
+        } else {
+            None
+        };
         let mut nz_rows = 0;
         let mut nz_cols = 0;
         for pos in 0..cw * ch {
-            let q = self.cb.quant[pos];
+            let q = quant[pos];
             if q == 0 {
                 continue;
             }
@@ -1905,6 +1971,15 @@ impl<C: Coder> TileCoder<'_, C> {
             nz_rows = nz_rows.max(i + 1);
             nz_cols = nz_cols.max(j + 1);
         }
+        (coefs, nz_rows, nz_cols)
+    }
+
+    pub(crate) fn reconstruct(&mut self, b: &Blk, plane: usize, start_x: usize, start_y: usize, tx_sz: u8) {
+        let tw = TX_W[tx_sz as usize] as usize;
+        let th = TX_H[tx_sz as usize] as usize;
+        let (cw, ch) = (tw.min(32), th.min(32));
+        let bit_depth = self.f.seq.color.bit_depth;
+        let (mut coefs, nz_rows, nz_cols) = self.dequant_block(b, plane, tx_sz, self.cb.tx_type, &self.cb.quant);
         let stride = self.f.planes[plane].stride;
         let dst = &mut self.f.planes[plane].data[start_y * stride + start_x..];
         itx::inverse_transform_add(
@@ -1912,7 +1987,7 @@ impl<C: Coder> TileCoder<'_, C> {
             tx_sz,
             self.cb.tx_type,
             b.lossless,
-            bit_depth as u8,
+            bit_depth,
             nz_rows,
             nz_cols,
             dst,
