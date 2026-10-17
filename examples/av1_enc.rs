@@ -37,6 +37,14 @@ fn main() {
         width: w,
         height: h,
     };
+    if let Some(path) = a.get(6) {
+        let mut out = std::io::BufWriter::new(std::fs::File::create(path).unwrap());
+        for pl in &frame.planes {
+            for y in 0..pl.height {
+                out.write_all(&pl.row(y).iter().map(|&v| v as u8).collect::<Vec<u8>>()).unwrap();
+            }
+        }
+    }
     let mut p = EncodeParams::default();
     if let Some(q) = a.get(4) {
         p.base_q_idx = q.parse().unwrap();

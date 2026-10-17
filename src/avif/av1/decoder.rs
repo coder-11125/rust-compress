@@ -141,7 +141,7 @@ fn decode_tile_group(fs: &mut FrameState, hdr: &FrameHeader, data: &[u8], done: 
 }
 
 /// Copy the coded area of the decoded planes into a [`Frame`] whose planes are exactly `mi_cols * 4` wide.
-fn coded_frame(fs: &FrameState) -> Frame {
+pub(crate) fn coded_frame(fs: &FrameState) -> Frame {
     let mut planes = Vec::new();
     for (p, plane) in fs.planes.iter().enumerate() {
         let (sx, sy) = if p == 0 { (0, 0) } else { (fs.sub_x, fs.sub_y) };
@@ -162,6 +162,42 @@ fn coded_frame(fs: &FrameState) -> Frame {
     }
 }
 
+
+/// Deblocking parameters and per-block data of a decoded (or encoded) frame.
+pub(crate) fn build_deblock(fs: &FrameState) -> (DeblockParams, DeblockMi) {
+    let hdr = &fs.hdr;
+    let lf = &hdr.loop_filter;
+    let mut mi = DeblockMi::new(fs.mi_cols, fs.mi_rows, fs.sub_x, fs.sub_y, fs.num_planes);
+    mi.mi_size.copy_from_slice(&fs.mi_size);
+    for (d, s) in mi.skip.iter_mut().zip(&fs.skip) {
+        *d = *s != 0;
+    }
+    mi.y_mode.copy_from_slice(&fs.y_mode);
+    mi.segment_id.copy_from_slice(&fs.seg_id);
+    mi.delta_lf.copy_from_slice(&fs.delta_lf);
+    for p in 0..fs.num_planes {
+        mi.tx_size[p].copy_from_slice(&fs.lf_tx[p]);
+    }
+    let mut seg_lf = [[0i8; 4]; 8];
+    for (seg, row) in seg_lf.iter_mut().enumerate() {
+        for (k, v) in row.iter_mut().enumerate() {
+            if hdr.seg_feature_active(seg, obu::SEG_LVL_ALT_LF_Y_V + k) {
+                *v = hdr.seg.feature_data[seg][obu::SEG_LVL_ALT_LF_Y_V + k] as i8;
+            }
+        }
+    }
+    let params = DeblockParams {
+        filter_level: lf.level,
+        sharpness: lf.sharpness,
+        delta_enabled: lf.delta_enabled,
+        ref_deltas: lf.ref_deltas,
+        mode_deltas: lf.mode_deltas,
+        delta_lf_multi: hdr.delta_lf_multi,
+        seg_lf,
+    };
+    (params, mi)
+}
+
 /// Post-filter and crop the decoded frame to its visible size.
 pub(crate) fn finish_frame(fs: FrameState) -> Result<Frame> {
     let hdr = &fs.hdr;
@@ -169,34 +205,7 @@ pub(crate) fn finish_frame(fs: FrameState) -> Result<Frame> {
     // Deblocking.
     let lf = &hdr.loop_filter;
     if lf.level[0] != 0 || lf.level[1] != 0 {
-        let mut mi = DeblockMi::new(fs.mi_cols, fs.mi_rows, fs.sub_x, fs.sub_y, fs.num_planes);
-        mi.mi_size.copy_from_slice(&fs.mi_size);
-        for (d, s) in mi.skip.iter_mut().zip(&fs.skip) {
-            *d = *s != 0;
-        }
-        mi.y_mode.copy_from_slice(&fs.y_mode);
-        mi.segment_id.copy_from_slice(&fs.seg_id);
-        mi.delta_lf.copy_from_slice(&fs.delta_lf);
-        for p in 0..fs.num_planes {
-            mi.tx_size[p].copy_from_slice(&fs.lf_tx[p]);
-        }
-        let mut seg_lf = [[0i8; 4]; 8];
-        for (seg, row) in seg_lf.iter_mut().enumerate() {
-            for (k, v) in row.iter_mut().enumerate() {
-                if hdr.seg_feature_active(seg, obu::SEG_LVL_ALT_LF_Y_V + k) {
-                    *v = hdr.seg.feature_data[seg][obu::SEG_LVL_ALT_LF_Y_V + k] as i8;
-                }
-            }
-        }
-        let params = DeblockParams {
-            filter_level: lf.level,
-            sharpness: lf.sharpness,
-            delta_enabled: lf.delta_enabled,
-            ref_deltas: lf.ref_deltas,
-            mode_deltas: lf.mode_deltas,
-            delta_lf_multi: hdr.delta_lf_multi,
-            seg_lf,
-        };
+        let (params, mi) = build_deblock(&fs);
         deblock_frame(&mut cur, &params, &mi);
     }
     // CDEF.

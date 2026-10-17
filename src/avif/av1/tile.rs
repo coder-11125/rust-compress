@@ -1633,7 +1633,8 @@ impl<C: Coder> TileCoder<'_, C> {
         }
     }
 
-    fn coeffs(&mut self, b: &Blk, plane: usize, start_x: usize, start_y: usize, tx_sz: u8) -> usize {
+    /// Contexts and fixed choices of one transform block's coefficient syntax.
+    pub(crate) fn txb_setup(&self, b: &Blk, plane: usize, start_x: usize, start_y: usize, tx_sz: u8) -> TxbSetup {
         let x4 = start_x >> 2;
         let y4 = start_y >> 2;
         let tw = TX_W[tx_sz as usize] as usize;
@@ -1649,7 +1650,7 @@ impl<C: Coder> TileCoder<'_, C> {
         // all_zero context
         let plane_sz = if plane == 0 { b.bsize } else { subsampled_size(b.bsize, sx as u8, sy as u8) };
         let (bw, bh) = (block_width(plane_sz), block_height(plane_sz));
-        let ctx = if plane == 0 {
+        let all_zero_ctx = if plane == 0 {
             let mut top = 0u8;
             let mut left = 0u8;
             for k in 0..w4 {
@@ -1694,6 +1695,61 @@ impl<C: Coder> TileCoder<'_, C> {
             }
             ctx
         };
+        let mut dc_sign = 0i32;
+        for k in 0..w4 {
+            if x4 + k < max_x4 {
+                match self.above_dc[plane][x4 + k] {
+                    1 => dc_sign -= 1,
+                    2 => dc_sign += 1,
+                    _ => {}
+                }
+            }
+        }
+        for k in 0..h4 {
+            if y4 + k < max_y4 {
+                match self.left_dc[plane][y4 + k] {
+                    1 => dc_sign -= 1,
+                    2 => dc_sign += 1,
+                    _ => {}
+                }
+            }
+        }
+        let dc_sign_ctx = if dc_sign < 0 {
+            1
+        } else if dc_sign > 0 {
+            2
+        } else {
+            0
+        };
+        // Transform type signalling.
+        let set = self.tx_set_intra(tx_sz);
+        let mut fixed_type = Some(0u8);
+        let mut read_type = false;
+        if !(b.lossless || TX_SQR_UP[tx_sz as usize] > TX_32X32) {
+            if plane > 0 {
+                fixed_type = Some(if set == 0 { 0 } else { MODE_TO_TXFM[b.uv_mode as usize] });
+            } else {
+                let qidx = if self.f.hdr.seg.enabled {
+                    self.f.hdr.qidx(true, b.segment_id as usize, 0)
+                } else {
+                    self.f.hdr.quant.base_q_idx as i32
+                };
+                if set > 0 && qidx > 0 {
+                    read_type = true;
+                    fixed_type = None;
+                }
+            }
+        }
+        let intra_dir = if b.use_filter_intra {
+            FILTER_INTRA_MODE_TO_INTRA_DIR[b.filter_intra_mode as usize]
+        } else {
+            b.y_mode
+        };
+        TxbSetup { tx_sz, ptype, tx_sz_ctx, all_zero_ctx, dc_sign_ctx, tx_set: set, read_type, fixed_type, intra_dir, x4, y4, w4, h4 }
+    }
+
+    fn coeffs(&mut self, b: &Blk, plane: usize, start_x: usize, start_y: usize, tx_sz: u8) -> usize {
+        let s = self.txb_setup(b, plane, start_x, start_y, tx_sz);
         if !C::DECODING {
             let sc = self.coef_queue.pop_front().unwrap_or_default();
             self.cb.eob = sc.eob;
@@ -1702,226 +1758,24 @@ impl<C: Coder> TileCoder<'_, C> {
                 self.cb.quant[pos as usize] = v;
             }
         }
-        let all_zero = self.c.symbol(&mut self.cdf.txb_skip[tx_sz_ctx][ctx], (self.cb.eob == 0) as usize) != 0;
-        let mut cul_level = 0u32;
-        let mut dc_category = 0u8;
-        let mut eob = 0usize;
-        if all_zero {
-            self.cb.eob = 0;
-        } else {
-            // Transform type.
-            let tx_type = self.transform_type(b, plane, tx_sz);
-            self.cb.tx_type = tx_type;
-            let class = tx_class(tx_type);
-            let scan_kind = match class {
-                TX_CLASS_VERT => 1,
-                TX_CLASS_HORIZ => 2,
-                _ => 0,
-            };
-            let scan: &[u16] = SCAN_TABLE[tx_sz as usize][if tx_type == IDTX { 0 } else { scan_kind }];
-            let adj = ADJUSTED_TX_SIZE[tx_sz as usize] as usize;
-            let bwl = TX_W_LOG2[adj] as usize;
-            let cw = 1usize << bwl;
-            let ch = TX_H[adj] as usize;
-            let area = cw * ch;
-
-            // eob
-            let eob_multisize = (TX_W_LOG2[tx_sz as usize].min(5) + TX_H_LOG2[tx_sz as usize].min(5)) as usize - 4;
-            let ectx = if class == TX_CLASS_2D { 0 } else { 1 };
-            let want_eob = self.cb.eob;
-            let (want_pt, want_extra) = eob_to_pt(want_eob);
-            let pt_sym = match eob_multisize {
-                0 => self.c.symbol(&mut self.cdf.eob_pt_16[ptype][ectx], want_pt - 1),
-                1 => self.c.symbol(&mut self.cdf.eob_pt_32[ptype][ectx], want_pt - 1),
-                2 => self.c.symbol(&mut self.cdf.eob_pt_64[ptype][ectx], want_pt - 1),
-                3 => self.c.symbol(&mut self.cdf.eob_pt_128[ptype][ectx], want_pt - 1),
-                4 => self.c.symbol(&mut self.cdf.eob_pt_256[ptype][ectx], want_pt - 1),
-                5 => self.c.symbol(&mut self.cdf.eob_pt_512[ptype][ectx], want_pt - 1),
-                _ => self.c.symbol(&mut self.cdf.eob_pt_1024[ptype][ectx], want_pt - 1),
-            };
-            let eob_pt = pt_sym + 1;
-            eob = if eob_pt < 2 { eob_pt } else { (1 << (eob_pt - 2)) + 1 };
-            let mut eob_shift = eob_pt as isize - 3;
-            if eob_shift >= 0 {
-                let extra_want = (want_extra >> eob_shift) & 1;
-                let eob_extra = self.c.symbol(&mut self.cdf.eob_extra[tx_sz_ctx][ptype][eob_pt - 3], extra_want) != 0;
-                if eob_extra {
-                    eob += 1 << eob_shift;
-                }
-                let n = (eob_pt as isize - 2).max(0);
-                for i in 1..n {
-                    eob_shift = n - 1 - i;
-                    let bit = self.c.literal(1, ((want_extra >> eob_shift) & 1) as u32) != 0;
-                    if bit {
-                        eob += 1 << eob_shift;
-                    }
-                }
-            }
-            if eob > area {
-                // Corrupt stream; clamp so the rest of the block stays in bounds.
-                eob = area;
-            }
-
-            // Levels, in reverse scan order.
-            let stride = 36usize;
-            let mut levels = [0u8; 36 * 36];
-            let mut quant = [0u32; 1024];
-            let want_abs = |pos: usize, q: &CoefBlock| q.quant[pos].unsigned_abs();
-            for c in (0..eob).rev() {
-                let pos = scan[c] as usize;
-                let row = pos >> bwl;
-                let col = pos & (cw - 1);
-                let want_level = if C::DECODING { 0 } else { want_abs(pos, &self.cb).min(15) as usize };
-                let mut level;
-                if c == eob - 1 {
-                    let ctx = if c == 0 {
-                        0
-                    } else if c <= area / 8 {
-                        1
-                    } else if c <= area / 4 {
-                        2
-                    } else {
-                        3
-                    };
-                    let s =
-                        self.c.symbol(&mut self.cdf.coeff_base_eob[tx_sz_ctx][ptype][ctx], want_level.clamp(1, 3) - 1);
-                    level = s + 1;
-                } else {
-                    let ctx = coeff_base_ctx(&levels, stride, tx_sz, class, row, col);
-                    level = self.c.symbol(&mut self.cdf.coeff_base[tx_sz_ctx][ptype][ctx], want_level.min(3));
-                }
-                if level > 2 {
-                    let ctx = coeff_br_ctx(&levels, stride, class, row, col, pos);
-                    let mut want_rest = want_level.saturating_sub(3);
-                    for _ in 0..4 {
-                        let sym = self.c.symbol(&mut self.cdf.coeff_br[tx_sz_ctx.min(3)][ptype][ctx], want_rest.min(3));
-                        want_rest = want_rest.saturating_sub(3);
-                        level += sym;
-                        if sym < 3 {
-                            break;
-                        }
-                    }
-                }
-                levels[row * stride + col] = level as u8;
-                quant[pos] = level as u32;
-            }
-            // Signs and Golomb-coded remainders, in scan order.
-            for c in 0..eob {
-                let pos = scan[c] as usize;
-                let want = self.cb.quant[pos];
-                let mut sign = false;
-                if quant[pos] != 0 {
-                    if c == 0 {
-                        let mut dc_sign_ctx = 0i32;
-                        for k in 0..w4 {
-                            if x4 + k < max_x4 {
-                                match self.above_dc[plane][x4 + k] {
-                                    1 => dc_sign_ctx -= 1,
-                                    2 => dc_sign_ctx += 1,
-                                    _ => {}
-                                }
-                            }
-                        }
-                        for k in 0..h4 {
-                            if y4 + k < max_y4 {
-                                match self.left_dc[plane][y4 + k] {
-                                    1 => dc_sign_ctx -= 1,
-                                    2 => dc_sign_ctx += 1,
-                                    _ => {}
-                                }
-                            }
-                        }
-                        let ctx = if dc_sign_ctx < 0 {
-                            1
-                        } else if dc_sign_ctx > 0 {
-                            2
-                        } else {
-                            0
-                        };
-                        sign = self.c.symbol(&mut self.cdf.dc_sign[ptype][ctx], (want < 0) as usize) != 0;
-                    } else {
-                        sign = self.c.literal(1, (want < 0) as u32) != 0;
-                    }
-                }
-                if quant[pos] > 14 {
-                    // Golomb code for the amount above 14.
-                    let value = want.unsigned_abs();
-                    let x_want = value.wrapping_sub(14);
-                    let length_want = 32 - x_want.leading_zeros();
-                    let mut length = 0u32;
-                    loop {
-                        length += 1;
-                        let bit = self.c.literal(1, (length == length_want) as u32) != 0;
-                        if bit || length >= 32 {
-                            break;
-                        }
-                        if length > 20 {
-                            break;
-                        }
-                    }
-                    let mut x = 1u32;
-                    for i in (0..length.saturating_sub(1)).rev() {
-                        let bit = self.c.literal(1, (x_want >> i) & 1);
-                        x = (x << 1) | bit;
-                    }
-                    quant[pos] = x.wrapping_add(14);
-                }
-                if pos == 0 && quant[pos] > 0 {
-                    dc_category = if sign { 1 } else { 2 };
-                }
-                quant[pos] &= 0xfffff;
-                cul_level = cul_level.wrapping_add(quant[pos]);
-                self.cb.quant[pos] = if sign { -(quant[pos] as i32) } else { quant[pos] as i32 };
-            }
-            cul_level = cul_level.min(63);
-            self.cb.eob = eob;
+        let out = code_txb(&mut self.c, &mut self.cdf, &s, &mut self.cb);
+        for i in 0..s.w4 {
+            self.above_level[plane][s.x4 + i] = out.cul_level as u8;
+            self.above_dc[plane][s.x4 + i] = out.dc_category;
         }
-        for i in 0..w4 {
-            self.above_level[plane][x4 + i] = cul_level as u8;
-            self.above_dc[plane][x4 + i] = dc_category;
+        for i in 0..s.h4 {
+            self.left_level[plane][s.y4 + i] = out.cul_level as u8;
+            self.left_dc[plane][s.y4 + i] = out.dc_category;
         }
-        for i in 0..h4 {
-            self.left_level[plane][y4 + i] = cul_level as u8;
-            self.left_dc[plane][y4 + i] = dc_category;
-        }
-        eob
+        out.eob
     }
 
-    fn transform_type(&mut self, b: &Blk, plane: usize, tx_sz: u8) -> u8 {
-        if b.lossless || TX_SQR_UP[tx_sz as usize] > TX_32X32 {
-            return 0;
-        }
-        let set = self.tx_set_intra(tx_sz);
-        if plane > 0 {
-            let t = MODE_TO_TXFM[b.uv_mode as usize];
-            // The chroma type must belong to the set; 16x16 and reduced sets contain all four DCT/ADST pairs.
-            return if set == 0 { 0 } else { t };
-        }
-        let qidx = if self.f.hdr.seg.enabled {
-            self.f.hdr.qidx(true, b.segment_id as usize, 0)
-        } else {
-            self.f.hdr.quant.base_q_idx as i32
-        };
-        if set > 0 && qidx > 0 {
-            let intra_dir = if b.use_filter_intra {
-                FILTER_INTRA_MODE_TO_INTRA_DIR[b.filter_intra_mode as usize]
-            } else {
-                b.y_mode
-            };
-            let sqr = TX_SQR[tx_sz as usize] as usize;
-            let want = self.cb.tx_type;
-            if set == 1 {
-                let want_sym = TX_TYPE_INTRA_INV_SET1.iter().position(|&t| t == want).unwrap_or(1);
-                let s = self.c.symbol(&mut self.cdf.intra_tx_set1[sqr][intra_dir as usize], want_sym);
-                TX_TYPE_INTRA_INV_SET1[s]
-            } else {
-                let want_sym = TX_TYPE_INTRA_INV_SET2.iter().position(|&t| t == want).unwrap_or(1);
-                let s = self.c.symbol(&mut self.cdf.intra_tx_set2[sqr][intra_dir as usize], want_sym);
-                TX_TYPE_INTRA_INV_SET2[s]
-            }
-        } else {
-            0
-        }
+    /// Estimated cost, in 1/256 bit, of coding `cb` as a transform block here (contexts are not modified).
+    pub(crate) fn txb_cost(&mut self, b: &Blk, plane: usize, start_x: usize, start_y: usize, tx_sz: u8, cb: &mut CoefBlock) -> u64 {
+        let s = self.txb_setup(b, plane, start_x, start_y, tx_sz);
+        let mut cost = super::entropy::CostCoder::new(false);
+        code_txb(&mut cost, &mut self.cdf, &s, cb);
+        cost.bits
     }
 
     /// Dequantize `quant` (specification raster order) for a transform block, returning the coefficient array in
@@ -1998,6 +1852,197 @@ impl<C: Coder> TileCoder<'_, C> {
             self.cb.quant[pos] = 0;
         }
     }
+}
+
+
+/// Setup of one transform block's coefficient syntax (contexts derived from the neighbourhood).
+pub(crate) struct TxbSetup {
+    pub tx_sz: u8,
+    pub ptype: usize,
+    pub tx_sz_ctx: usize,
+    pub all_zero_ctx: usize,
+    pub dc_sign_ctx: usize,
+    /// 0 = DCT only, 1 = seven intra types, 2 = five intra types.
+    pub tx_set: u8,
+    pub read_type: bool,
+    pub fixed_type: Option<u8>,
+    pub intra_dir: u8,
+    pub x4: usize,
+    pub y4: usize,
+    pub w4: usize,
+    pub h4: usize,
+}
+
+pub(crate) struct TxbOut {
+    pub eob: usize,
+    pub cul_level: u32,
+    pub dc_category: u8,
+}
+
+/// The coefficient syntax of one transform block (spec `coeffs()` without the context bookkeeping), generic over
+/// decoding, encoding and cost estimation.
+pub(crate) fn code_txb<K: Coder>(k: &mut K, cdf: &mut Cdfs, s: &TxbSetup, cb: &mut CoefBlock) -> TxbOut {
+    let (tx_sz, ptype, tx_sz_ctx) = (s.tx_sz, s.ptype, s.tx_sz_ctx);
+    let all_zero = k.symbol(&mut cdf.txb_skip[tx_sz_ctx][s.all_zero_ctx], (cb.eob == 0) as usize) != 0;
+    let mut cul_level = 0u32;
+    let mut dc_category = 0u8;
+    let mut eob = 0usize;
+    if all_zero {
+        cb.eob = 0;
+    } else {
+        let tx_type = if s.read_type {
+            let sqr = TX_SQR[tx_sz as usize] as usize;
+            let want = cb.tx_type;
+            if s.tx_set == 1 {
+                let want_sym = TX_TYPE_INTRA_INV_SET1.iter().position(|&t| t == want).unwrap_or(1);
+                TX_TYPE_INTRA_INV_SET1[k.symbol(&mut cdf.intra_tx_set1[sqr][s.intra_dir as usize], want_sym)]
+            } else {
+                let want_sym = TX_TYPE_INTRA_INV_SET2.iter().position(|&t| t == want).unwrap_or(1);
+                TX_TYPE_INTRA_INV_SET2[k.symbol(&mut cdf.intra_tx_set2[sqr][s.intra_dir as usize], want_sym)]
+            }
+        } else {
+            s.fixed_type.unwrap_or(0)
+        };
+        cb.tx_type = tx_type;
+        let class = tx_class(tx_type);
+        let scan_kind = match class {
+            TX_CLASS_VERT => 1,
+            TX_CLASS_HORIZ => 2,
+            _ => 0,
+        };
+        let scan: &[u16] = SCAN_TABLE[tx_sz as usize][if tx_type == IDTX { 0 } else { scan_kind }];
+        let adj = ADJUSTED_TX_SIZE[tx_sz as usize] as usize;
+        let bwl = TX_W_LOG2[adj] as usize;
+        let cw = 1usize << bwl;
+        let ch = TX_H[adj] as usize;
+        let area = cw * ch;
+        // eob
+        let eob_multisize = (TX_W_LOG2[tx_sz as usize].min(5) + TX_H_LOG2[tx_sz as usize].min(5)) as usize - 4;
+        let ectx = if class == TX_CLASS_2D { 0 } else { 1 };
+        let want_eob = cb.eob;
+        let (want_pt, want_extra) = eob_to_pt(want_eob);
+        let pt_sym = match eob_multisize {
+            0 => k.symbol(&mut cdf.eob_pt_16[ptype][ectx], want_pt - 1),
+            1 => k.symbol(&mut cdf.eob_pt_32[ptype][ectx], want_pt - 1),
+            2 => k.symbol(&mut cdf.eob_pt_64[ptype][ectx], want_pt - 1),
+            3 => k.symbol(&mut cdf.eob_pt_128[ptype][ectx], want_pt - 1),
+            4 => k.symbol(&mut cdf.eob_pt_256[ptype][ectx], want_pt - 1),
+            5 => k.symbol(&mut cdf.eob_pt_512[ptype][ectx], want_pt - 1),
+            _ => k.symbol(&mut cdf.eob_pt_1024[ptype][ectx], want_pt - 1),
+        };
+        let eob_pt = pt_sym + 1;
+        eob = if eob_pt < 2 { eob_pt } else { (1 << (eob_pt - 2)) + 1 };
+        let mut eob_shift = eob_pt as isize - 3;
+        if eob_shift >= 0 {
+            let extra_want = (want_extra >> eob_shift) & 1;
+            let eob_extra = k.symbol(&mut cdf.eob_extra[tx_sz_ctx][ptype][eob_pt - 3], extra_want) != 0;
+            if eob_extra {
+                eob += 1 << eob_shift;
+            }
+            let n = (eob_pt as isize - 2).max(0);
+            for i in 1..n {
+                eob_shift = n - 1 - i;
+                let bit = k.literal(1, ((want_extra >> eob_shift) & 1) as u32) != 0;
+                if bit {
+                    eob += 1 << eob_shift;
+                }
+            }
+        }
+        if eob > area {
+            // Corrupt stream; clamp so the rest of the block stays in bounds.
+            eob = area;
+        }
+
+        // Levels, in reverse scan order.
+        let stride = 36usize;
+        let mut levels = [0u8; 36 * 36];
+        let mut quant = [0u32; 1024];
+        let want_abs = |pos: usize, q: &CoefBlock| q.quant[pos].unsigned_abs();
+        for c in (0..eob).rev() {
+            let pos = scan[c] as usize;
+            let row = pos >> bwl;
+            let col = pos & (cw - 1);
+            let want_level = if K::DECODING { 0 } else { want_abs(pos, &cb).min(15) as usize };
+            let mut level;
+            if c == eob - 1 {
+                let ctx = if c == 0 {
+                    0
+                } else if c <= area / 8 {
+                    1
+                } else if c <= area / 4 {
+                    2
+                } else {
+                    3
+                };
+                let s =
+                    k.symbol(&mut cdf.coeff_base_eob[tx_sz_ctx][ptype][ctx], want_level.clamp(1, 3) - 1);
+                level = s + 1;
+            } else {
+                let ctx = coeff_base_ctx(&levels, stride, tx_sz, class, row, col);
+                level = k.symbol(&mut cdf.coeff_base[tx_sz_ctx][ptype][ctx], want_level.min(3));
+            }
+            if level > 2 {
+                let ctx = coeff_br_ctx(&levels, stride, class, row, col, pos);
+                let mut want_rest = want_level.saturating_sub(3);
+                for _ in 0..4 {
+                    let sym = k.symbol(&mut cdf.coeff_br[tx_sz_ctx.min(3)][ptype][ctx], want_rest.min(3));
+                    want_rest = want_rest.saturating_sub(3);
+                    level += sym;
+                    if sym < 3 {
+                        break;
+                    }
+                }
+            }
+            levels[row * stride + col] = level as u8;
+            quant[pos] = level as u32;
+        }
+        // Signs and Golomb-coded remainders, in scan order.
+        for c in 0..eob {
+            let pos = scan[c] as usize;
+            let want = cb.quant[pos];
+            let mut sign = false;
+            if quant[pos] != 0 {
+                if c == 0 {
+                    let ctx = s.dc_sign_ctx;
+                    sign = k.symbol(&mut cdf.dc_sign[ptype][ctx], (want < 0) as usize) != 0;
+                } else {
+                    sign = k.literal(1, (want < 0) as u32) != 0;
+                }
+            }
+            if quant[pos] > 14 {
+                // Golomb code for the amount above 14.
+                let value = want.unsigned_abs();
+                let x_want = value.wrapping_sub(14);
+                let length_want = 32 - x_want.leading_zeros();
+                let mut length = 0u32;
+                loop {
+                    length += 1;
+                    let bit = k.literal(1, (length == length_want) as u32) != 0;
+                    if bit || length >= 32 {
+                        break;
+                    }
+                    if length > 20 {
+                        break;
+                    }
+                }
+                let mut x = 1u32;
+                for i in (0..length.saturating_sub(1)).rev() {
+                    let bit = k.literal(1, (x_want >> i) & 1);
+                    x = (x << 1) | bit;
+                }
+                quant[pos] = x.wrapping_add(14);
+            }
+            if pos == 0 && quant[pos] > 0 {
+                dc_category = if sign { 1 } else { 2 };
+            }
+            quant[pos] &= 0xfffff;
+            cul_level = cul_level.wrapping_add(quant[pos]);
+            cb.quant[pos] = if sign { -(quant[pos] as i32) } else { quant[pos] as i32 };
+        }
+        cul_level = cul_level.min(63);
+        cb.eob = eob;
+    }
+    TxbOut { eob, cul_level, dc_category }
 }
 
 /// `eob` → (eob_pt, extra bits) as in the encoder's `eob` binarization.

@@ -330,7 +330,7 @@ pub fn make_sequence_header(color: &ColorConfig, width: usize, height: usize) ->
         seq_force_screen_content_tools: obu::SELECT_SCREEN_CONTENT_TOOLS,
         seq_force_integer_mv: obu::SELECT_INTEGER_MV,
         enable_superres: false,
-        enable_cdef: false,
+        enable_cdef: true,
         enable_restoration: false,
         color: color.clone(),
         film_grain_params_present: false,
@@ -376,6 +376,8 @@ pub fn encode_picture(src: &Frame, color: &ColorConfig, p: &EncodeParams) -> Res
         tc.decode_tile()?;
         tc.c.finish()
     };
+    choose_filters(&mut fs, src, p.base_q_idx);
+    let hdr = fs.hdr.clone();
     let mut hw = BitWriter::new();
     obu_write::frame_header_bits(&seq, &hdr, &mut hw);
     let mut payload = hw.finish();
@@ -384,4 +386,135 @@ pub fn encode_picture(src: &Frame, color: &ColorConfig, p: &EncodeParams) -> Res
     data.extend(obu_write::write_obu(obu::OBU_FRAME, &payload));
     let recon = super::decoder::finish_frame(fs)?;
     Ok(Encoded { data, recon, seq, hdr })
+}
+
+/// Sum of squared differences over the visible area of one plane.
+fn plane_sse(a: &Frame, b: &Frame, plane: usize) -> f64 {
+    let (pa, pb) = (&a.planes[plane], &b.planes[plane]);
+    let (sx, sy) = if plane == 0 { (0, 0) } else { (a.sub_x as usize, a.sub_y as usize) };
+    let (w, h) = ((b.width + sx) >> sx, (b.height + sy) >> sy);
+    let mut sse = 0f64;
+    for y in 0..h {
+        let (ra, rb) = (pa.row(y), pb.row(y));
+        let mut acc = 0u64;
+        for x in 0..w {
+            let d = ra[x] as i64 - rb[x] as i64;
+            acc += (d * d) as u64;
+        }
+        sse += acc as f64;
+    }
+    sse
+}
+
+/// Pick the deblocking levels and the CDEF strengths that minimise the error against the source, and store them
+/// in the frame header. The entropy-coded data does not depend on them.
+fn choose_filters(fs: &mut FrameState, src: &Frame, base_q_idx: u8) {
+    use super::cdef::{CdefParams, cdef_frame};
+    use super::deblock::deblock_frame;
+    use super::decoder::{build_deblock, coded_frame};
+    if fs.hdr.coded_lossless {
+        return;
+    }
+    let np = fs.num_planes;
+    let mut cur0 = coded_frame(fs);
+    cur0.width = fs.hdr.frame_width;
+    cur0.height = fs.hdr.frame_height;
+    let (params0, mi) = build_deblock(fs);
+    let deblocked_with = |levels: [u8; 4]| -> Frame {
+        let mut f = cur0.clone();
+        let mut p = params0.clone();
+        p.filter_level = levels;
+        deblock_frame(&mut f, &p, &mi);
+        f
+    };
+    // Luma level: coarse scan then refinement.
+    let luma_cost = |l: u8| plane_sse(&deblocked_with([l, l, 0, 0]), src, 0);
+    let mut best = (luma_cost(0), 0u8);
+    for l in (4..=60).step_by(4) {
+        let c = luma_cost(l);
+        if c < best.0 {
+            best = (c, l);
+        }
+    }
+    for d in [-2i32, -1, 1, 2] {
+        let l = (best.1 as i32 + d).clamp(0, 63) as u8;
+        let c = luma_cost(l);
+        if c < best.0 {
+            best = (c, l);
+        }
+    }
+    let luma_level = best.1;
+    let mut levels = [luma_level, luma_level, 0, 0];
+    if luma_level > 0 && np > 1 {
+        for pl in 1..3 {
+            let cost = |l: u8| {
+                let mut lv = [luma_level, luma_level, 0, 0];
+                lv[1 + pl] = l;
+                plane_sse(&deblocked_with(lv), src, pl)
+            };
+            let mut b = (cost(0), 0u8);
+            for l in (4..=60).step_by(4) {
+                let c = cost(l);
+                if c < b.0 {
+                    b = (c, l);
+                }
+            }
+            for d in [-2i32, -1, 1, 2] {
+                let l = (b.1 as i32 + d).clamp(0, 63) as u8;
+                let c = cost(l);
+                if c < b.0 {
+                    b = (c, l);
+                }
+            }
+            levels[1 + pl] = b.1;
+        }
+    }
+    fs.hdr.loop_filter.level = levels;
+    let deblocked = deblocked_with(levels);
+
+    // CDEF: one strength set for the whole frame.
+    let damping = (3 + (base_q_idx >> 6)).min(6);
+    let skip: Vec<bool> = fs.skip.iter().map(|&s| s != 0).collect();
+    let mut out = deblocked.clone();
+    let mut cdef_cost = |y: (u8, u8), uv: (u8, u8), plane: usize| -> f64 {
+        let p = CdefParams {
+            damping,
+            bits: 0,
+            y_pri: [y.0; 8],
+            y_sec: [y.1; 8],
+            uv_pri: [uv.0; 8],
+            uv_sec: [uv.1; 8],
+        };
+        cdef_frame(&deblocked, &mut out, &p, &fs.cdef_idx, fs.cdef_stride, &skip, fs.mi_cols, fs.mi_rows);
+        plane_sse(&out, src, plane)
+    };
+    let pris = [0u8, 1, 2, 3, 4, 6, 8, 11, 15];
+    let secs = [0u8, 1, 2, 4];
+    let mut yb = (f64::MAX, (0u8, 0u8));
+    for &pr in &pris {
+        for &sc in &secs {
+            let c = cdef_cost((pr, sc), (0, 0), 0);
+            if c < yb.0 {
+                yb = (c, (pr, sc));
+            }
+        }
+    }
+    let mut uvb = (0.0, (0u8, 0u8));
+    if np > 1 {
+        uvb.0 = f64::MAX;
+        for &pr in &pris {
+            for &sc in &secs {
+                let c = cdef_cost(yb.1, (pr, sc), 1) + cdef_cost(yb.1, (pr, sc), 2);
+                if c < uvb.0 {
+                    uvb = (c, (pr, sc));
+                }
+            }
+        }
+    }
+    fs.hdr.cdef.damping = damping;
+    fs.hdr.cdef.bits = 0;
+    fs.hdr.cdef.y_pri[0] = yb.1.0;
+    fs.hdr.cdef.y_sec[0] = yb.1.1;
+    fs.hdr.cdef.uv_pri[0] = uvb.1.0;
+    fs.hdr.cdef.uv_sec[0] = uvb.1.1;
 }
