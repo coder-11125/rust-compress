@@ -15,3 +15,6 @@ pub mod obu;
 pub mod obu_write;
 pub mod qm_tables;
 pub mod tile;
+pub mod lr;
+pub mod superres;
+pub mod filmgrain;

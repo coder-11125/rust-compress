@@ -5,6 +5,9 @@ use super::cdef::{CdefParams, cdef_frame};
 use super::cdf_tables::Cdfs;
 use super::deblock::{DeblockMi, DeblockParams, deblock_frame};
 use super::entropy::SymbolDecoder;
+use super::filmgrain::{FilmGrainParams, apply_film_grain};
+use super::lr::{LrPlane, LrType, LrUnit, loop_restoration_frame};
+use super::superres::upscale_frame;
 use super::frame::{Frame, Plane};
 use super::obu::{self, FrameHeader, SequenceHeader};
 use super::tile::{FrameState, TileCoder};
@@ -40,6 +43,9 @@ pub fn decode(data: &[u8]) -> Result<Decoded> {
                 let s = seq.as_ref().ok_or_else(|| Error::invalid("AV1 frame before sequence header"))?;
                 let mut r = BitReader::new(o.payload);
                 let h = FrameHeader::parse(s, &mut r)?;
+                if std::env::var_os("AV1_DEBUG").is_some() {
+                    eprintln!("{s:?}\n{h:?}");
+                }
                 check_limits(s, &h)?;
                 let fs = FrameState::new(s, &h)?;
                 hdr = Some(h);
@@ -208,7 +214,42 @@ fn finish_frame(fs: FrameState) -> Result<Frame> {
         let skip: Vec<bool> = fs.skip.iter().map(|&s| s != 0).collect();
         cdef_frame(&cur, &mut filtered, &params, &fs.cdef_idx, fs.cdef_stride, &skip, fs.mi_cols, fs.mi_rows);
     }
-    let out = filtered;
+    let (mut deblocked, mut filtered) = (cur, filtered);
+    if hdr.use_superres {
+        deblocked = upscale_frame(&deblocked, hdr.upscaled_width, hdr.superres_denom as u8);
+        filtered = upscale_frame(&filtered, hdr.upscaled_width, hdr.superres_denom as u8);
+    }
+    let out = if hdr.lr.uses_lr {
+        let mut lr_planes = Vec::new();
+        for p in 0..fs.num_planes {
+            let (cols, rows, params) = &fs.lr_units[p];
+            let mut lp = LrPlane { unit_size: hdr.lr.unit_size[p].max(1), units_per_row: *cols, units_per_col: *rows, units: Vec::new() };
+            for u in params {
+                lp.units.push(LrUnit {
+                    kind: match u.kind {
+                        obu::RESTORE_WIENER => LrType::Wiener,
+                        obu::RESTORE_SGRPROJ => LrType::Sgrproj,
+                        _ => LrType::None,
+                    },
+                    wiener: u.wiener,
+                    sgr_set: u.sgr_set,
+                    sgr_xqd: u.sgr_xqd,
+                });
+            }
+            if params.is_empty() {
+                lp = LrPlane::new(64, 1, 1);
+            }
+            lr_planes.push(lp);
+        }
+        let mut dst = filtered.clone();
+        deblocked.width = hdr.upscaled_width;
+        filtered.width = hdr.upscaled_width;
+        dst.width = hdr.upscaled_width;
+        loop_restoration_frame(&filtered, &deblocked, &mut dst, &lr_planes);
+        dst
+    } else {
+        filtered
+    };
     let (w, h) = (hdr.upscaled_width, hdr.frame_height);
     let mut planes = Vec::new();
     for (p, plane) in out.planes.iter().enumerate() {
@@ -220,12 +261,43 @@ fn finish_frame(fs: FrameState) -> Result<Frame> {
         }
         planes.push(o);
     }
-    Ok(Frame {
+    let frame = Frame {
         planes,
         bit_depth: fs.seq.color.bit_depth,
         sub_x: fs.seq.color.sub_x,
         sub_y: fs.seq.color.sub_y,
         width: w,
         height: h,
-    })
+    };
+    let g = &hdr.film_grain;
+    if !g.apply_grain {
+        return Ok(frame);
+    }
+    let mut p = FilmGrainParams { apply_grain: true, grain_seed: g.grain_seed, ..Default::default() };
+    p.num_y_points = g.num_y_points as u8;
+    p.point_y_value.copy_from_slice(&g.point_y_value[..14]);
+    p.point_y_scaling.copy_from_slice(&g.point_y_scaling[..14]);
+    p.chroma_scaling_from_luma = g.chroma_scaling_from_luma;
+    p.num_cb_points = g.num_cb_points as u8;
+    p.point_cb_value.copy_from_slice(&g.point_cb_value[..10]);
+    p.point_cb_scaling.copy_from_slice(&g.point_cb_scaling[..10]);
+    p.num_cr_points = g.num_cr_points as u8;
+    p.point_cr_value.copy_from_slice(&g.point_cr_value[..10]);
+    p.point_cr_scaling.copy_from_slice(&g.point_cr_scaling[..10]);
+    p.grain_scaling_minus_8 = g.grain_scaling_minus_8;
+    p.ar_coeff_lag = g.ar_coeff_lag;
+    p.ar_coeffs_y_plus_128 = g.ar_coeffs_y_plus_128;
+    p.ar_coeffs_cb_plus_128 = g.ar_coeffs_cb_plus_128;
+    p.ar_coeffs_cr_plus_128 = g.ar_coeffs_cr_plus_128;
+    p.ar_coeff_shift_minus_6 = g.ar_coeff_shift_minus_6;
+    p.grain_scale_shift = g.grain_scale_shift;
+    p.cb_mult = g.cb_mult;
+    p.cb_luma_mult = g.cb_luma_mult;
+    p.cb_offset = g.cb_offset;
+    p.cr_mult = g.cr_mult;
+    p.cr_luma_mult = g.cr_luma_mult;
+    p.cr_offset = g.cr_offset;
+    p.overlap_flag = g.overlap_flag;
+    p.clip_to_restricted_range = g.clip_to_restricted_range;
+    Ok(apply_film_grain(&frame, &p, fs.seq.color.matrix_coefficients == 0))
 }
