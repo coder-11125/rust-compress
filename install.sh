@@ -73,9 +73,10 @@ tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT HUP INT TERM
 
 info "Downloading $asset ..."
-curl -fsSL "$download" -o "$tmp/$asset" || err "download failed: $download"
+curl -fsSL --retry 3 --retry-delay 2 --connect-timeout 20 "$download" -o "$tmp/$asset" ||
+    err "download failed: $download"
 
-if curl -fsSL "$download.sha256" -o "$tmp/$asset.sha256" 2>/dev/null; then
+if curl -fsSL --retry 3 --retry-delay 2 --connect-timeout 20 "$download.sha256" -o "$tmp/$asset.sha256" 2>/dev/null; then
     expected=$(cut -d ' ' -f 1 "$tmp/$asset.sha256")
     actual=$(sha256 "$tmp/$asset")
     [ "$expected" = "$actual" ] || err "checksum mismatch for $asset"

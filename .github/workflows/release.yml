@@ -15,7 +15,9 @@ jobs:
         include:
           - { os: ubuntu-latest, target: x86_64-unknown-linux-gnu, archive: tar.gz }
           - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu, archive: tar.gz }
-          - { os: macos-13, target: x86_64-apple-darwin, archive: tar.gz }
+          # Cross-compile the Intel build on an arm64 runner: macos-13 is the last hosted Intel
+          # image and jobs there can queue for a long time. Pure-Rust means no C toolchain is needed.
+          - { os: macos-latest, target: x86_64-apple-darwin, archive: tar.gz }
           - { os: macos-latest, target: aarch64-apple-darwin, archive: tar.gz }
           - { os: windows-latest, target: x86_64-pc-windows-msvc, archive: zip }
     runs-on: ${{ matrix.os }}
