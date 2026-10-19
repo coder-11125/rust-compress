@@ -6,7 +6,7 @@ use std::fs;
 use tempfile::tempdir;
 
 fn cmd() -> Command {
-    Command::cargo_bin("rust-compress").unwrap()
+    Command::cargo_bin("rc").unwrap()
 }
 
 fn run(input: &[u8], ext: &str, args: &[&str]) -> (Vec<u8>, String) {

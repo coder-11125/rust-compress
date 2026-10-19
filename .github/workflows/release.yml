@@ -32,11 +32,11 @@ jobs:
           mkdir "$name"
           cp LICENSE README.md "$name/"
           if [ "${{ matrix.archive }}" = "zip" ]; then
-            cp "target/${{ matrix.target }}/release/rust-compress.exe" "$name/"
+            cp "target/${{ matrix.target }}/release/rc.exe" "$name/"
             7z a "$name.zip" "$name"
             echo "ASSET=$name.zip" >> "$GITHUB_ENV"
           else
-            cp "target/${{ matrix.target }}/release/rust-compress" "$name/"
+            cp "target/${{ matrix.target }}/release/rc" "$name/"
             tar czf "$name.tar.gz" "$name"
             echo "ASSET=$name.tar.gz" >> "$GITHUB_ENV"
           fi

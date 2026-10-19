@@ -5,7 +5,7 @@ use std::fs;
 use tempfile::tempdir;
 
 fn cmd() -> Command {
-    Command::cargo_bin("rust-compress").unwrap()
+    Command::cargo_bin("rc").unwrap()
 }
 
 fn put(dir: &std::path::Path, name: &str, fixture_name: &str) -> std::path::PathBuf {

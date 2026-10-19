@@ -8,7 +8,7 @@ use std::fs;
 use tempfile::tempdir;
 
 fn cmd() -> Command {
-    Command::cargo_bin("rust-compress").unwrap()
+    Command::cargo_bin("rc").unwrap()
 }
 
 /// Little-endian EXIF: IFD0 {orientation, ExifIFD}, ExifIFD {PixelX, PixelY}, then a fake thumbnail.

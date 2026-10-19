@@ -25,7 +25,7 @@ pub enum SubsamplingArg {
 
 /// Fast, high-quality image compression (PNG and JPEG) with a from-scratch engine.
 #[derive(Parser, Debug)]
-#[command(name = "rust-compress", version, about)]
+#[command(name = "rc", version, about)]
 pub struct Cli {
     /// Image files and/or directories to compress. Use `-` to read one image from standard input.
     #[arg(required = true, value_name = "INPUT")]

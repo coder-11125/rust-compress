@@ -108,7 +108,7 @@ mod cli {
     use tempfile::tempdir;
 
     fn cmd() -> Command {
-        Command::cargo_bin("rust-compress").unwrap()
+        Command::cargo_bin("rc").unwrap()
     }
 
     #[test]

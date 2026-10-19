@@ -3,16 +3,16 @@
 A fast command-line image compressor for **PNG**, **JPEG**, **WebP** and **AVIF** (GIF files can be converted). The compression engine is written from scratch in Rust — DEFLATE, PNG, JPEG, GIF, WebP (lossless and lossy) and AVIF (AV1) codecs, Huffman coding, DCT, color quantization — with no codec crates. Only [`clap`](https://crates.io/crates/clap) (argument parsing) and [`rayon`](https://crates.io/crates/rayon) (parallelism) are dependencies.
 
 ```
-rust-compress photo.jpg                 # -> photo.min.jpg next to the original
-rust-compress ./images -r -o ./out      # whole tree, mirrored into ./out
-rust-compress shot.png --lossy          # palette quantization: usually 50-70% smaller
-rust-compress *.png -l 9 --in-place     # squeeze harder (slow), only replace if smaller
-rust-compress logo.png -f jpeg -q 85    # convert while compressing
-rust-compress photo.jpg --target-ssim 0.95   # lowest quality that still scores SSIM >= 0.95
-rust-compress shot.png -f webp          # lossless WebP: ~20% smaller than the optimised PNG
-rust-compress big.jpg --resize 1920x    # shrink to fit 1920 px wide (never enlarges)
-rust-compress photo.jpg --keep-metadata # keep EXIF / XMP / comments
-cat in.png | rust-compress - > out.png  # stdin to stdout
+rc photo.jpg                 # -> photo.min.jpg next to the original
+rc ./images -r -o ./out      # whole tree, mirrored into ./out
+rc shot.png --lossy          # palette quantization: usually 50-70% smaller
+rc *.png -l 9 --in-place     # squeeze harder (slow), only replace if smaller
+rc logo.png -f jpeg -q 85    # convert while compressing
+rc photo.jpg --target-ssim 0.95   # lowest quality that still scores SSIM >= 0.95
+rc shot.png -f webp          # lossless WebP: ~20% smaller than the optimised PNG
+rc big.jpg --resize 1920x    # shrink to fit 1920 px wide (never enlarges)
+rc photo.jpg --keep-metadata # keep EXIF / XMP / comments
+cat in.png | rc - > out.png  # stdin to stdout
 ```
 
 ## What it does
@@ -62,7 +62,7 @@ cat in.png | rust-compress - > out.png  # stdin to stdout
 ## Usage
 
 ```
-rust-compress [OPTIONS] <INPUT>...
+rc [OPTIONS] <INPUT>...
 
   -r, --recursive         descend into subdirectories
   -o, --output <PATH>     output file (one input file) or directory (mirrors the input tree)
@@ -118,7 +118,7 @@ What it offers beyond ratio: no C dependencies, one binary for all of these form
 ## Build
 
 ```
-cargo build --release        # binary: target/release/rust-compress
+cargo build --release        # binary: target/release/rc
 cargo test                   # unit + integration tests (cross-checked against the `image` crate)
 cargo clippy --all-targets -- -D warnings
 ```
