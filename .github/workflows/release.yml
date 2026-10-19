@@ -29,18 +29,33 @@ jobs:
         shell: bash
         run: |
           name="rust-compress-${GITHUB_REF_NAME}-${{ matrix.target }}"
+          hash_file() {
+            if command -v sha256sum >/dev/null 2>&1; then
+              sha256sum "$1" > "$1.sha256"
+            elif command -v shasum >/dev/null 2>&1; then
+              shasum -a 256 "$1" > "$1.sha256"
+            else
+              openssl dgst -sha256 -r "$1" > "$1.sha256"
+            fi
+          }
           mkdir "$name"
           cp LICENSE README.md "$name/"
           if [ "${{ matrix.archive }}" = "zip" ]; then
             cp "target/${{ matrix.target }}/release/rc.exe" "$name/"
             7z a "$name.zip" "$name"
+            hash_file "$name.zip"
             echo "ASSET=$name.zip" >> "$GITHUB_ENV"
+            echo "CHECKSUM=$name.zip.sha256" >> "$GITHUB_ENV"
           else
             cp "target/${{ matrix.target }}/release/rc" "$name/"
             tar czf "$name.tar.gz" "$name"
+            hash_file "$name.tar.gz"
             echo "ASSET=$name.tar.gz" >> "$GITHUB_ENV"
+            echo "CHECKSUM=$name.tar.gz.sha256" >> "$GITHUB_ENV"
           fi
       - uses: softprops/action-gh-release@v2
         with:
-          files: ${{ env.ASSET }}
+          files: |
+            ${{ env.ASSET }}
+            ${{ env.CHECKSUM }}
           generate_release_notes: true

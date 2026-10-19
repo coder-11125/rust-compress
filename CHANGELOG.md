@@ -8,7 +8,8 @@
 - PNG: binary-tree match finder and dual-seed cost refinement for levels 7-9; bigram and brute-force
   filter strategies. Level 7 matches or beats `oxipng -o2` and level 9 matches or beats `oxipng -o4`
   on most images.
-- Packaging: MIT license, crate metadata, CI and release workflows.
+- Packaging: MIT license, crate metadata, CI and release workflows, a `curl | sh` installer and
+  SHA-256 checksums for the release binaries.
 - Lossless WebP (VP8L) reading and writing; GIF (still) input; CMYK/YCCK JPEG transcoding; animated PNG
   and lossy/animated WebP are passed through untouched instead of failing.
 - `--keep-metadata` (EXIF, XMP, comments, PNG text/time/density, converted between formats),

@@ -2,6 +2,22 @@
 
 A fast command-line image compressor for **PNG**, **JPEG**, **WebP** and **AVIF** (GIF files can be converted). The compression engine is written from scratch in Rust — DEFLATE, PNG, JPEG, GIF, WebP (lossless and lossy) and AVIF (AV1) codecs, Huffman coding, DCT, color quantization — with no codec crates. Only [`clap`](https://crates.io/crates/clap) (argument parsing) and [`rayon`](https://crates.io/crates/rayon) (parallelism) are dependencies.
 
+## Install
+
+```
+curl -fsSL https://raw.githubusercontent.com/coder-11125/rust-compress/main/install.sh | sh
+```
+
+Installs the `rc` binary for Linux or macOS (x86_64 or arm64) from the latest GitHub release. It goes to `/usr/local/bin` when that directory is writable, otherwise to `~/.local/bin`. To pin a release or choose a directory:
+
+```
+curl -fsSL https://raw.githubusercontent.com/coder-11125/rust-compress/main/install.sh | RC_VERSION=v0.1.0 RC_INSTALL_DIR="$HOME/bin" sh
+```
+
+Windows users can download the `.zip` asset from the [releases page](https://github.com/coder-11125/rust-compress/releases). To build from source instead, see [Build](#build).
+
+## Quick start
+
 ```
 rc photo.jpg                 # -> photo.min.jpg next to the original
 rc ./images -r -o ./out      # whole tree, mirrored into ./out
