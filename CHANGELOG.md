@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+## 0.1.0 - 19-10-2026
+
+- Initial release: fast PNG and JPEG compression with a from-scratch engine (DEFLATE, PNG, JPEG).
 - PNG: binary-tree match finder and dual-seed cost refinement for levels 7-9; bigram and brute-force
   filter strategies. Level 7 matches or beats `oxipng -o2` and level 9 matches or beats `oxipng -o4`
   on most images.
@@ -16,7 +19,3 @@
   writer (grids, alpha, transforms, ICC/EXIF/XMP) and a rate-distortion intra encoder (`-f avif -q N`). See
   `THIRD_PARTY_NOTICES.md` for the generated tables.
 - Hostile-input mutation tests for every decoder.
-
-## 0.1.0
-
-- Initial release: PNG and JPEG compression with a from-scratch engine.

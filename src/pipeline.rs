@@ -274,8 +274,9 @@ fn run(job: &Job, cli: &Cli, data: &[u8]) -> Result<(Status, u64, Option<String>
     if !cli.in_place && !cli.force && !cli.dry_run && !is_stdio(&job.output) && job.output.exists() {
         return Err(Error::unsupported(format!("{} already exists (use --force)", job.output.display())));
     }
-    // Recompressing an animation as a still would drop every frame but the first, and lossy WebP has
-    // no decoder here, so such files are left exactly as they are.
+    // Recompressing an animation as a still would drop every frame but the first. Lossy WebP and
+    // lossy AVIF are left as they are unless --lossy explicitly asks for a re-encode (otherwise a
+    // re-encode would only add generation loss).
     let untouchable = match (in_fmt, out_fmt) {
         (Format::Png, Format::Png) if png::is_animated(data) => Some("animated PNG left unchanged"),
         (Format::Webp, Format::Webp) => crate::webp::unsupported_reason(data)

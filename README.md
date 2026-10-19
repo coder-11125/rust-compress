@@ -44,7 +44,7 @@ cat in.png | rc - > out.png  # stdin to stdout
 **WebP (lossless)** — full VP8L encoder and decoder:
 - Encoder tries a palette transform (bundling up to 8 pixels per symbol) or subtract-green + per-tile predictor + cross-color decorrelation, ranks the pipelines with a cheap estimate and fully encodes the best ones.
 - LZ77 with the format's 2-D distance codes, an optimal (cost-model driven) parse, a colour cache sized by trial, and **entropy-clustered prefix-code groups**: image tiles with similar statistics share one set of codes.
-- 8-bit only: 16-bit inputs are reduced to 8-bit (the report note says so). Images are limited to 16384×16384 by the format. Lossy WebP (VP8) cannot be decoded: such files are left untouched when the format is kept and are an error when a conversion is requested. Animated WebP is treated the same way.
+- 8-bit only: 16-bit inputs are reduced to 8-bit (the report note says so). Images are limited to 16384×16384 by the format. Lossy WebP (VP8) is decoded for conversions or an explicit `--lossy` re-encode; when the format is kept it is left untouched, since recompressing it would only add generation loss. Animated WebP is treated the same way.
 
 **Other formats**
 - GIF files (still images: palettes, interlacing, transparency) convert to PNG, JPEG or WebP with `-f`. Animated GIFs are refused with a clear message. There is no GIF output, so directory runs only pick up `.gif` files when `-f` names a target.

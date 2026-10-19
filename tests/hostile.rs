@@ -91,6 +91,12 @@ fn exercise_webp(bytes: &[u8]) {
 
 type Exercise = fn(&[u8]);
 
+/// Per-case wall-clock budget. This is a hang detector, not a speed benchmark: debug builds
+/// running the hostile suites in parallel on a small machine can be several times slower than a
+/// release build on one core, so the budget is deliberately generous. A real hang never finishes
+/// and is still caught.
+const CASE_BUDGET: Duration = Duration::from_secs(60);
+
 /// Apply `exercise` to many damaged variants of `original`; collect panics and slow runs.
 fn hammer(name: &str, original: &[u8], exercise: Exercise, failures: &mut Vec<String>) {
     let mut cases: Vec<(String, Vec<u8>)> = Vec::new();
@@ -122,7 +128,7 @@ fn hammer(name: &str, original: &[u8], exercise: Exercise, failures: &mut Vec<St
         let r = catch_unwind(AssertUnwindSafe(|| exercise(&bytes)));
         if r.is_err() {
             failures.push(format!("{name} {label}: panicked"));
-        } else if start.elapsed() > Duration::from_secs(10) {
+        } else if start.elapsed() > CASE_BUDGET {
             failures.push(format!("{name} {label}: took {:?}", start.elapsed()));
         }
     }
