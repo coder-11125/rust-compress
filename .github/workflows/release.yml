@@ -27,6 +27,43 @@ jobs:
         with:
           targets: ${{ matrix.target }}
       - run: cargo build --release --locked --target ${{ matrix.target }}
+      - name: Prepare release notes
+        shell: bash
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          {
+            cat <<'HEADER'
+          Fast PNG, JPEG, WebP and AVIF compression with a from-scratch engine and no codec dependencies.
+
+          ## Install
+
+          ```sh
+          curl -fsSL https://raw.githubusercontent.com/coder-11125/rust-compress/main/install.sh | sh
+          ```
+
+          Detects Linux or macOS on x86_64/arm64 and installs the `rc` binary to `/usr/local/bin`, or
+          `~/.local/bin` when that is not writable. Pin a release with `RC_VERSION=v0.1.0` or choose a
+          directory with `RC_INSTALL_DIR`. Windows users can download the `.zip` asset below.
+
+          ## Changes
+          HEADER
+            awk -v ver="$version" '
+              $0 ~ "^## " ver "([ -]|$)" { found = 1; next }
+              found && /^## / { exit }
+              found { print }
+            ' CHANGELOG.md
+            cat <<'FOOTER'
+
+          ## Verifying downloads
+
+          Every archive has a `.sha256` sidecar:
+
+          ```sh
+          shasum -a 256 -c rust-compress-<tag>-<target>.tar.gz.sha256   # macOS
+          sha256sum -c rust-compress-<tag>-<target>.tar.gz.sha256      # Linux
+          ```
+          FOOTER
+          } > release-notes.md
       - name: Package
         shell: bash
         run: |
@@ -57,7 +94,7 @@ jobs:
           fi
       - uses: softprops/action-gh-release@v2
         with:
+          body_path: release-notes.md
           files: |
             ${{ env.ASSET }}
             ${{ env.CHECKSUM }}
-          generate_release_notes: true
