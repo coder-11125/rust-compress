@@ -14,6 +14,16 @@ pub enum FormatArg {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum BitDepthArg {
+    /// 10 bits for 16-bit sources, otherwise 8.
+    Auto,
+    #[value(name = "8")]
+    B8,
+    #[value(name = "10")]
+    B10,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 pub enum SubsamplingArg {
     /// 4:4:4 for quality >= 90, otherwise 4:2:0.
     Auto,
@@ -55,6 +65,10 @@ pub struct Cli {
     /// JPEG chroma subsampling.
     #[arg(long, value_enum, default_value_t = SubsamplingArg::Auto)]
     pub subsampling: SubsamplingArg,
+
+    /// AVIF output bit depth: auto keeps 16-bit sources at 10 bits, everything else at 8.
+    #[arg(long, value_enum, default_value_t = BitDepthArg::Auto)]
+    pub bit_depth: BitDepthArg,
 
     /// Allow lossy output: PNG palette quantization, lossy (VP8) WebP when the output is WebP, or re-encoding an AVIF source (AVIF is otherwise left unchanged).
     #[arg(long)]

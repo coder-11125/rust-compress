@@ -53,9 +53,9 @@ cat in.png | rc - > out.png  # stdin to stdout
 
 **AVIF** — a from-scratch AV1 still-picture decoder and intra encoder inside a HEIF container (`-f avif -q N`):
 - The decoder implements the AV1 intra-frame toolset: all partition types, intra modes (directional with edge filtering and upsampling, smooth, Paeth, filter-intra, chroma-from-luma, palette), every transform size and type, segmentation, delta-q/lf, quantizer matrices, the deblocking filter, CDEF, loop restoration (Wiener and self-guided), super-resolution and film grain, in 8/10/12 bits and 4:0:0/4:2:0/4:2:2/4:4:4. Output matches dav1d bit for bit on streams from libaom, SVT-AV1, rav1e and ffmpeg, and libavif/Pillow pixel for pixel (±1 from chroma upsampling). Containers: single images, grids, alpha auxiliary images (also premultiplied), `clap`/`irot`/`imir`, `colr` nclx and ICC, EXIF and XMP. Inter prediction and intra block copy are not implemented: for an animated (`avis`) file only the first, intra-coded picture is decoded. Bit depths above 8 and 4:2:2 are implemented but have had less cross-checking than 8-bit 4:2:0 / 4:4:4.
-- The encoder is lossy only. It searches partitions, intra modes with angle deltas, chroma-from-luma and transform sizes per superblock by rate-distortion cost using the real adaptive entropy-coder state, then picks the deblocking level and CDEF strengths by measured error, and chooses a loop-restoration filter (Wiener or self-guided) per unit. Restoration parameters live inside the tile data, so the tiles are written a second time from the decisions already made. Output is 8-bit 4:2:0 (4:4:4 at `-q 90` and up, or `--subsampling 444`) or monochrome for gray images; transparency is a monochrome auxiliary image. ICC, EXIF (with `--keep-metadata`) and XMP are stored. Streams decode identically in dav1d, libaom and Pillow.
+- The encoder is lossy only. It searches partitions, intra modes with angle deltas, chroma-from-luma and transform sizes per superblock by rate-distortion cost using the real adaptive entropy-coder state, then picks the deblocking level and CDEF strengths by measured error, and chooses a loop-restoration filter (Wiener or self-guided) per unit. Restoration parameters live inside the tile data, so the tiles are written a second time from the decisions already made. Output is 8-bit or 10-bit (`--bit-depth auto|8|10`; auto keeps 16-bit sources at 10 bits) 4:2:0 (4:4:4 at `-q 90` and up, or `--subsampling 444`) or monochrome for gray images; transparency is a monochrome auxiliary image. ICC, EXIF (with `--keep-metadata`) and XMP are stored. Streams decode identically in dav1d, libaom and Pillow.
 - AVIF inputs are left untouched unless `--lossy` is given, since re-encoding only adds generation loss.
-- The encoder is considerably slower than the JPEG/WebP ones and about the size of libaom (`cpu-used 4`) at equal RGB PSNR: on eight photos and screenshots, −6.5% on average, from −26% to +4.3% per image, both decoded through the same dav1d/ffmpeg path; palette, filter-intra, intra block copy, inter tools and 10-bit output are not implemented in the encoder.
+- The encoder is considerably slower than the JPEG/WebP ones and about the size of libaom (`cpu-used 4`) at equal RGB PSNR: on eight photos and screenshots, −6.5% on average, from −26% to +4.3% per image, both decoded through the same dav1d/ffmpeg path; palette, filter-intra, intra block copy and inter tools are not implemented in the encoder.
 
 **WebP (lossless)** — full VP8L encoder and decoder:
 - Encoder tries a palette transform (bundling up to 8 pixels per symbol) or subtract-green + per-tile predictor + cross-color decorrelation, ranks the pipelines with a cheap estimate and fully encodes the best ones.
@@ -63,9 +63,10 @@ cat in.png | rc - > out.png  # stdin to stdout
 - 8-bit only: 16-bit inputs are reduced to 8-bit (the report note says so). Images are limited to 16384×16384 by the format. Lossy WebP (VP8) is decoded for conversions or an explicit `--lossy` re-encode; when the format is kept it is left untouched, since recompressing it would only add generation loss. Animated WebP is treated the same way.
 
 **Other formats**
-- GIF files (still images: palettes, interlacing, transparency) convert to PNG, JPEG or WebP with `-f`. Animated GIFs are refused with a clear message. There is no GIF output, so directory runs only pick up `.gif` files when `-f` names a target.
+- GIF files (still images: palettes, interlacing, transparency) convert to PNG, JPEG or WebP with `-f`. Animated GIFs convert to PNG or JPEG only as a refusal with a clear message; with `-f avif` they become animated AVIF. There is no GIF output, so directory runs only pick up `.gif` files when `-f` names a target.
 - CMYK and YCCK JPEGs are transcoded losslessly in the DCT domain (identical coefficients, Adobe colour flag kept); converting or resizing them goes through RGB.
-- Animated PNGs are passed through unchanged instead of failing the batch.
+- Animated PNGs are passed through unchanged instead of failing the batch, unless `-f avif` asks for an animated AVIF.
+- **Animations** — animated GIF, APNG, animated WebP and animated AVIF inputs convert to an animated AVIF (`-f avif`; with `--lossy` for AVIF inputs): full-canvas frames with the files' disposal and blend rules, per-frame durations and looping, alpha as a second track, every frame a key frame (no inter prediction yet), frames encoded in parallel. Output decodes in libavif and dav1d. Animated AVIF files whose frames use inter prediction (most files from libavif or ffmpeg) cannot be read yet. A finite repeat count is played forever.
 
 **Metadata** — only color information survives by default (ICC profile, PNG color chunks). `--keep-metadata` also keeps EXIF, XMP, JPEG comments / Photoshop blocks and PNG text, time and pixel-density chunks. EXIF and XMP carry across PNG ↔ JPEG ↔ WebP conversions; when an orientation is baked into the pixels the EXIF orientation is reset, its recorded dimensions are corrected and a now-stale thumbnail is dropped.
 
@@ -86,6 +87,7 @@ rc [OPTIONS] <INPUT>...
   -q, --quality <1-100>   JPEG quality ceiling (default 80)
   -f, --format <FMT>      keep | png | jpeg | webp | avif (default keep)
       --subsampling <S>   auto | 444 | 420
+      --bit-depth <D>     AVIF output: auto | 8 | 10 (auto: 10 for 16-bit sources)
       --lossy             PNG palette quantization, lossy WebP with -f webp, or re-encode an AVIF input (-q = quality)
       --colors <2-256>    with --lossy (default 256)
       --dither <0.0-1.0>  with --lossy (default 0.5)
@@ -161,8 +163,8 @@ tests/          codec round trips, reference-decoder cross-checks, hostile input
 
 ## Limitations
 
-- Formats: PNG, JPEG, WebP (lossless and lossy) and AVIF in and out; GIF in (stills). No animated output. JPEG: 8-bit Huffman, 1, 3 or 4 components (no arithmetic coding or 12-bit).
-- WebP and AVIF output are 8-bit: 16-bit sources lose precision on conversion.
+- Formats: PNG, JPEG, WebP (lossless and lossy) and AVIF in and out; GIF in. Animated output only as AVIF. JPEG: 8-bit Huffman, 1, 3 or 4 components (no arithmetic coding or 12-bit).
+- WebP output is 8-bit, and AVIF output is 8-bit unless the source is 16-bit or `--bit-depth 10` is given.
 - CMYK JPEGs are never requantized (`-q` does not apply to them); YCCK decoding is covered by unit tests but has no real-file fixture.
 - EXIF/XMP/comments are dropped unless `--keep-metadata` is given. An EXIF block too large for a JPEG segment (over 64 KB) cannot be carried into a JPEG.
 - Resizing only shrinks and filters in gamma-encoded space.

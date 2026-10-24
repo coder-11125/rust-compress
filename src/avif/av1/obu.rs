@@ -111,7 +111,12 @@ pub struct SequenceHeader {
     pub use_128x128_superblock: bool,
     pub enable_filter_intra: bool,
     pub enable_intra_edge_filter: bool,
+    pub enable_interintra_compound: bool,
+    pub enable_masked_compound: bool,
+    pub enable_warped_motion: bool,
+    pub enable_dual_filter: bool,
     pub enable_order_hint: bool,
+    pub enable_jnt_comp: bool,
     pub enable_ref_frame_mvs: bool,
     pub seq_force_screen_content_tools: u8,
     pub seq_force_integer_mv: u8,
@@ -202,13 +207,13 @@ impl SequenceHeader {
         s.seq_force_screen_content_tools = SELECT_SCREEN_CONTENT_TOOLS;
         s.seq_force_integer_mv = SELECT_INTEGER_MV;
         if !s.reduced_still_picture_header {
-            r.flag()?; // enable_interintra_compound
-            r.flag()?; // enable_masked_compound
-            r.flag()?; // enable_warped_motion
-            r.flag()?; // enable_dual_filter
+            s.enable_interintra_compound = r.flag()?;
+            s.enable_masked_compound = r.flag()?;
+            s.enable_warped_motion = r.flag()?;
+            s.enable_dual_filter = r.flag()?;
             s.enable_order_hint = r.flag()?;
             if s.enable_order_hint {
-                r.flag()?; // enable_jnt_comp
+                s.enable_jnt_comp = r.flag()?;
                 s.enable_ref_frame_mvs = r.flag()?;
             }
             if r.flag()? {

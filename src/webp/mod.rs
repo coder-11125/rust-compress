@@ -1,5 +1,5 @@
-//! WebP: container handling, the lossless (VP8L) codec and the lossy (VP8) codec. Animated files
-//! are refused.
+//! WebP: container handling, the lossless (VP8L) codec and the lossy (VP8) codec. [`decode`] refuses animated
+//! files; [`decode_animation`] reads them.
 
 pub mod alpha;
 pub mod cluster;
@@ -7,6 +7,7 @@ pub mod vp8;
 pub mod vp8l;
 pub mod vp8l_enc;
 
+use crate::animation::Animation;
 use crate::error::{Error, Result};
 use crate::image::{ColorType, Image, MAX_PIXELS, Metadata};
 
@@ -61,18 +62,26 @@ pub fn unsupported_reason(data: &[u8]) -> Option<&'static str> {
 
 pub fn decode(data: &[u8]) -> Result<Image> {
     let chunks = chunks(data)?;
+    for c in &chunks {
+        match &c.id {
+            b"VP8X" if c.body.first().is_some_and(|f| f & 0x02 != 0) => {
+                return Err(Error::unsupported("animated WebP"));
+            }
+            b"ANIM" | b"ANMF" => return Err(Error::unsupported("animated WebP")),
+            _ => {}
+        }
+    }
+    image_from_chunks(&chunks)
+}
+
+/// The picture described by the chunks of one image (a whole still file, or the payload of an animation frame).
+fn image_from_chunks(chunks: &[Chunk<'_>]) -> Result<Image> {
     let mut meta = Metadata::default();
     let mut lossless: Option<&[u8]> = None;
     let mut lossy_data: Option<&[u8]> = None;
     let mut alpha_data: Option<&[u8]> = None;
-    for c in &chunks {
+    for c in chunks {
         match &c.id {
-            b"VP8X" => {
-                if c.body.first().is_some_and(|f| f & 0x02 != 0) {
-                    return Err(Error::unsupported("animated WebP"));
-                }
-            }
-            b"ANIM" | b"ANMF" => return Err(Error::unsupported("animated WebP")),
             b"VP8L" if lossless.is_none() => lossless = Some(c.body),
             b"VP8 " if lossy_data.is_none() => lossy_data = Some(c.body),
             b"ALPH" if alpha_data.is_none() => alpha_data = Some(c.body),
@@ -119,6 +128,117 @@ pub fn decode(data: &[u8]) -> Result<Image> {
     let mut img = Image::new(d.width as u32, d.height as u32, color, 8, out)?;
     img.meta = meta;
     Ok(img)
+}
+
+/// Chunks packed back to back, as inside an `ANMF` payload.
+fn sub_chunks(body: &[u8]) -> Result<Vec<Chunk<'_>>> {
+    let mut pos = 0;
+    let mut out = Vec::new();
+    while pos + 8 <= body.len() {
+        let id: [u8; 4] = body[pos..pos + 4].try_into().unwrap();
+        let len = u32::from_le_bytes(body[pos + 4..pos + 8].try_into().unwrap()) as usize;
+        let end = pos.checked_add(8).and_then(|p| p.checked_add(len)).filter(|&e| e <= body.len());
+        let end = end.ok_or_else(|| Error::invalid("truncated WebP frame chunk"))?;
+        out.push(Chunk { id, body: &body[pos + 8..end] });
+        pos = end + (len & 1);
+    }
+    Ok(out)
+}
+
+fn le24(b: &[u8]) -> usize {
+    b[0] as usize | (b[1] as usize) << 8 | (b[2] as usize) << 16
+}
+
+/// Every frame of an animated WebP as the canvas it produces (8-bit RGBA, or RGB when nothing is transparent).
+/// A still WebP gives a one-frame animation.
+pub fn decode_animation(data: &[u8]) -> Result<Animation> {
+    use crate::animation::{AnimFrame, MAX_ANIMATION_PIXELS, normalize_delay};
+    let list = chunks(data)?;
+    let animated = list.iter().any(|c| &c.id == b"ANMF");
+    if !animated {
+        let img = decode(data)?;
+        return Ok(Animation {
+            width: img.width,
+            height: img.height,
+            frames: vec![AnimFrame { image: img, duration_ms: crate::animation::DEFAULT_DELAY_MS }],
+            loop_forever: false,
+        });
+    }
+    let vp8x = list
+        .iter()
+        .find(|c| &c.id == b"VP8X" && c.body.len() >= 10)
+        .ok_or_else(|| Error::invalid("animated WebP without VP8X"))?;
+    let (cw, ch) = (le24(&vp8x.body[4..7]) + 1, le24(&vp8x.body[7..10]) + 1);
+    if (cw as u64) * (ch as u64) > MAX_PIXELS {
+        return Err(Error::invalid("bad WebP canvas size"));
+    }
+    let loop_forever = list
+        .iter()
+        .find(|c| &c.id == b"ANIM" && c.body.len() >= 6)
+        .is_none_or(|c| u16::from_le_bytes([c.body[4], c.body[5]]) != 1);
+    let mut canvas = vec![0u8; cw * ch * 4];
+    let mut shown: Vec<(Vec<u8>, u32)> = Vec::new();
+    let mut prev: Option<(bool, usize, usize, usize, usize)> = None;
+    for c in list.iter().filter(|c| &c.id == b"ANMF") {
+        if c.body.len() < 16 {
+            return Err(Error::invalid("short ANMF chunk"));
+        }
+        if (shown.len() as u64 + 1) * (cw as u64) * (ch as u64) > MAX_ANIMATION_PIXELS {
+            return Err(Error::unsupported("WebP animation too large"));
+        }
+        let b = c.body;
+        let (x, y) = (le24(&b[0..3]) * 2, le24(&b[3..6]) * 2);
+        let (w, h) = (le24(&b[6..9]) + 1, le24(&b[9..12]) + 1);
+        let ms = le24(&b[12..15]) as u32;
+        let (dispose_bg, no_blend) = (b[15] & 1 != 0, b[15] & 2 != 0);
+        if x + w > cw || y + h > ch {
+            return Err(Error::invalid("WebP frame outside the canvas"));
+        }
+        if let Some((true, px, py, pw, ph)) = prev {
+            for row in py..py + ph {
+                canvas[(row * cw + px) * 4..(row * cw + px + pw) * 4].fill(0);
+            }
+        }
+        let img = image_from_chunks(&sub_chunks(&b[16..])?)?;
+        if (img.width as usize, img.height as usize) != (w, h) {
+            return Err(Error::invalid("WebP frame size does not match its header"));
+        }
+        let chs = img.color.channels();
+        for row in 0..h {
+            for col in 0..w {
+                let p = &img.data[(row * w + col) * chs..][..chs];
+                let s = if chs == 4 { [p[0], p[1], p[2], p[3]] } else { [p[0], p[1], p[2], 255] };
+                let d = &mut canvas[((y + row) * cw + x + col) * 4..][..4];
+                if no_blend || s[3] == 255 {
+                    d.copy_from_slice(&s);
+                } else if s[3] != 0 {
+                    let (sa, da) = (s[3] as u32, d[3] as u32);
+                    let oa = sa * 255 + da * (255 - sa);
+                    for k in 0..3 {
+                        d[k] = ((s[k] as u32 * sa * 255 + d[k] as u32 * da * (255 - sa) + oa / 2) / oa) as u8;
+                    }
+                    d[3] = ((oa + 127) / 255) as u8;
+                }
+            }
+        }
+        shown.push((canvas.clone(), normalize_delay(ms)));
+        prev = Some((dispose_bg, x, y, w, h));
+    }
+    if shown.is_empty() {
+        return Err(Error::invalid("animated WebP without frames"));
+    }
+    let opaque = shown.iter().all(|(f, _)| f.chunks_exact(4).all(|p| p[3] == 255));
+    let mut frames = Vec::with_capacity(shown.len());
+    for (rgba, ms) in shown {
+        let image = if opaque {
+            let rgb = rgba.chunks_exact(4).flat_map(|p| [p[0], p[1], p[2]]).collect();
+            Image::new(cw as u32, ch as u32, ColorType::Rgb, 8, rgb)?
+        } else {
+            Image::new(cw as u32, ch as u32, ColorType::Rgba, 8, rgba)?
+        };
+        frames.push(AnimFrame { image, duration_ms: ms });
+    }
+    Ok(Animation { width: cw as u32, height: ch as u32, frames, loop_forever })
 }
 
 /// Largest width or height a VP8L stream can describe.

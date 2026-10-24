@@ -17,21 +17,60 @@ fn trailing_bits(w: &mut BitWriter) {
     w.byte_align();
 }
 
-/// A sequence header OBU payload for a reduced still picture header sequence.
+/// A sequence header OBU payload: the reduced still picture form, or the general form (one operating point, no
+/// timing or decoder model, no frame ids) for sequences of frames.
 pub fn sequence_header_payload(s: &SequenceHeader) -> Vec<u8> {
-    assert!(s.reduced_still_picture_header, "only reduced still picture sequences are written");
     let mut w = BitWriter::new();
     w.bits(s.profile as u32, 3);
-    w.bit(true); // still_picture
-    w.bit(true); // reduced_still_picture_header
-    w.bits(s.operating_points[0].level as u32, 5);
+    w.bit(s.still_picture);
+    w.bit(s.reduced_still_picture_header);
+    let level = s.operating_points[0].level;
+    if s.reduced_still_picture_header {
+        w.bits(level as u32, 5);
+    } else {
+        w.bit(false); // timing_info_present_flag
+        w.bit(false); // initial_display_delay_present_flag
+        w.bits(0, 5); // operating_points_cnt_minus_1
+        w.bits(s.operating_points[0].idc, 12);
+        w.bits(level as u32, 5);
+        if level > 7 {
+            w.bit(s.operating_points[0].tier);
+        }
+    }
     w.bits(s.frame_width_bits - 1, 4);
     w.bits(s.frame_height_bits - 1, 4);
     w.bits(s.max_frame_width - 1, s.frame_width_bits);
     w.bits(s.max_frame_height - 1, s.frame_height_bits);
+    if !s.reduced_still_picture_header {
+        w.bit(false); // frame_id_numbers_present_flag
+    }
     w.bit(s.use_128x128_superblock);
     w.bit(s.enable_filter_intra);
     w.bit(s.enable_intra_edge_filter);
+    if !s.reduced_still_picture_header {
+        w.bit(s.enable_interintra_compound);
+        w.bit(s.enable_masked_compound);
+        w.bit(s.enable_warped_motion);
+        w.bit(s.enable_dual_filter);
+        w.bit(s.enable_order_hint);
+        if s.enable_order_hint {
+            w.bit(s.enable_jnt_comp);
+            w.bit(s.enable_ref_frame_mvs);
+        }
+        w.bit(s.seq_force_screen_content_tools == SELECT_SCREEN_CONTENT_TOOLS);
+        if s.seq_force_screen_content_tools != SELECT_SCREEN_CONTENT_TOOLS {
+            w.bit(s.seq_force_screen_content_tools != 0);
+        }
+        if s.seq_force_screen_content_tools > 0 {
+            w.bit(s.seq_force_integer_mv == SELECT_INTEGER_MV);
+            if s.seq_force_integer_mv != SELECT_INTEGER_MV {
+                w.bit(s.seq_force_integer_mv != 0);
+            }
+        }
+        if s.enable_order_hint {
+            w.bits(s.order_hint_bits - 1, 3);
+        }
+    }
     w.bit(s.enable_superres);
     w.bit(s.enable_cdef);
     w.bit(s.enable_restoration);
@@ -84,15 +123,25 @@ fn write_delta_q(w: &mut BitWriter, v: i32) {
     }
 }
 
-/// The frame header bits for a key frame of a reduced still picture sequence (no tile data).
+/// The frame header bits for a shown key frame (no tile data), in a reduced still picture sequence or a general
+/// one with order hints off.
 pub fn frame_header_bits(s: &SequenceHeader, h: &FrameHeader, w: &mut BitWriter) {
-    assert!(s.reduced_still_picture_header && h.frame_type == KEY_FRAME);
+    assert!(h.frame_type == KEY_FRAME && h.show_frame);
+    if !s.reduced_still_picture_header {
+        assert!(!s.enable_order_hint, "key frames with order hints are not written");
+        w.bit(false); // show_existing_frame
+        w.bits(KEY_FRAME as u32, 2);
+        w.bit(true); // show_frame
+    }
     w.bit(h.disable_cdf_update);
     w.bit(h.allow_screen_content_tools);
     if h.allow_screen_content_tools {
         w.bit(h.force_integer_mv);
     }
-    // frame_size_override_flag, order_hint, primary_ref_frame, refresh_frame_flags: implied.
+    if !s.reduced_still_picture_header {
+        w.bit(false); // frame_size_override_flag
+    }
+    // order_hint, primary_ref_frame, refresh_frame_flags: implied.
     if s.enable_superres {
         w.bit(h.use_superres);
         if h.use_superres {
@@ -103,7 +152,9 @@ pub fn frame_header_bits(s: &SequenceHeader, h: &FrameHeader, w: &mut BitWriter)
     if h.allow_screen_content_tools && h.upscaled_width == h.frame_width {
         w.bit(h.allow_intrabc);
     }
-    // disable_frame_end_update_cdf: implied 1.
+    if !s.reduced_still_picture_header && !h.disable_cdf_update {
+        w.bit(true); // disable_frame_end_update_cdf: nothing carries over
+    }
     write_tile_info(s, h, w);
     // quantization_params
     let q = &h.quant;

@@ -1,10 +1,11 @@
 //! Per-file processing: read -> decode -> encode -> never-grow check -> atomic write.
 
-use crate::cli::{Cli, SubsamplingArg};
+use crate::animation::Animation;
+use crate::cli::{BitDepthArg, Cli, SubsamplingArg};
 use crate::collect::{Format, Job, is_stdio, target_format};
 use crate::error::{Error, Result};
 use crate::exif;
-use crate::image::{Image, Metadata};
+use crate::image::{ColorType, Image, Metadata};
 use crate::report::{Report, Status};
 use crate::{jpeg, png, resize};
 use std::fs;
@@ -218,9 +219,15 @@ fn encode(img: &Image, fmt: Format, cli: &Cli) -> Result<Encoded> {
                 SubsamplingArg::S444 => true,
                 SubsamplingArg::S420 => false,
             };
-            let opts = crate::avif::encode::EncodeOptions { quality: cli.quality, full_chroma, effort: cli.level };
+            let bit_depth = match cli.bit_depth {
+                BitDepthArg::Auto if img.depth == 16 => 10,
+                BitDepthArg::Auto | BitDepthArg::B8 => 8,
+                BitDepthArg::B10 => 10,
+            };
+            let opts =
+                crate::avif::encode::EncodeOptions { quality: cli.quality, full_chroma, effort: cli.level, bit_depth };
             let mut encoded: Encoded = crate::avif::encode::encode(img, &opts)?.into();
-            if img.depth == 16 {
+            if img.depth == 16 && bit_depth == 8 {
                 encoded.note = Some("16-bit reduced to 8-bit".into());
             }
             Ok(encoded)
@@ -266,7 +273,9 @@ fn run(job: &Job, cli: &Cli, data: &[u8]) -> Result<(Status, u64, Option<String>
     })?;
     let out_fmt = target_format(cli, in_fmt);
     if out_fmt == Format::Gif {
-        return Err(Error::unsupported("GIF files can only be converted: use --format png or --format jpeg"));
+        return Err(Error::unsupported(
+            "GIF files can only be converted: use --format png, jpeg, webp or avif (animations: avif)",
+        ));
     }
     if cli.in_place && out_fmt != in_fmt {
         return Err(Error::unsupported("--in-place cannot be combined with a format change"));
@@ -294,7 +303,10 @@ fn run(job: &Job, cli: &Cli, data: &[u8]) -> Result<(Status, u64, Option<String>
         }
         return Ok((Status::NoGain, data.len() as u64, Some(note.into())));
     }
-    let encoded = if in_fmt == Format::Jpeg && out_fmt == Format::Jpeg {
+    let animation = if out_fmt == Format::Avif { decode_animation(data, in_fmt)? } else { None };
+    let encoded = if let Some(anim) = animation {
+        animation_to_avif(anim, cli)?
+    } else if in_fmt == Format::Jpeg && out_fmt == Format::Jpeg {
         jpeg_to_jpeg(data, cli)?
     } else {
         let mut img = decode(data, in_fmt)?;
@@ -317,6 +329,47 @@ fn run(job: &Job, cli: &Cli, data: &[u8]) -> Result<(Status, u64, Option<String>
         write_output(&job.output, &encoded)?;
     }
     Ok((Status::Compressed, encoded.len() as u64, note))
+}
+
+/// The frames of an animated input, `None` for a still (or a format without animation here).
+fn decode_animation(data: &[u8], fmt: Format) -> Result<Option<Animation>> {
+    let anim = match fmt {
+        Format::Gif => Some(crate::gif::decode_animation(data)?),
+        Format::Webp if crate::webp::unsupported_reason(data) == Some("animated WebP") => {
+            Some(crate::webp::decode_animation(data)?)
+        }
+        Format::Png if png::is_animated(data) => Some(png::apng::decode_animation(data)?),
+        Format::Avif => Some(crate::avif::decode_animation(data)?),
+        _ => None,
+    };
+    Ok(anim.filter(|a| a.frames.len() > 1))
+}
+
+/// Encode an animation as an animated AVIF, resizing every frame when asked.
+fn animation_to_avif(mut anim: Animation, cli: &Cli) -> Result<Encoded> {
+    let mut resized = None;
+    if cli.resize.is_some() {
+        for f in &mut anim.frames {
+            let (img, r) =
+                resize_image(std::mem::replace(&mut f.image, Image::new(1, 1, ColorType::Gray, 8, vec![0])?), cli);
+            f.image = img;
+            resized = r;
+        }
+        anim.width = anim.frames[0].image.width;
+        anim.height = anim.frames[0].image.height;
+    }
+    let full_chroma = match cli.subsampling {
+        SubsamplingArg::Auto => cli.quality >= 90,
+        SubsamplingArg::S444 => true,
+        SubsamplingArg::S420 => false,
+    };
+    let bit_depth = if cli.bit_depth == BitDepthArg::B10 { 10 } else { 8 };
+    let opts = crate::avif::encode::EncodeOptions { quality: cli.quality, full_chroma, effort: cli.level, bit_depth };
+    let n = anim.frames.len();
+    let mut encoded: Encoded = crate::avif::encode::encode_animation(&anim, &opts)?.into();
+    encoded.note = Some(format!("{n} frames"));
+    encoded.forced = true;
+    Ok(encoded.resized(resized))
 }
 
 pub fn process(job: &Job, cli: &Cli) -> Report {

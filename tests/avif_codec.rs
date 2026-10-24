@@ -112,7 +112,7 @@ fn round_trips_every_colour_type() {
     ] {
         for full_chroma in [false, true] {
             let img = synthetic(w, h, color);
-            let bytes = encode(&img, &EncodeOptions { quality: 80, full_chroma, effort: 7 }).unwrap();
+            let bytes = encode(&img, &EncodeOptions { quality: 80, full_chroma, effort: 7, bit_depth: 8 }).unwrap();
             assert!(avif::is_avif(&bytes));
             let back = avif::decode(&bytes).unwrap_or_else(|e| panic!("{w}x{h} {color:?}: {e}"));
             assert_eq!(back.color, color, "{w}x{h}");
@@ -125,8 +125,10 @@ fn round_trips_every_colour_type() {
 #[test]
 fn alpha_survives_nearly_exactly() {
     let img = synthetic(64, 48, ColorType::Rgba);
-    let back =
-        avif::decode(&encode(&img, &EncodeOptions { quality: 80, full_chroma: true, effort: 7 }).unwrap()).unwrap();
+    let back = avif::decode(
+        &encode(&img, &EncodeOptions { quality: 80, full_chroma: true, effort: 7, bit_depth: 8 }).unwrap(),
+    )
+    .unwrap();
     let worst = img
         .data
         .chunks_exact(4)
@@ -142,7 +144,7 @@ fn quality_orders_size_and_fidelity() {
     let img = synthetic(96, 64, ColorType::Rgb);
     let mut last = (usize::MAX, 0.0);
     for q in [20u8, 50, 80, 95] {
-        let bytes = encode(&img, &EncodeOptions { quality: q, full_chroma: true, effort: 7 }).unwrap();
+        let bytes = encode(&img, &EncodeOptions { quality: q, full_chroma: true, effort: 7, bit_depth: 8 }).unwrap();
         let p = psnr(&img, &avif::decode(&bytes).unwrap(), 3);
         assert!(
             !bytes.is_empty() && (last.0 == usize::MAX || bytes.len() >= last.0),
@@ -162,20 +164,52 @@ fn metadata_round_trips() {
     img.meta.xmp = Some(b"<x:xmpmeta xmlns:x=\"adobe:ns:meta/\"></x:xmpmeta>".to_vec());
     // A minimal big-endian TIFF block with an empty IFD.
     img.meta.exif = Some(vec![b'M', b'M', 0, 42, 0, 0, 0, 8, 0, 0, 0, 0, 0, 0]);
-    let back =
-        avif::decode(&encode(&img, &EncodeOptions { quality: 70, full_chroma: false, effort: 7 }).unwrap()).unwrap();
+    let back = avif::decode(
+        &encode(&img, &EncodeOptions { quality: 70, full_chroma: false, effort: 7, bit_depth: 8 }).unwrap(),
+    )
+    .unwrap();
     assert_eq!(back.meta.icc, img.meta.icc);
     assert_eq!(back.meta.xmp, img.meta.xmp);
     assert_eq!(back.meta.exif, img.meta.exif);
 }
 
 #[test]
-fn sixteen_bit_input_is_reduced() {
+fn sixteen_bit_input_is_reduced_to_eight_on_request() {
     let data: Vec<u8> = (0..16 * 16 * 3).flat_map(|i| (((i * 257) % 65536) as u16).to_be_bytes()).collect();
     let img = Image::new(16, 16, ColorType::Rgb, 16, data).unwrap();
-    let back =
-        avif::decode(&encode(&img, &EncodeOptions { quality: 90, full_chroma: true, effort: 7 }).unwrap()).unwrap();
+    let back = avif::decode(
+        &encode(&img, &EncodeOptions { quality: 90, full_chroma: true, effort: 7, bit_depth: 8 }).unwrap(),
+    )
+    .unwrap();
     assert_eq!((back.width, back.height, back.depth), (16, 16, 8));
+}
+
+#[test]
+fn ten_bit_output_keeps_sixteen_bit_precision() {
+    // A smooth 16-bit ramp: at 8 bits it bands into steps of 257, at 10 bits it does not.
+    let (w, h) = (64u32, 32u32);
+    let mut data = Vec::new();
+    for y in 0..h {
+        for x in 0..w {
+            for c in 0..3u32 {
+                let v = (x * 900 + y * 300 + c * 2000 + 4000).min(65535) as u16;
+                data.extend_from_slice(&v.to_be_bytes());
+            }
+        }
+    }
+    let img = Image::new(w, h, ColorType::Rgb, 16, data).unwrap();
+    let opts = EncodeOptions { quality: 95, full_chroma: true, effort: 7, bit_depth: 10 };
+    let back = avif::decode(&encode(&img, &opts).unwrap()).unwrap();
+    assert_eq!((back.width, back.height, back.depth), (w, h, 16));
+    let err: f64 = img
+        .data
+        .chunks_exact(2)
+        .zip(back.data.chunks_exact(2))
+        .map(|(a, b)| (u16::from_be_bytes([a[0], a[1]]) as f64 - u16::from_be_bytes([b[0], b[1]]) as f64).powi(2))
+        .sum::<f64>()
+        / (img.data.len() / 2) as f64;
+    let psnr16 = 10.0 * (65535.0f64 * 65535.0 / err.max(1e-9)).log10();
+    assert!(psnr16 > 55.0, "16-bit PSNR {psnr16:.1}");
 }
 
 // ----------------------------------------------------------------------------------------------------------

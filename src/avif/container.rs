@@ -41,6 +41,7 @@
 //! * The `prem` reference is accepted in either direction between the colour and alpha items (libavif writes
 //!   it from the alpha item to the colour item, which is also what [`write`] does).
 
+use super::sequence::TrackOut;
 use crate::error::{Error, Result};
 use crate::image::{MAX_PIXELS, Metadata};
 use std::cell::Cell;
@@ -350,21 +351,21 @@ impl AvifFile {
 // Low-level reading
 // ---------------------------------------------------------------------------------------------------------
 
-struct Cur<'a> {
+pub(super) struct Cur<'a> {
     d: &'a [u8],
     p: usize,
 }
 
 impl<'a> Cur<'a> {
-    fn new(d: &'a [u8]) -> Self {
+    pub(super) fn new(d: &'a [u8]) -> Self {
         Cur { d, p: 0 }
     }
 
-    fn left(&self) -> usize {
+    pub(super) fn left(&self) -> usize {
         self.d.len() - self.p
     }
 
-    fn take(&mut self, n: usize) -> Result<&'a [u8]> {
+    pub(super) fn take(&mut self, n: usize) -> Result<&'a [u8]> {
         if n > self.left() {
             return Err(Error::invalid("box truncated"));
         }
@@ -373,27 +374,27 @@ impl<'a> Cur<'a> {
         Ok(s)
     }
 
-    fn rest(&mut self) -> &'a [u8] {
+    pub(super) fn rest(&mut self) -> &'a [u8] {
         let s = &self.d[self.p..];
         self.p = self.d.len();
         s
     }
 
-    fn u8(&mut self) -> Result<u8> {
+    pub(super) fn u8(&mut self) -> Result<u8> {
         Ok(self.take(1)?[0])
     }
 
-    fn u16(&mut self) -> Result<u16> {
+    pub(super) fn u16(&mut self) -> Result<u16> {
         let b = self.take(2)?;
         Ok(u16::from_be_bytes([b[0], b[1]]))
     }
 
-    fn u32(&mut self) -> Result<u32> {
+    pub(super) fn u32(&mut self) -> Result<u32> {
         let b = self.take(4)?;
         Ok(u32::from_be_bytes([b[0], b[1], b[2], b[3]]))
     }
 
-    fn u64(&mut self) -> Result<u64> {
+    pub(super) fn u64(&mut self) -> Result<u64> {
         let b = self.take(8)?;
         let mut a = [0u8; 8];
         a.copy_from_slice(b);
@@ -401,7 +402,7 @@ impl<'a> Cur<'a> {
     }
 
     /// A 0/4/8 byte unsigned field (iloc sizes).
-    fn uint(&mut self, size: u8) -> Result<u64> {
+    pub(super) fn uint(&mut self, size: u8) -> Result<u64> {
         match size {
             0 => Ok(0),
             4 => Ok(self.u32()? as u64),
@@ -410,13 +411,13 @@ impl<'a> Cur<'a> {
         }
     }
 
-    fn fourcc(&mut self) -> Result<FourCc> {
+    pub(super) fn fourcc(&mut self) -> Result<FourCc> {
         let b = self.take(4)?;
         Ok([b[0], b[1], b[2], b[3]])
     }
 
     /// A NUL-terminated string; an unterminated one runs to the end of the box.
-    fn cstr(&mut self) -> &'a [u8] {
+    pub(super) fn cstr(&mut self) -> &'a [u8] {
         let rest = &self.d[self.p..];
         match rest.iter().position(|&b| b == 0) {
             Some(n) => {
@@ -431,7 +432,7 @@ impl<'a> Cur<'a> {
     }
 
     /// FullBox header: version and 24-bit flags.
-    fn full(&mut self) -> Result<(u8, u32)> {
+    pub(super) fn full(&mut self) -> Result<(u8, u32)> {
         let v = self.u8()?;
         let b = self.take(3)?;
         Ok((v, (b[0] as u32) << 16 | (b[1] as u32) << 8 | b[2] as u32))
@@ -440,7 +441,7 @@ impl<'a> Cur<'a> {
 
 /// Split `data` into boxes: (type, body). 64-bit sizes, size 0 (to the end of `data`) and `uuid` boxes are handled.
 /// A trailing fragment shorter than a box header is ignored.
-fn split_boxes(data: &[u8]) -> Result<Vec<(FourCc, &[u8])>> {
+pub(super) fn split_boxes(data: &[u8]) -> Result<Vec<(FourCc, &[u8])>> {
     let mut out = Vec::new();
     let mut p = 0usize;
     while data.len() - p >= 8 {
@@ -473,7 +474,7 @@ fn split_boxes(data: &[u8]) -> Result<Vec<(FourCc, &[u8])>> {
     Ok(out)
 }
 
-fn show(k: &FourCc) -> String {
+pub(super) fn show(k: &FourCc) -> String {
     k.iter().map(|&b| if (0x20..0x7f).contains(&b) { b as char } else { '?' }).collect()
 }
 
@@ -1103,6 +1104,24 @@ pub struct AvifOutput {
     /// EXIF as a bare TIFF block (an `Exif\0\0` prefix is tolerated and removed).
     pub exif: Option<Vec<u8>>,
     pub xmp: Option<Vec<u8>>,
+    /// Further frames: the file becomes an `avis` image sequence whose first sample is `color` (and `alpha`).
+    pub sequence: Option<SequenceOut>,
+}
+
+/// The frames after the first of an animation, as AV1 samples (sequence header only in the first one).
+#[derive(Clone, Debug)]
+pub struct SequenceOut {
+    /// Ticks per second of the durations.
+    pub timescale: u32,
+    /// Duration of every frame including the first.
+    pub durations: Vec<u32>,
+    /// Which frames are sync samples (key frames), including the first.
+    pub sync: Vec<bool>,
+    /// Colour samples of frames 1.. .
+    pub color: Vec<Vec<u8>>,
+    /// Alpha samples of frames 1.. (empty when there is no alpha).
+    pub alpha: Vec<Vec<u8>>,
+    pub loop_forever: bool,
 }
 
 impl AvifOutput {
@@ -1120,11 +1139,12 @@ impl AvifOutput {
             mirror: None,
             exif: None,
             xmp: None,
+            sequence: None,
         }
     }
 }
 
-fn bx(kind: &[u8; 4], body: &[u8]) -> Vec<u8> {
+pub(super) fn bx(kind: &[u8; 4], body: &[u8]) -> Vec<u8> {
     let mut o = Vec::with_capacity(body.len() + 8);
     o.extend_from_slice(&(body.len() as u32 + 8).to_be_bytes());
     o.extend_from_slice(kind);
@@ -1132,7 +1152,7 @@ fn bx(kind: &[u8; 4], body: &[u8]) -> Vec<u8> {
     o
 }
 
-fn fbx(kind: &[u8; 4], version: u8, flags: u32, body: &[u8]) -> Vec<u8> {
+pub(super) fn fbx(kind: &[u8; 4], version: u8, flags: u32, body: &[u8]) -> Vec<u8> {
     let mut b = vec![version, (flags >> 16) as u8, (flags >> 8) as u8, flags as u8];
     b.extend_from_slice(body);
     bx(kind, &b)
@@ -1253,9 +1273,16 @@ pub fn write(img: &AvifOutput) -> Vec<u8> {
         });
     }
 
-    let total: u64 = items.iter().map(|i| i.data.len() as u64).sum();
+    let items_total: u64 = items.iter().map(|i| i.data.len() as u64).sum();
+    let extra_total: u64 =
+        img.sequence.as_ref().map_or(0, |s| s.color.iter().chain(&s.alpha).map(|d| d.len() as u64).sum());
+    let total = items_total + extra_total;
     let wide = total > 0x7fff_ffff;
-    let ftyp = bx(b"ftyp", b"avif\0\0\0\0avifmif1miaf");
+    let ftyp = if img.sequence.is_some() {
+        bx(b"ftyp", b"avis\0\0\0\0avisavifmif1miafmsf1iso8")
+    } else {
+        bx(b"ftyp", b"avif\0\0\0\0avifmif1miaf")
+    };
 
     let build_meta = |offsets: &[u64]| -> Vec<u8> {
         let mut m = fbx(b"hdlr", 0, 0, &[&[0u8; 4][..], b"pict", &[0u8; 12], &[0u8][..]].concat());
@@ -1358,7 +1385,80 @@ pub fn write(img: &AvifOutput) -> Vec<u8> {
     for it in &items {
         out.extend_from_slice(&it.data);
     }
+    if let Some(seq) = &img.sequence {
+        for d in seq.color.iter().chain(&seq.alpha) {
+            out.extend_from_slice(d);
+        }
+        out.extend(sequence_moov(img, seq, &offsets, pos_after_items(&offsets, &items)));
+    }
     out
+}
+
+fn pos_after_items(offsets: &[u64], items: &[WItem]) -> u64 {
+    offsets.last().zip(items.last()).map_or(0, |(&o, i)| o + i.data.len() as u64)
+}
+
+/// The `moov` of an animation: sample 0 of each track is the primary item (and the alpha item), the rest follow
+/// the items in `mdat`, colour samples first.
+fn sequence_moov(img: &AvifOutput, seq: &SequenceOut, item_offsets: &[u64], extras_start: u64) -> Vec<u8> {
+    let frames = seq.durations.len();
+    let mut pos = extras_start;
+    let mut track = |first_off: u64, first_len: usize, rest: &[Vec<u8>]| {
+        let mut offsets = vec![first_off];
+        let mut sizes = vec![first_len as u32];
+        for d in rest {
+            offsets.push(pos);
+            sizes.push(d.len() as u32);
+            pos += d.len() as u64;
+        }
+        (offsets, sizes)
+    };
+    let (c_off, c_sz) = track(item_offsets[0], img.color.data.len(), &seq.color);
+    let alpha_tr = img.alpha.as_ref().map(|a| track(item_offsets[1], a.data.len(), &seq.alpha));
+    let mut colr = Vec::new();
+    if let Some(n) = &img.colour.nclx {
+        let mut b = b"nclx".to_vec();
+        b.extend_from_slice(&n.colour_primaries.to_be_bytes());
+        b.extend_from_slice(&n.transfer_characteristics.to_be_bytes());
+        b.extend_from_slice(&n.matrix_coefficients.to_be_bytes());
+        b.push((n.full_range as u8) << 7);
+        colr.extend(bx(b"colr", &b));
+    }
+    if let Some(icc) = &img.colour.icc {
+        let mut b = b"prof".to_vec();
+        b.extend_from_slice(icc);
+        colr.extend(bx(b"colr", &b));
+    }
+    let mut tracks = vec![TrackOut {
+        id: 1,
+        alpha: false,
+        config: &img.color.config,
+        width: img.width,
+        height: img.height,
+        extra_entry_boxes: colr,
+        offsets: c_off,
+        sizes: c_sz,
+        durations: seq.durations.clone(),
+        sync: seq.sync.clone(),
+        aux_for: None,
+    }];
+    if let (Some(a), Some((offsets, sizes))) = (&img.alpha, alpha_tr) {
+        tracks.push(TrackOut {
+            id: 2,
+            alpha: true,
+            config: &a.config,
+            width: img.width,
+            height: img.height,
+            extra_entry_boxes: Vec::new(),
+            offsets,
+            sizes,
+            durations: seq.durations.clone(),
+            sync: seq.sync.clone(),
+            aux_for: Some(1),
+        });
+    }
+    debug_assert!(tracks.iter().all(|t| t.offsets.len() == frames));
+    super::sequence::build_moov(&tracks, seq.timescale, seq.loop_forever)
 }
 
 #[cfg(test)]

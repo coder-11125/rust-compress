@@ -4,7 +4,9 @@ pub mod av1;
 pub mod container;
 pub mod convert;
 pub mod encode;
+pub mod sequence;
 
+use crate::animation::{AnimFrame, Animation};
 use crate::error::{Error, Result};
 use crate::image::{ColorType, Image};
 use av1::frame::{Frame, Plane};
@@ -167,6 +169,63 @@ pub fn decode(data: &[u8]) -> Result<Image> {
     }
     img.meta = file.metadata();
     Ok(apply_transforms(img, &file.primary))
+}
+
+/// Decode every frame of an AVIF image sequence. A file without a sequence gives a one-frame animation.
+/// Only key-frame-only sequences are supported so far: a sample that needs a reference is [`Error::Unsupported`].
+pub fn decode_animation(data: &[u8]) -> Result<Animation> {
+    let Some(seq) = sequence::parse(data)? else {
+        let img = decode(data)?;
+        return Ok(Animation {
+            width: img.width,
+            height: img.height,
+            frames: vec![AnimFrame { image: img, duration_ms: crate::animation::DEFAULT_DELAY_MS }],
+            loop_forever: false,
+        });
+    };
+    let color = seq.color().ok_or_else(|| Error::invalid("image sequence without a colour track"))?;
+    let alpha = seq.alpha();
+    if let Some(a) = alpha
+        && a.samples.len() != color.samples.len()
+    {
+        return Err(Error::invalid("alpha track has a different number of samples"));
+    }
+    if color.samples.len() as u64 * color.width as u64 * color.height as u64 > crate::animation::MAX_ANIMATION_PIXELS {
+        return Err(Error::unsupported("animation too large"));
+    }
+    let sample = |track: &sequence::Track, i: usize| -> Result<Vec<u8>> {
+        let s = &track.samples[i];
+        let end = s.offset.checked_add(s.size as u64).filter(|&e| e <= data.len() as u64);
+        let end = end.ok_or_else(|| Error::invalid("sample lies outside the file"))? as usize;
+        let mut stream = track.config.as_ref().map(|c| c.config_obus.clone()).unwrap_or_default();
+        stream.extend_from_slice(&data[s.offset as usize..end]);
+        Ok(stream)
+    };
+    let nclx = container::parse(data).ok().and_then(|f| f.primary.colour.nclx);
+    let mut frames = Vec::with_capacity(color.samples.len());
+    for (i, s) in color.samples.iter().enumerate() {
+        if !s.sync {
+            return Err(Error::unsupported("animated AVIF with inter-coded frames"));
+        }
+        let d = av1::decoder::decode(&sample(color, i)?)?;
+        let mut cc = d.seq.color.clone();
+        if let Some(n) = &nclx {
+            cc.matrix_coefficients = n.matrix_coefficients as u8;
+            cc.color_range = n.full_range;
+        }
+        let mut img = convert::frame_to_image(&d.frame, &cc)?;
+        if let Some(a) = alpha {
+            let ad = av1::decoder::decode(&sample(a, i)?)?;
+            if ad.frame.width != d.frame.width || ad.frame.height != d.frame.height {
+                return Err(Error::invalid("alpha plane size differs from the colour image"));
+            }
+            img = add_alpha(img, &ad.frame, ad.seq.color.color_range, false)?;
+        }
+        let ms = (s.duration as u64 * 1000 / color.timescale as u64).min(u32::MAX as u64) as u32;
+        frames.push(AnimFrame { image: img, duration_ms: crate::animation::normalize_delay(ms) });
+    }
+    let (width, height) = (frames[0].image.width, frames[0].image.height);
+    Ok(Animation { width, height, frames, loop_forever: seq.loop_forever })
 }
 
 fn add_alpha(img: Image, alpha: &Frame, full_range: bool, premultiplied: bool) -> Result<Image> {

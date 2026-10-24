@@ -298,11 +298,20 @@ pub struct EncodeParams {
     pub lambda_scale: f64,
     /// Search effort 0..=9 (default 7): 8 and 9 examine every partition, lower values prune the search.
     pub effort: u8,
+    /// A single still picture (reduced headers) rather than a frame of a sequence.
+    pub still: bool,
 }
 
 impl Default for EncodeParams {
     fn default() -> Self {
-        EncodeParams { base_q_idx: 100, fixed_bsize: BLOCK_16X16, quant_round: 96, lambda_scale: 0.09, effort: 7 }
+        EncodeParams {
+            base_q_idx: 100,
+            fixed_bsize: BLOCK_16X16,
+            quant_round: 96,
+            lambda_scale: 0.09,
+            effort: 7,
+            still: true,
+        }
     }
 }
 
@@ -323,7 +332,7 @@ fn level_for(width: usize, height: usize) -> u8 {
     LIMITS.iter().find(|(max, _)| area <= *max).map_or(31, |&(_, level)| level)
 }
 
-pub fn make_sequence_header(color: &ColorConfig, width: usize, height: usize) -> SequenceHeader {
+pub fn make_sequence_header(color: &ColorConfig, width: usize, height: usize, still: bool) -> SequenceHeader {
     let bits = |n: usize| (usize::BITS - (n.max(2) - 1).leading_zeros()).max(1);
     let profile = if color.sub_x == 0 && color.sub_y == 0 && !color.mono_chrome {
         1
@@ -334,8 +343,8 @@ pub fn make_sequence_header(color: &ColorConfig, width: usize, height: usize) ->
     };
     SequenceHeader {
         profile,
-        still_picture: true,
-        reduced_still_picture_header: true,
+        still_picture: still,
+        reduced_still_picture_header: still,
         operating_points: vec![OperatingPoint {
             idc: 0,
             level: level_for(width, height),
@@ -363,7 +372,7 @@ pub fn make_sequence_header(color: &ColorConfig, width: usize, height: usize) ->
 /// Encode one picture (planes already at the sequence's bit depth and subsampling).
 pub fn encode_picture(src: &Frame, color: &ColorConfig, p: &EncodeParams) -> Result<Encoded> {
     let (w, h) = (src.width, src.height);
-    let seq = make_sequence_header(color, w, h);
+    let seq = make_sequence_header(color, w, h, p.still);
     let mut hdr = FrameHeader {
         frame_type: obu::KEY_FRAME,
         show_frame: true,

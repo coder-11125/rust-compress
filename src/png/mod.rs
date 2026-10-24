@@ -1,5 +1,6 @@
 //! PNG codec (RFC 2083 / ISO 15948) written from scratch.
 
+pub mod apng;
 pub mod decode;
 pub mod encode;
 pub mod filter;

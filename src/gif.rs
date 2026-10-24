@@ -1,6 +1,8 @@
-//! GIF decoder (still images only). GIF87a/GIF89a, global and local palettes, interlacing and
-//! transparency. Animated GIFs are refused rather than flattened to their first frame.
+//! GIF decoder: stills, and animations as full-canvas frames. GIF87a/GIF89a, global and local palettes, interlacing and
+//! transparency. [`decode`] refuses animated GIFs rather than flattening them to their first frame; use
+//! [`decode_animation`] for those.
 
+use crate::animation::{AnimFrame, Animation, MAX_ANIMATION_PIXELS, normalize_delay};
 use crate::error::{Error, Result};
 use crate::image::{ColorType, Image, MAX_PIXELS};
 
@@ -229,6 +231,129 @@ pub fn decode(data: &[u8]) -> Result<Image> {
         }
     }
     Image::new(sw as u32, sh as u32, if has_alpha { ColorType::Rgba } else { ColorType::Rgb }, 8, out)
+}
+
+/// Decode every frame of a GIF into full-canvas frames, honouring disposal methods, transparency, local palettes
+/// and the loop extension. A still GIF gives a one-frame animation.
+pub fn decode_animation(data: &[u8]) -> Result<Animation> {
+    if !is_gif(data) {
+        return Err(Error::invalid("not a GIF file"));
+    }
+    let mut c = Cursor { d: data, pos: 6 };
+    let (sw, sh) = (c.u16()?, c.u16()?);
+    let packed = c.u8()?;
+    let _background = c.u8()?;
+    let _aspect = c.u8()?;
+    if sw == 0 || sh == 0 || (sw as u64) * (sh as u64) > MAX_PIXELS {
+        return Err(Error::invalid("bad GIF dimensions"));
+    }
+    let global = if packed & 0x80 != 0 { Some(color_table(&mut c, packed)?) } else { None };
+
+    // RGBA canvas; shown frames are snapshots of it.
+    let mut canvas = vec![0u8; sw * sh * 4];
+    let mut previous: Option<Vec<u8>> = None;
+    let mut frames: Vec<(Vec<u8>, u32)> = Vec::new();
+    let mut gce: Option<(u8, u32, Option<u8>)> = None; // (disposal, delay ms, transparent index)
+    let mut loops: Option<u16> = None;
+    let mut last_disposal = (0u8, 0usize, 0usize, 0usize, 0usize);
+    loop {
+        match c.u8()? {
+            0x21 => {
+                let label = c.u8()?;
+                if label == 0xF9 {
+                    let b = c.sub_blocks()?;
+                    if b.len() >= 4 {
+                        let delay = u16::from_le_bytes([b[1], b[2]]) as u32 * 10;
+                        gce = Some(((b[0] >> 2) & 7, delay, (b[0] & 1 != 0).then_some(b[3])));
+                    }
+                } else if label == 0xFF {
+                    // Application extension: the loop count lives in a NETSCAPE2.0 / ANIMEXTS1.0 sub-block.
+                    let n = c.u8()? as usize;
+                    let id = c.take(n)?.to_vec();
+                    let body = c.sub_blocks()?;
+                    if (id.starts_with(b"NETSCAPE2.0") || id.starts_with(b"ANIMEXTS1.0"))
+                        && body.len() >= 3
+                        && body[0] == 1
+                    {
+                        loops = Some(u16::from_le_bytes([body[1], body[2]]));
+                    }
+                } else {
+                    c.skip_sub_blocks()?;
+                }
+            }
+            0x2C => {
+                let (left, top, w, h) = (c.u16()?, c.u16()?, c.u16()?, c.u16()?);
+                let fp = c.u8()?;
+                if w == 0 || h == 0 || left + w > sw || top + h > sh {
+                    return Err(Error::invalid("GIF frame outside the canvas"));
+                }
+                let table = if fp & 0x80 != 0 { Some(color_table(&mut c, fp)?) } else { global.clone() };
+                let table = table.ok_or_else(|| Error::invalid("GIF without a color table"))?;
+                let min_code = c.u8()?;
+                let packed_data = c.sub_blocks()?;
+                let mut idx = lzw_decode(&packed_data, min_code, w * h)?;
+                idx.resize(w * h, 0);
+                if fp & 0x40 != 0 {
+                    idx = deinterlace(&idx, w, h);
+                }
+                if (frames.len() as u64 + 1) * (sw * sh) as u64 > MAX_ANIMATION_PIXELS {
+                    return Err(Error::unsupported("GIF animation too large"));
+                }
+                // Dispose of the previous frame first.
+                let (disposal, dl, dt, dw, dh) = last_disposal;
+                match disposal {
+                    2 => {
+                        for y in dt..dt + dh {
+                            canvas[(y * sw + dl) * 4..(y * sw + dl + dw) * 4].fill(0);
+                        }
+                    }
+                    3 => {
+                        if let Some(p) = previous.take() {
+                            canvas = p;
+                        }
+                    }
+                    _ => {}
+                }
+                let (disposal, delay, transparent) = gce.take().unwrap_or((0, 0, None));
+                if disposal == 3 {
+                    previous = Some(canvas.clone());
+                }
+                for y in 0..h {
+                    for x in 0..w {
+                        let i = idx[y * w + x];
+                        if transparent == Some(i) {
+                            continue;
+                        }
+                        let rgb = table.get(i as usize).copied().unwrap_or([0, 0, 0]);
+                        let o = ((top + y) * sw + left + x) * 4;
+                        canvas[o..o + 3].copy_from_slice(&rgb);
+                        canvas[o + 3] = 255;
+                    }
+                }
+                frames.push((canvas.clone(), normalize_delay(delay)));
+                last_disposal = (disposal, left, top, w, h);
+            }
+            0x3B => break,
+            _ => return Err(Error::invalid("bad GIF block")),
+        }
+    }
+    if frames.is_empty() {
+        return Err(Error::invalid("GIF contains no image"));
+    }
+    let opaque = frames.iter().all(|(f, _)| f.chunks_exact(4).all(|p| p[3] == 255));
+    let mut out = Vec::with_capacity(frames.len());
+    for (rgba, ms) in frames {
+        let image = if opaque {
+            let rgb = rgba.chunks_exact(4).flat_map(|p| [p[0], p[1], p[2]]).collect();
+            Image::new(sw as u32, sh as u32, ColorType::Rgb, 8, rgb)?
+        } else {
+            Image::new(sw as u32, sh as u32, ColorType::Rgba, 8, rgba)?
+        };
+        out.push(AnimFrame { image, duration_ms: ms });
+    }
+    // No loop extension means play once; any repeat count (0 meaning forever) is played forever.
+    let loop_forever = loops.is_some();
+    Ok(Animation { width: sw as u32, height: sh as u32, frames: out, loop_forever })
 }
 
 /// Rows of an interlaced frame arrive in four passes; put them back in order.

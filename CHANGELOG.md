@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Animated AVIF output (`avis`) from animated GIF, APNG, animated WebP and key-frame AVIF sequences. Every frame is a key
+  frame; verified with libavif (Pillow) and dav1d (ffmpeg).
+
+- AVIF: 10-bit output (`--bit-depth auto|8|10`); 16-bit sources are kept at 10 bits by default.
+
 - AVIF encoder: about 2x faster (candidate transforms are ranked in the transform domain and only the winner is
   reconstructed; the mode search uses DCT only), at roughly 1% larger output on photos.
 - AVIF encoder: loop restoration (Wiener and self-guided, per-unit switchable), written by a second pass over the

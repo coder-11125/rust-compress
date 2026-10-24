@@ -1,3 +1,4 @@
+pub mod animation;
 pub mod avif;
 pub mod cli;
 pub mod collect;
