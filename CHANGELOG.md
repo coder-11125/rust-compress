@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- AVIF encoder: about 2x faster (candidate transforms are ranked in the transform domain and only the winner is
+  reconstructed; the mode search uses DCT only), at roughly 1% larger output on photos.
+- AVIF encoder: loop restoration (Wiener and self-guided, per-unit switchable), written by a second pass over the
+  tiles. Streams decode identically in dav1d.
+- AVIF encoder: blocks with no residual are now signalled as skipped (the flag was always written as false), and the
+  quantizer dead zone is tighter (about 2% smaller at equal PSNR).
+- Measured against libaom (`cpu-used 4`) at equal PSNR with both outputs decoded the same way: −6.5% on average over
+  eight images (previous build −5.6%).
+
 ## 0.1.0 - 19-10-2026
 
 - Initial release: fast PNG and JPEG compression with a from-scratch engine (DEFLATE, PNG, JPEG).

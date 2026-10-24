@@ -14,6 +14,7 @@ pub mod frame;
 pub mod ipred;
 pub mod itx;
 pub mod lr;
+pub mod lr_search;
 pub mod obu;
 pub mod obu_write;
 pub mod qm_tables;

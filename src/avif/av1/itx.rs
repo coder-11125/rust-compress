@@ -994,6 +994,36 @@ pub fn forward_transform(
     }
 }
 
+/// Pixel-domain energy per unit of coefficient-domain energy for a transform size and type (the dequantized
+/// coefficients live on the forward transform's scale, which is not orthonormal). Measured once per combination
+/// by inverse-transforming a fixed pseudo-random coefficient perturbation, so the encoder can compare the
+/// distortion of candidate quantizations without reconstructing them.
+pub fn dist_scale(tx_size: u8, tx_type: u8) -> f64 {
+    static TABLE: [[std::sync::OnceLock<f64>; 16]; 19] = [const { [const { std::sync::OnceLock::new() }; 16] }; 19];
+    *TABLE[tx_size as usize][tx_type as usize].get_or_init(|| {
+        let ts = tx_size as usize;
+        let (w, h) = (1usize << TX_WIDTH_LOG2[ts], 1usize << TX_HEIGHT_LOG2[ts]);
+        let (cw, ch) = (w.min(32), h.min(32));
+        let (mut pix, mut coef) = (0f64, 0f64);
+        let mut state = 0x2545_f491u32 ^ (ts as u32 * 977 + tx_type as u32);
+        for _ in 0..4 {
+            let mut c = vec![0i32; w * h];
+            for i in 0..ch {
+                for j in 0..cw {
+                    state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                    let v = ((state >> 16) % 129) as i32 - 64;
+                    c[i * w + j] = v;
+                    coef += (v * v) as f64;
+                }
+            }
+            let mut dst = vec![2048u16; w * h];
+            inverse_transform_add(&mut c, tx_size, tx_type, false, 12, h.min(32), w.min(32), &mut dst, w);
+            pix += dst.iter().map(|&p| ((p as i32 - 2048) as f64).powi(2)).sum::<f64>();
+        }
+        if coef == 0.0 { 1.0 } else { pix / coef }
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

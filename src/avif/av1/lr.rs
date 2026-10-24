@@ -73,7 +73,7 @@ const FILTER_BITS: u32 = 7;
 
 /// `Sgr_Params`: `[r0, e0, r1, e1]` per set. Pass 0 uses the 5x5 window (`r = 2`), pass 1 the 3x3 window
 /// (`r = 1`); a radius of 0 disables that pass.
-const SGR_PARAMS: [[u8; 4]; 16] = [
+pub(crate) const SGR_PARAMS: [[u8; 4]; 16] = [
     [2, 12, 1, 4],
     [2, 15, 1, 6],
     [2, 18, 1, 8],
@@ -130,12 +130,12 @@ pub fn loop_restoration_frame(cdef_out: &Frame, deblocked: &Frame, out: &mut Fra
     }
 }
 
-struct PlaneCtx<'a> {
-    cdef: &'a Plane,
-    deblocked: &'a Plane,
-    plane_w: usize,
-    plane_h: usize,
-    bit_depth: u32,
+pub(crate) struct PlaneCtx<'a> {
+    pub(crate) cdef: &'a Plane,
+    pub(crate) deblocked: &'a Plane,
+    pub(crate) plane_w: usize,
+    pub(crate) plane_h: usize,
+    pub(crate) bit_depth: u32,
 }
 
 fn restore_plane(ctx: &PlaneCtx, lr: &LrPlane, sub_y: usize, out: &mut Plane) {
@@ -180,26 +180,26 @@ fn restore_plane(ctx: &PlaneCtx, lr: &LrPlane, sub_y: usize, out: &mut Plane) {
 }
 
 /// One unit within one stripe.
-struct Block {
-    x0: usize,
-    y0: usize,
-    w: usize,
-    h: usize,
-    stripe_start: isize,
-    stripe_end: isize,
+pub(crate) struct Block {
+    pub(crate) x0: usize,
+    pub(crate) y0: usize,
+    pub(crate) w: usize,
+    pub(crate) h: usize,
+    pub(crate) stripe_start: isize,
+    pub(crate) stripe_end: isize,
 }
 
 /// Margin of source samples kept around a block: Wiener needs 3, the box filters need 2 + 1.
-const MARGIN: usize = 3;
+pub(crate) const MARGIN: usize = 3;
 
 /// The source samples around a block as `get_source_sample` returns them, with a margin of [`MARGIN`].
-struct Window {
-    data: Vec<u16>,
-    stride: usize,
+pub(crate) struct Window {
+    pub(crate) data: Vec<u16>,
+    pub(crate) stride: usize,
 }
 
 impl Window {
-    fn gather(ctx: &PlaneCtx, b: &Block) -> Window {
+    pub(crate) fn gather(ctx: &PlaneCtx, b: &Block) -> Window {
         let stride = b.w + 2 * MARGIN;
         let rows = b.h + 2 * MARGIN;
         let mut data = vec![0u16; stride * rows];
@@ -228,7 +228,7 @@ impl Window {
 
     /// The sample at block-relative `(x, y)`, each of which may reach `MARGIN` outside the block.
     #[inline(always)]
-    fn at(&self, x: isize, y: isize) -> u16 {
+    pub(crate) fn at(&self, x: isize, y: isize) -> u16 {
         self.data[(y + MARGIN as isize) as usize * self.stride + (x + MARGIN as isize) as usize]
     }
 }
@@ -245,7 +245,7 @@ fn wiener_taps(c: &[i8; 3]) -> [i32; 7] {
 }
 
 /// 7.17.4: horizontal pass into a clipped intermediate, then the vertical pass.
-fn wiener(win: &Window, bit_depth: u32, coeffs: &[[i8; 3]; 2], out: &mut [u16]) {
+pub(crate) fn wiener(win: &Window, bit_depth: u32, coeffs: &[[i8; 3]; 2], out: &mut [u16]) {
     let (round0, round1) = if bit_depth == 12 { (5, 9) } else { (3, 11) };
     let vfilter = wiener_taps(&coeffs[0]);
     let hfilter = wiener_taps(&coeffs[1]);
@@ -301,7 +301,7 @@ fn sgrproj(win: &Window, bit_depth: u32, unit: &LrUnit, out: &mut [u16]) {
 
 /// The box filter process: per-pixel `a`/`b` over a `(2r+1)^2` window, then a weighted 3x3 blend of the
 /// neighbours' values, returned at `SGRPROJ_RST_BITS` extra precision.
-fn box_filter(win: &Window, bit_depth: u32, r: usize, eps: u32, w: usize, h: usize) -> Vec<i32> {
+pub(crate) fn box_filter(win: &Window, bit_depth: u32, r: usize, eps: u32, w: usize, h: usize) -> Vec<i32> {
     let d = 2 * r + 1;
     let n = (d * d) as u32;
     let n2e = n * n * eps;

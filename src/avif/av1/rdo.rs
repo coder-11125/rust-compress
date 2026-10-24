@@ -219,7 +219,8 @@ impl<C: Coder> TileCoder<'_, C> {
                 cands.push((mode, 0));
             }
         }
-        // --- Full evaluation of the candidates (luma only), keeping the best.
+        // --- Full evaluation of the candidates (luma only), keeping the best. Mode decisions use DCT only.
+        self.full_tx = effort >= 8;
         let mut best: Option<(f64, Blk)> = None;
         for &(mode, angle) in &cands {
             let mut t = base.clone();
@@ -322,7 +323,8 @@ impl<C: Coder> TileCoder<'_, C> {
             }
         }
 
-        // --- Final cost of the chosen configuration.
+        // --- Final cost of the chosen configuration, with the complete transform-type search.
+        self.full_tx = true;
         let (log, dist, coef_bits) = self.analyze_planes(&mut blk, 7);
         let skip = log.iter().all(|s| s.eob == 0);
         let bits = if skip {
@@ -331,6 +333,7 @@ impl<C: Coder> TileCoder<'_, C> {
             coef_bits + self.mode_bits(&blk, false)
         };
         blk.skip = skip;
+        blk.pre = Some(std::sync::Arc::new(log));
         let j = dist + lambda * bits as f64 / 256.0;
         (j, blk)
     }
@@ -510,11 +513,13 @@ impl<C: Coder> TileCoder<'_, C> {
 
     /// Reconstruct planned blocks into the frame buffer (so later predictions see them).
     pub(crate) fn apply_blocks(&mut self, blks: &[Blk]) {
+        let full = std::mem::replace(&mut self.full_tx, true);
         for b in blks {
             let mut t = b.clone();
             self.set_block_geometry(&mut t);
             self.analyze_planes(&mut t, 7);
         }
+        self.full_tx = full;
     }
 
     /// Search one superblock and queue its decisions for the traversal.

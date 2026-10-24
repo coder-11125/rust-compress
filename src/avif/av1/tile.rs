@@ -26,6 +26,23 @@ pub struct LrUnitParams {
     pub sgr_xqd: [i8; 2],
 }
 
+impl LrUnitParams {
+    /// The parameters the encoder's restoration search chose for a unit.
+    pub fn from_unit(u: &super::lr::LrUnit) -> LrUnitParams {
+        use super::lr::LrType;
+        LrUnitParams {
+            kind: match u.kind {
+                LrType::None => RESTORE_NONE,
+                LrType::Wiener => RESTORE_WIENER,
+                LrType::Sgrproj => RESTORE_SGRPROJ,
+            },
+            wiener: u.wiener,
+            sgr_set: u.sgr_set,
+            sgr_xqd: u.sgr_xqd,
+        }
+    }
+}
+
 /// Everything decoded for a frame that later stages (loop filters, output) need.
 #[derive(Clone)]
 pub struct FrameState {
@@ -158,6 +175,8 @@ pub struct Blk {
     pub cdef_value: u32,
     pub delta_q: i32,
     pub delta_lf_values: [i32; 4],
+    /// Encoder: the coefficients chosen for this block by the search, reused instead of analysing it again.
+    pub pre: Option<std::sync::Arc<Vec<StoredCoefs>>>,
 }
 
 /// Quantized coefficients of one transform block in the specification's raster order
@@ -181,6 +200,8 @@ pub struct StoredCoefs {
     pub eob: usize,
     /// Non-zero coefficients as (position, value).
     pub coefs: Vec<(u16, i32)>,
+    /// Encoder: hash of the residual these were chosen for (0 when unknown), to tell whether they still apply.
+    pub hash: u64,
 }
 
 const SB_MI_MAX: usize = 32;
@@ -232,6 +253,10 @@ pub struct TileCoder<'a, C: Coder> {
     pub stats: bool,
     pub dbg_snap: Option<Vec<Vec<u16>>>,
     pub an_planes: u8,
+    /// Whether the transform-type search tries every candidate type (off while ranking modes: DCT only).
+    pub full_tx: bool,
+    /// Coefficients still to be applied from a block's `pre` list while analysing it.
+    pub pre_coefs: std::collections::VecDeque<StoredCoefs>,
     pub an_dist: f64,
     pub an_bits: u64,
 }
@@ -289,6 +314,8 @@ impl<'a, C: Coder> TileCoder<'a, C> {
             stats: std::env::var_os("AV1_STATS").is_some(),
             dbg_snap: None,
             an_planes: 7,
+            full_tx: true,
+            pre_coefs: Default::default(),
             an_dist: 0.0,
             an_bits: 0,
         }
@@ -427,19 +454,27 @@ impl<'a, C: Coder> TileCoder<'a, C> {
 
     fn read_lr_unit(&mut self, plane: usize, ur: usize, uc: usize) {
         let frame_kind = self.f.hdr.lr.kind[plane];
+        let cols = self.f.lr_units[plane].0;
+        // The encoder writes the parameters it stored for this unit; the decoder ignores `want`.
+        let want = if C::DECODING { LrUnitParams::default() } else { self.f.lr_units[plane].2[ur * cols + uc] };
         let mut p = LrUnitParams::default();
         let restoration_type = match frame_kind {
             RESTORE_WIENER => {
-                let s = self.c.symbol(&mut self.cdf.lr_wiener, 0);
+                let s = self.c.symbol(&mut self.cdf.lr_wiener, (want.kind == RESTORE_WIENER) as usize);
                 if s != 0 { RESTORE_WIENER } else { RESTORE_NONE }
             }
             RESTORE_SGRPROJ => {
-                let s = self.c.symbol(&mut self.cdf.lr_sgrproj, 0);
+                let s = self.c.symbol(&mut self.cdf.lr_sgrproj, (want.kind == RESTORE_SGRPROJ) as usize);
                 if s != 0 { RESTORE_SGRPROJ } else { RESTORE_NONE }
             }
             _ => {
                 debug_assert_eq!(frame_kind, RESTORE_SWITCHABLE);
-                match self.c.symbol(&mut self.cdf.lr_switchable, 0) {
+                let w = match want.kind {
+                    RESTORE_WIENER => 1,
+                    RESTORE_SGRPROJ => 2,
+                    _ => 0,
+                };
+                match self.c.symbol(&mut self.cdf.lr_switchable, w) {
                     0 => RESTORE_NONE,
                     1 => RESTORE_WIENER,
                     _ => RESTORE_SGRPROJ,
@@ -457,25 +492,32 @@ impl<'a, C: Coder> TileCoder<'a, C> {
                     p.wiener[pass][0] = 0;
                 }
                 for j in first..3 {
-                    let v = self.decode_signed_subexp_with_ref(
+                    let v = self.code_signed_subexp_with_ref(
                         MIN[j],
                         MAX[j] + 1,
                         K[j],
                         self.ref_lr_wiener[plane][pass][j],
+                        want.wiener[pass][j] as i32,
                     );
                     p.wiener[pass][j] = v as i8;
                     self.ref_lr_wiener[plane][pass][j] = v;
                 }
             }
         } else if restoration_type == RESTORE_SGRPROJ {
-            let set = self.c.literal(4, 0) as usize;
+            let set = self.c.literal(4, want.sgr_set as u32) as usize;
             p.sgr_set = set as u8;
             const MIN: [i32; 2] = [-96, -32];
             const MAX: [i32; 2] = [31, 95];
             for i in 0..2 {
                 let radius = SGR_RADII[set][i];
                 let v = if radius != 0 {
-                    self.decode_signed_subexp_with_ref(MIN[i], MAX[i] + 1, 4, self.ref_sgr_xqd[plane][i])
+                    self.code_signed_subexp_with_ref(
+                        MIN[i],
+                        MAX[i] + 1,
+                        4,
+                        self.ref_sgr_xqd[plane][i],
+                        want.sgr_xqd[i] as i32,
+                    )
                 } else if i == 1 {
                     ((1 << 7) - self.ref_sgr_xqd[plane][0]).clamp(MIN[i], MAX[i])
                 } else {
@@ -485,53 +527,66 @@ impl<'a, C: Coder> TileCoder<'a, C> {
                 self.ref_sgr_xqd[plane][i] = v;
             }
         }
-        let cols = self.f.lr_units[plane].0;
         self.f.lr_units[plane].2[ur * cols + uc] = p;
     }
 
-    fn decode_signed_subexp_with_ref(&mut self, low: i32, high: i32, k: u32, r: i32) -> i32 {
-        let x = self.decode_unsigned_subexp_with_ref(high - low, k, r - low);
+    fn code_signed_subexp_with_ref(&mut self, low: i32, high: i32, k: u32, r: i32, want: i32) -> i32 {
+        let x = self.code_unsigned_subexp_with_ref(high - low, k, r - low, want - low);
         x + low
     }
 
-    fn decode_unsigned_subexp_with_ref(&mut self, mx: i32, k: u32, r: i32) -> i32 {
-        let v = self.decode_subexp(mx, k);
-        if (r << 1) <= mx { inverse_recenter(r, v) } else { mx - 1 - inverse_recenter(mx - 1 - r, v) }
+    fn code_unsigned_subexp_with_ref(&mut self, mx: i32, k: u32, r: i32, want: i32) -> i32 {
+        // Forward recentering of the wanted value (the encoder's side of `inverse_recenter`).
+        let mirrored = (r << 1) > mx;
+        let v_want = if C::DECODING {
+            0
+        } else if mirrored {
+            recenter(mx - 1 - r, mx - 1 - want)
+        } else {
+            recenter(r, want)
+        };
+        let v = self.code_subexp(mx, k, v_want);
+        if mirrored { mx - 1 - inverse_recenter(mx - 1 - r, v) } else { inverse_recenter(r, v) }
     }
 
-    fn decode_subexp(&mut self, num_syms: i32, k: u32) -> i32 {
+    fn code_subexp(&mut self, num_syms: i32, k: u32, want: i32) -> i32 {
         let mut i = 0;
         let mut mk = 0;
         loop {
             let b2 = if i != 0 { k + i - 1 } else { k };
             let a = 1 << b2;
             if num_syms <= mk + 3 * a {
-                let v = self.literal_ns((num_syms - mk) as u32);
+                let v = self.code_ns((num_syms - mk) as u32, want.wrapping_sub(mk) as u32);
                 return v as i32 + mk;
             }
-            let more = self.c.literal(1, 0) != 0;
+            let more = self.c.literal(1, (want >= mk + a) as u32) != 0;
             if more {
                 i += 1;
                 mk += a;
             } else {
-                let v = self.c.literal(b2, 0);
+                let v = self.c.literal(b2, want.wrapping_sub(mk) as u32);
                 return v as i32 + mk;
             }
         }
     }
 
-    /// `NS(n)` coded with literal bits.
     fn literal_ns(&mut self, n: u32) -> u32 {
+        self.code_ns(n, 0)
+    }
+
+    /// `NS(n)` coded with literal bits.
+    fn code_ns(&mut self, n: u32, want: u32) -> u32 {
         if n <= 1 {
             return 0;
         }
         let w = 32 - n.leading_zeros();
         let m = (1u32 << w) - n;
-        let v = self.c.literal(w - 1, 0);
+        let hi = if want < m { want } else { want.wrapping_add(m) >> 1 };
+        let v = self.c.literal(w - 1, hi);
         if v < m {
             return v;
         }
-        let extra = self.c.literal(1, 0);
+        let extra = self.c.literal(1, want.wrapping_add(m) & 1);
         (v << 1) - m + extra
     }
 
@@ -813,7 +868,10 @@ impl<'a, C: Coder> TileCoder<'a, C> {
 
     fn intra_frame_mode_info(&mut self, b: &mut Blk) -> Result<()> {
         let seg_pre_skip = self.f.hdr.seg.seg_id_pre_skip;
-        b.skip = false;
+        // The encoder arrives with the planned skip flag; the decoder starts from false.
+        if C::DECODING {
+            b.skip = false;
+        }
         if seg_pre_skip {
             self.intra_segment_id(b);
         }
@@ -1313,6 +1371,17 @@ impl<'a, C: Coder> TileCoder<'a, C> {
                 b.tx_size = SPLIT_TX_SIZE[b.tx_size as usize];
             }
         }
+    }
+}
+
+/// The encoder's side of [`inverse_recenter`].
+fn recenter(r: i32, v: i32) -> i32 {
+    if v > 2 * r {
+        v
+    } else if v >= r {
+        (v - r) << 1
+    } else {
+        ((r - v) << 1) - 1
     }
 }
 
