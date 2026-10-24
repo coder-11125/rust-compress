@@ -86,3 +86,24 @@ fn dump_stream() {
     let (Ok(f), Ok(o)) = (std::env::var("AV1_FILE"), std::env::var("AV1_OUT")) else { return };
     std::fs::write(o, decode_all(&std::fs::read(f).unwrap()).unwrap().1).unwrap();
 }
+
+/// Development helper: with `AVIF_FILE` and `AVIF_OUT` set, decode that animated AVIF and write its frames as RGBA.
+#[test]
+fn dump_avif_animation() {
+    let (Ok(f), Ok(o)) = (std::env::var("AVIF_FILE"), std::env::var("AVIF_OUT")) else { return };
+    let anim = rust_compress::avif::decode_animation(&std::fs::read(f).unwrap()).unwrap();
+    let mut out = Vec::new();
+    for fr in &anim.frames {
+        let img = fr.image.to_depth8();
+        let ch = img.color.channels();
+        for px in img.data.chunks_exact(ch) {
+            match ch {
+                1 => out.extend_from_slice(&[px[0], px[0], px[0], 255]),
+                2 => out.extend_from_slice(&[px[0], px[0], px[0], px[1]]),
+                3 => out.extend_from_slice(&[px[0], px[1], px[2], 255]),
+                _ => out.extend_from_slice(px),
+            }
+        }
+    }
+    std::fs::write(o, out).unwrap();
+}

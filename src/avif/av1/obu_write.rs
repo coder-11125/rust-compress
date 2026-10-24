@@ -123,25 +123,40 @@ fn write_delta_q(w: &mut BitWriter, v: i32) {
     }
 }
 
-/// The frame header bits for a shown key frame (no tile data), in a reduced still picture sequence or a general
-/// one with order hints off.
+/// The frame header bits for a shown key frame or an inter frame (no tile data), in a reduced still picture
+/// sequence or a general one with order hints off. Inter frames use no reference frame context (`primary_ref_frame`
+/// none), keep their result in slot 0 and predict from it alone.
 pub fn frame_header_bits(s: &SequenceHeader, h: &FrameHeader, w: &mut BitWriter) {
-    assert!(h.frame_type == KEY_FRAME && h.show_frame);
+    assert!(h.show_frame && (h.frame_type == KEY_FRAME || h.frame_type == INTER_FRAME));
+    let inter = h.frame_type == INTER_FRAME;
     if !s.reduced_still_picture_header {
-        assert!(!s.enable_order_hint, "key frames with order hints are not written");
+        assert!(!s.enable_order_hint, "frames with order hints are not written");
         w.bit(false); // show_existing_frame
-        w.bits(KEY_FRAME as u32, 2);
+        w.bits(h.frame_type as u32, 2);
         w.bit(true); // show_frame
+        if inter {
+            w.bit(false); // error_resilient_mode
+        }
     }
     w.bit(h.disable_cdf_update);
     w.bit(h.allow_screen_content_tools);
-    if h.allow_screen_content_tools {
+    if h.allow_screen_content_tools && !inter {
         w.bit(h.force_integer_mv);
+    } else if h.allow_screen_content_tools {
+        assert!(!h.force_integer_mv, "inter frames with integer vectors are not written");
+        w.bit(false);
     }
     if !s.reduced_still_picture_header {
         w.bit(false); // frame_size_override_flag
     }
-    // order_hint, primary_ref_frame, refresh_frame_flags: implied.
+    if inter {
+        w.bits(PRIMARY_REF_NONE as u32, 3);
+        w.bits(h.refresh_frame_flags as u32, 8);
+        for i in 0..7 {
+            w.bits(h.ref_frame_idx[i] as u32, 3);
+        }
+    }
+    // order_hint, primary_ref_frame, refresh_frame_flags of key frames: implied.
     if s.enable_superres {
         w.bit(h.use_superres);
         if h.use_superres {
@@ -149,7 +164,14 @@ pub fn frame_header_bits(s: &SequenceHeader, h: &FrameHeader, w: &mut BitWriter)
         }
     }
     w.bit(false); // render_and_frame_size_different
-    if h.allow_screen_content_tools && h.upscaled_width == h.frame_width {
+    if inter {
+        w.bit(h.allow_high_precision_mv);
+        w.bit(h.interpolation_filter == SWITCHABLE);
+        if h.interpolation_filter != SWITCHABLE {
+            w.bits(h.interpolation_filter as u32, 2);
+        }
+        w.bit(h.is_motion_mode_switchable);
+    } else if h.allow_screen_content_tools && h.upscaled_width == h.frame_width {
         w.bit(h.allow_intrabc);
     }
     if !s.reduced_still_picture_header && !h.disable_cdf_update {
@@ -295,7 +317,16 @@ pub fn frame_header_bits(s: &SequenceHeader, h: &FrameHeader, w: &mut BitWriter)
     if !h.coded_lossless {
         w.bit(h.tx_mode_select);
     }
+    if inter {
+        w.bit(h.reference_select);
+        // No skip mode (no order hints) and no warped motion (sequence flag off).
+    }
     w.bit(h.reduced_tx_set);
+    if inter {
+        for _ in 0..7 {
+            w.bit(false); // is_global
+        }
+    }
 }
 
 fn write_tile_info(s: &SequenceHeader, h: &FrameHeader, w: &mut BitWriter) {

@@ -154,7 +154,7 @@ impl<C: Coder> TileCoder<'_, C> {
     /// block of `b`, returning the coefficients in coding order.
     pub(crate) fn analyze_block(&mut self, b: &mut Blk) -> Vec<StoredCoefs> {
         let saved = self.block_decoded;
-        if b.use_intrabc {
+        if b.is_inter {
             // The transform tree reads InterTxSizes, which the block's syntax would set; the plan is unsplit.
             let (rows, cols) = (self.f.mi_rows, self.f.mi_cols);
             let (bw4, bh4) = (NUM_4X4_WIDE[b.bsize as usize] as usize, NUM_4X4_HIGH[b.bsize as usize] as usize);
@@ -330,6 +330,8 @@ pub struct EncodeParams {
     pub intrabc: bool,
     /// This pass codes the frame with intra block copy allowed (set by the trial, not by callers).
     pub ibc_frame: bool,
+    /// Code an inter frame predicted from this picture (the previous output) instead of a key frame.
+    pub reference: Option<std::sync::Arc<Frame>>,
 }
 
 impl Default for EncodeParams {
@@ -343,6 +345,7 @@ impl Default for EncodeParams {
             still: true,
             intrabc: true,
             ibc_frame: false,
+            reference: None,
         }
     }
 }
@@ -406,7 +409,7 @@ pub fn make_sequence_header(color: &ColorConfig, width: usize, height: usize, st
 /// rate-distortion terms is kept: block copy frames cannot use the deblocking, CDEF and restoration filters.
 pub fn encode_picture(src: &Frame, color: &ColorConfig, p: &EncodeParams) -> Result<Encoded> {
     let plain = encode_frame(src, color, &EncodeParams { ibc_frame: false, ..p.clone() })?;
-    if !p.intrabc || p.ibc_frame || src.width < 128 || src.height < 64 || p.base_q_idx == 0 {
+    if !p.intrabc || p.ibc_frame || p.reference.is_some() || src.width < 128 || src.height < 64 || p.base_q_idx == 0 {
         return Ok(plain);
     }
     let (w, h) = (src.width, src.height);
@@ -477,7 +480,35 @@ fn encode_frame(src: &Frame, color: &ColorConfig, p: &EncodeParams) -> Result<En
         hdr.allow_intrabc = true;
     }
 
+    if p.reference.is_some() {
+        hdr.frame_type = obu::INTER_FRAME;
+        hdr.refresh_frame_flags = 1;
+        hdr.ref_frame_idx = [0; 7];
+        hdr.interpolation_filter = EIGHTTAP;
+        hdr.primary_ref_frame = obu::PRIMARY_REF_NONE;
+        hdr.gm_params = [obu::DEFAULT_GM_PARAMS; 8];
+        hdr.loop_filter.delta_enabled = false;
+    }
     let mut fs = FrameState::new(&seq, &hdr)?;
+    if let Some(rf) = &p.reference {
+        let mut set = super::refs::RefSet::default();
+        for i in 1..8 {
+            set.views[i] = Some(super::refs::RefView {
+                frame: rf.clone(),
+                upscaled_width: w,
+                frame_width: w,
+                frame_height: h,
+                mi_cols: hdr.mi_cols,
+                mi_rows: hdr.mi_rows,
+                order_hint: 0,
+                frame_type: obu::KEY_FRAME,
+                saved_order_hints: [0; 8],
+                mf_ref_frames: None,
+                mf_mvs: None,
+            });
+        }
+        fs.refs = Some(std::sync::Arc::new(set));
+    }
     let planes = pad_source(&fs, src);
     let ibc = if p.ibc_frame {
         ibc_search::IbcIndex::build(&planes[0], planes[0].width, planes[0].height).map(std::sync::Arc::new)
@@ -578,6 +609,7 @@ fn encode_frame(src: &Frame, color: &ColorConfig, p: &EncodeParams) -> Result<En
                     hdr.lr.unit_size[2] = choice.planes[1].unit_size;
                 }
                 let mut fs2 = FrameState::new(&seq, &hdr)?;
+                fs2.refs = fs.refs.clone();
                 for (i, pc) in choice.planes.iter().enumerate() {
                     if pc.kind == obu::RESTORE_NONE {
                         continue;

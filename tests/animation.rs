@@ -70,6 +70,53 @@ fn animation_round_trips_with_timing_and_looping() {
     }
 }
 
+/// A smooth random texture, shifted by (3t, t) pixels per frame: what a camera pan looks like.
+fn panning(w: u32, h: u32, t: u32) -> Image {
+    let hash = |x: i32, y: i32| -> f64 {
+        let mut v = (x as u32).wrapping_mul(0x9e37_79b1) ^ (y as u32).wrapping_mul(0x85eb_ca6b) ^ 0x1234_5678;
+        v ^= v >> 15;
+        v = v.wrapping_mul(0x2c1b_3c6d);
+        v ^= v >> 12;
+        (v & 0xffff) as f64 / 65535.0
+    };
+    let noise = |fx: f64, fy: f64| -> f64 {
+        let (x0, y0) = (fx.floor(), fy.floor());
+        let (tx, ty) = (fx - x0, fy - y0);
+        let (x0, y0) = (x0 as i32, y0 as i32);
+        let top = hash(x0, y0) * (1.0 - tx) + hash(x0 + 1, y0) * tx;
+        let bottom = hash(x0, y0 + 1) * (1.0 - tx) + hash(x0 + 1, y0 + 1) * tx;
+        top * (1.0 - ty) + bottom * ty
+    };
+    let mut data = Vec::new();
+    for y in 0..h {
+        for x in 0..w {
+            let (u, v) = ((x + 3 * t) as f64, (y + t) as f64);
+            let value = 0.5 * noise(u / 8.0, v / 8.0) + 0.3 * noise(u / 3.0, v / 3.0) + 0.2 * noise(u / 1.5, v / 1.5);
+            let g = (value * 255.0) as u8;
+            data.extend_from_slice(&[g, (g as u32 * 9 / 10) as u8, (255 - g) / 2 + 40]);
+        }
+    }
+    Image::new(w, h, ColorType::Rgb, 8, data).unwrap()
+}
+
+#[test]
+fn inter_frames_make_a_panning_animation_much_smaller() {
+    let frames: Vec<AnimFrame> = (0..6).map(|t| AnimFrame { image: panning(128, 96, t), duration_ms: 100 }).collect();
+    let anim = Animation { width: 128, height: 96, frames, loop_forever: true };
+    let bytes = encode_animation(&anim, &opts()).unwrap();
+    let separate: usize = anim.frames.iter().map(|f| avif::encode::encode(&f.image, &opts()).unwrap().len()).sum();
+    assert!(bytes.len() * 10 < separate * 6, "animation {} bytes, frames coded separately {separate}", bytes.len());
+    let seq = sequence::parse(&bytes).unwrap().expect("a movie box");
+    let color = seq.color().unwrap();
+    assert!(color.samples[0].sync);
+    assert!(color.samples[1..].iter().any(|s| !s.sync), "later frames are inter frames");
+    let back = avif::decode_animation(&bytes).unwrap();
+    for (i, (a, b)) in anim.frames.iter().zip(&back.frames).enumerate() {
+        let p = psnr(&a.image, &b.image);
+        assert!(p > 28.0, "frame {i}: PSNR {p:.1}");
+    }
+}
+
 #[test]
 fn a_single_play_animation_does_not_loop() {
     let mut anim = animation(ColorType::Rgb, 3);
@@ -97,7 +144,7 @@ fn sample_tables_describe_every_frame() {
     assert_eq!((color.samples.len(), alpha.samples.len()), (6, 6));
     assert_eq!(color.timescale, 1000);
     for t in [color, alpha] {
-        assert!(t.samples.iter().all(|s| s.sync), "every frame is a key frame");
+        assert!(t.samples[0].sync, "the first frame is a key frame");
         assert!(t.samples.iter().all(|s| s.offset + s.size as u64 <= bytes.len() as u64));
         assert_eq!(t.samples.iter().map(|s| s.duration).collect::<Vec<_>>(), vec![40, 60, 80, 100, 120, 140]);
     }

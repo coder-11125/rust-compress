@@ -201,14 +201,14 @@ fn wedge_masks() -> &'static Vec<[Vec<Vec<u8>>; 2]> {
 
 /// The rounding variables of the inter prediction process (InterRound0, InterRound1, InterPostRound).
 #[derive(Clone, Copy)]
-struct Rounding {
-    r0: i32,
-    r1: i32,
-    post: i32,
+pub(crate) struct Rounding {
+    pub r0: i32,
+    pub r1: i32,
+    pub post: i32,
 }
 
 impl Rounding {
-    fn new(bit_depth: i32, is_compound: bool) -> Rounding {
+    pub(crate) fn new(bit_depth: i32, is_compound: bool) -> Rounding {
         let r0 = if bit_depth == 12 { 5 } else { 3 };
         let r1 = match (is_compound, bit_depth == 12) {
             (true, _) => 7,
@@ -267,8 +267,7 @@ impl<C: Coder> TileCoder<'_, C> {
                     if cand_row + r >= self.f.mi_rows || cand_col + c >= self.f.mi_cols {
                         continue;
                     }
-                    let i = self.mi(cand_row + r, cand_col + c);
-                    if self.f.ref_frame[i][0] == INTRA_FRAME {
+                    if self.motion_at(b, cand_row + r, cand_col + c).0[0] == INTRA_FRAME {
                         some_use_intra = true;
                     }
                 }
@@ -294,6 +293,17 @@ impl<C: Coder> TileCoder<'_, C> {
             }
         }
         Ok(())
+    }
+
+    /// Reference frames, vectors and filters of the 4x4 block at (`row`, `col`): the current block's own values
+    /// (not stored yet while it is being predicted) or what was stored for an earlier block.
+    fn motion_at(&self, b: &Blk, row: usize, col: usize) -> ([i8; 2], [[i32; 2]; 2], [u8; 2]) {
+        let (bh4, bw4) = (NUM_4X4_HIGH[b.bsize as usize] as usize, NUM_4X4_WIDE[b.bsize as usize] as usize);
+        if row >= b.mi_row && row < b.mi_row + bh4 && col >= b.mi_col && col < b.mi_col + bw4 {
+            return (b.ref_frame, b.mv, b.interp_filter);
+        }
+        let i = self.mi(row, col);
+        (self.f.ref_frame[i], self.f.mvs[i], self.f.interp_filter[i])
     }
 
     /// The intra prediction that an inter-intra block blends its inter prediction with (written to the frame first).
@@ -329,10 +339,7 @@ impl<C: Coder> TileCoder<'_, C> {
         cand_row: usize,
         cand_col: usize,
     ) -> Result<()> {
-        let ci = self.mi(cand_row, cand_col);
-        let cand_refs = self.f.ref_frame[ci];
-        let cand_mvs = self.f.mvs[ci];
-        let cand_filt = self.f.interp_filter[ci];
+        let (cand_refs, cand_mvs, cand_filt) = self.motion_at(b, cand_row, cand_col);
         let is_compound = cand_refs[1] > INTRA_FRAME;
         let bd = self.f.seq.color.bit_depth as i32;
         let rnd = Rounding::new(bd, is_compound);
@@ -553,7 +560,7 @@ impl<C: Coder> TileCoder<'_, C> {
 
     /// The block inter prediction process (7.11.3.4) with the motion vector scaling process (7.11.3.3).
     #[allow(clippy::too_many_arguments)]
-    fn block_inter(
+    pub(crate) fn block_inter(
         &self,
         view: &RefView,
         plane: usize,

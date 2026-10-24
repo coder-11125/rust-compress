@@ -271,6 +271,7 @@ pub struct TileCoder<'a, C: Coder> {
     pub(crate) left_seg_pred: Vec<u8>,
     /// Local warp candidates of the block being parsed (`CandList`).
     pub(crate) warp_cands: Vec<[i32; 4]>,
+    pub(crate) trace: bool,
     pub(crate) num_samples: usize,
     pub(crate) local_warp: Option<[i32; 6]>,
     pub(crate) mask: Vec<u8>,
@@ -350,6 +351,7 @@ impl<'a, C: Coder> TileCoder<'a, C> {
             above_seg_pred: vec![0; mi_cols + 32],
             left_seg_pred: vec![0; mi_rows + 32],
             warp_cands: Vec::new(),
+            trace: std::env::var_os("AV1_TRACE").is_some(),
             num_samples: 0,
             local_warp: None,
             mask: Vec::new(),
@@ -406,6 +408,45 @@ impl<'a, C: Coder> TileCoder<'a, C> {
     }
 
     #[inline]
+    /// Record a block's mode info in the per-position arrays that later blocks use as context.
+    pub(crate) fn store_block_info(&mut self, b: &Blk) {
+        let (r, c) = (b.mi_row, b.mi_col);
+        let bsize = b.bsize;
+        let bw4 = NUM_4X4_WIDE[bsize as usize] as usize;
+        let bh4 = NUM_4X4_HIGH[bsize as usize] as usize;
+        let (rows, cols) = (self.f.mi_rows, self.f.mi_cols);
+        let dlf = [self.delta_lf[0] as i8, self.delta_lf[1] as i8, self.delta_lf[2] as i8, self.delta_lf[3] as i8];
+        for y in 0..bh4 {
+            if r + y >= rows {
+                break;
+            }
+            for x in 0..bw4 {
+                if c + x >= cols {
+                    break;
+                }
+                let i = (r + y) * cols + c + x;
+                self.f.mi_size[i] = b.bsize;
+                self.f.skip[i] = b.skip as u8;
+                self.f.y_mode[i] = b.y_mode;
+                self.f.uv_mode[i] = b.uv_mode;
+                self.f.seg_id[i] = b.segment_id;
+                self.f.tx_size[i] = b.tx_size;
+                self.f.is_inter[i] = b.is_inter as u8;
+                self.f.skip_mode[i] = b.skip_mode as u8;
+                self.f.comp_group_idx[i] = b.comp_group_idx;
+                self.f.compound_idx[i] = b.compound_idx;
+                self.f.interp_filter[i] = b.interp_filter;
+                self.f.ref_frame[i] = b.ref_frame;
+                if b.is_inter {
+                    self.f.mvs[i] = b.mv;
+                }
+                self.f.pal_size[0][i] = b.pal_size_y;
+                self.f.pal_size[1][i] = b.pal_size_uv;
+                self.f.delta_lf[i] = dlf;
+            }
+        }
+    }
+
     pub(crate) fn mi(&self, r: usize, c: usize) -> usize {
         r * self.f.mi_cols + c
     }
@@ -851,38 +892,25 @@ impl<'a, C: Coder> TileCoder<'a, C> {
         if b.skip {
             self.reset_block_context(&b);
         }
-        // Store per-block information.
-        let (rows, cols) = (self.f.mi_rows, self.f.mi_cols);
-        let dlf = [self.delta_lf[0] as i8, self.delta_lf[1] as i8, self.delta_lf[2] as i8, self.delta_lf[3] as i8];
-        for y in 0..bh4 {
-            if r + y >= rows {
-                break;
-            }
-            for x in 0..bw4 {
-                if c + x >= cols {
-                    break;
-                }
-                let i = (r + y) * cols + c + x;
-                self.f.mi_size[i] = bsize;
-                self.f.skip[i] = b.skip as u8;
-                self.f.y_mode[i] = b.y_mode;
-                self.f.uv_mode[i] = b.uv_mode;
-                self.f.seg_id[i] = b.segment_id;
-                self.f.tx_size[i] = b.tx_size;
-                self.f.is_inter[i] = b.is_inter as u8;
-                self.f.skip_mode[i] = b.skip_mode as u8;
-                self.f.comp_group_idx[i] = b.comp_group_idx;
-                self.f.compound_idx[i] = b.compound_idx;
-                self.f.interp_filter[i] = b.interp_filter;
-                self.f.ref_frame[i] = b.ref_frame;
-                if b.is_inter {
-                    self.f.mvs[i] = b.mv;
-                }
-                self.f.pal_size[0][i] = b.pal_size_y;
-                self.f.pal_size[1][i] = b.pal_size_uv;
-                self.f.delta_lf[i] = dlf;
-            }
+        if self.trace {
+            eprintln!(
+                "BLK r{} c{} sz{} inter{} mode{} ref{:?} mv{:?} skip{} tx{} filt{:?} ymode{} uv{}",
+                b.mi_row,
+                b.mi_col,
+                b.bsize,
+                b.is_inter,
+                b.y_mode,
+                b.ref_frame,
+                b.mv,
+                b.skip,
+                b.tx_size,
+                b.interp_filter,
+                b.y_mode,
+                b.uv_mode
+            );
         }
+        self.store_block_info(&b);
+        let (rows, cols) = (self.f.mi_rows, self.f.mi_cols);
         for x in 0..bw4 {
             if c + x < cols + 32 {
                 self.above_pal[0][c + x] = b.pal_y;

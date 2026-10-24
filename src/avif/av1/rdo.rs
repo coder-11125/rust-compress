@@ -90,10 +90,15 @@ impl<C: Coder> TileCoder<'_, C> {
             }
             return bits;
         }
-        let above = if b.avail_u { self.f.y_mode[self.mi(r - 1, c)] } else { DC_PRED };
-        let left = if b.avail_l { self.f.y_mode[self.mi(r, c - 1)] } else { DC_PRED };
-        let (ac, lc) = (INTRA_MODE_CONTEXT[above as usize] as usize, INTRA_MODE_CONTEXT[left as usize] as usize);
-        bits += cdf_cost(&self.cdf.kf_y_mode[ac][lc], b.y_mode as usize);
+        if self.f.hdr.is_intra() {
+            let above = if b.avail_u { self.f.y_mode[self.mi(r - 1, c)] } else { DC_PRED };
+            let left = if b.avail_l { self.f.y_mode[self.mi(r, c - 1)] } else { DC_PRED };
+            let (ac, lc) = (INTRA_MODE_CONTEXT[above as usize] as usize, INTRA_MODE_CONTEXT[left as usize] as usize);
+            bits += cdf_cost(&self.cdf.kf_y_mode[ac][lc], b.y_mode as usize);
+        } else {
+            bits += cdf_cost(&self.cdf.is_inter[self.is_inter_ctx(b)], 0);
+            bits += cdf_cost(&self.cdf.y_mode[SIZE_GROUP[b.bsize as usize] as usize], b.y_mode as usize);
+        }
         if b.bsize >= BLOCK_8X8 && is_directional(b.y_mode) {
             bits += cdf_cost(&self.cdf.angle_delta[(b.y_mode - V_PRED) as usize], (b.angle_y + 3) as usize);
         }
@@ -185,18 +190,26 @@ impl<C: Coder> TileCoder<'_, C> {
     /// copy. Returns its cost and syntax, with the frame buffer holding the block's reconstruction.
     pub(crate) fn eval_leaf(&mut self, r: usize, c: usize, bsize: u8) -> (f64, Blk) {
         let ibc = self.eval_ibc(r, c, bsize);
+        let inter = self.eval_inter(r, c, bsize);
         let (j, blk) = self.eval_leaf_intra(r, c, bsize);
-        if let Some((jb, mut tb)) = ibc
-            && jb < j
-        {
-            // The intra evaluation overwrote the buffer; put the block copy reconstruction back.
-            self.full_tx = true;
-            let (log, _, _) = self.analyze_planes(&mut tb, 7);
-            tb.skip = log.iter().all(|s| s.eob == 0);
-            tb.pre = Some(std::sync::Arc::new(log));
-            self.last_dv = tb.mv[0];
-            return (jb, tb);
+        let mut best = (j, blk, false);
+        for cand in [ibc, inter].into_iter().flatten() {
+            if cand.0 < best.0 {
+                best = (cand.0, cand.1, true);
+            }
         }
+        let (j, mut blk, redo) = best;
+        if redo {
+            // The intra evaluation overwrote the buffer; put the winning reconstruction back.
+            self.full_tx = true;
+            let (log, _, _) = self.analyze_planes(&mut blk, 7);
+            blk.skip = log.iter().all(|s| s.eob == 0);
+            blk.pre = Some(std::sync::Arc::new(log));
+            if blk.use_intrabc {
+                self.last_dv = blk.mv[0];
+            }
+        }
+        self.store_block_info(&blk);
         (j, blk)
     }
 
@@ -255,7 +268,7 @@ impl<C: Coder> TileCoder<'_, C> {
     /// Choose and evaluate the best intra leaf block of the given size. Returns its cost and syntax.
     fn eval_leaf_intra(&mut self, r: usize, c: usize, bsize: u8) -> (f64, Blk) {
         let lambda = self.lambda();
-        let mut base = Blk { mi_row: r, mi_col: c, bsize, ..Default::default() };
+        let mut base = Blk { mi_row: r, mi_col: c, bsize, ref_frame: [INTRA_FRAME, NONE_FRAME], ..Default::default() };
         self.set_block_geometry(&mut base);
         let max_rect = MAX_TX_SIZE_RECT[bsize as usize];
         base.tx_size = max_rect;
@@ -519,6 +532,7 @@ impl<C: Coder> TileCoder<'_, C> {
             options.push(PARTITION_SPLIT);
         }
         let effort = self.enc_src.as_ref().map_or(9, |e| e.effort);
+        self.clear_planned(r, c, num4);
         let (mut none_j, mut split_j): (Option<f64>, Option<f64>) = (None, None);
         let mut best: Option<Node> = None;
         let mut last: Option<Node> = None;
@@ -530,6 +544,8 @@ impl<C: Coder> TileCoder<'_, C> {
                     continue;
                 }
             }
+            // Not decoded yet as far as the options of this node are concerned.
+            self.clear_planned(r, c, num4);
             let pbits = self.partition_bits(r, c, bsize, p, has_rows, has_cols);
             let mut node = Node { j: lambda * pbits as f64 / 256.0, parts: vec![p], blks: Vec::new() };
             let sub = partition_subsize(p, bsize);
@@ -593,6 +609,16 @@ impl<C: Coder> TileCoder<'_, C> {
         best
     }
 
+    /// Mark the positions of a square region as not yet decoded (what the motion vector scans look for).
+    fn clear_planned(&mut self, r: usize, c: usize, n4: usize) {
+        let (rows, cols) = (self.f.mi_rows, self.f.mi_cols);
+        for y in r..(r + n4).min(rows) {
+            for x in c..(c + n4).min(cols) {
+                self.f.ref_frame[y * cols + x] = [super::mvpred::UNWRITTEN, NONE_FRAME];
+            }
+        }
+    }
+
     /// Reconstruct planned blocks into the frame buffer (so later predictions see them).
     pub(crate) fn apply_blocks(&mut self, blks: &[Blk]) {
         let full = std::mem::replace(&mut self.full_tx, true);
@@ -600,6 +626,7 @@ impl<C: Coder> TileCoder<'_, C> {
             let mut t = b.clone();
             self.set_block_geometry(&mut t);
             self.analyze_planes(&mut t, 7);
+            self.store_block_info(&t);
         }
         self.full_tx = full;
     }
@@ -608,8 +635,305 @@ impl<C: Coder> TileCoder<'_, C> {
     pub(crate) fn plan_sb(&mut self, r: usize, c: usize) {
         let bs = self.sb_size();
         let node = self.search_node(r, c, bs);
+        // The traversal writes the blocks in order and sees only what precedes each of them.
+        self.clear_planned(r, c, NUM_4X4_WIDE[bs as usize] as usize);
         self.part_cache = node.parts.into();
         self.blk_cache = node.blks.into();
+    }
+}
+
+// -------------------------------------------------------------------------------------------------
+// Inter blocks (predicted from the previous frame)
+// -------------------------------------------------------------------------------------------------
+
+impl<C: Coder> TileCoder<'_, C> {
+    /// `is_inter`'s context.
+    fn is_inter_ctx(&self, b: &Blk) -> usize {
+        let intra_of = |r: usize, c: usize| self.f.ref_frame[self.mi(r, c)][0] <= INTRA_FRAME;
+        let (above, left) =
+            (b.avail_u.then(|| intra_of(b.mi_row - 1, b.mi_col)), b.avail_l.then(|| intra_of(b.mi_row, b.mi_col - 1)));
+        match (above, left) {
+            (Some(a), Some(l)) => {
+                if a && l {
+                    3
+                } else {
+                    (a || l) as usize
+                }
+            }
+            (Some(x), None) | (None, Some(x)) => 2 * x as usize,
+            (None, None) => 0,
+        }
+    }
+
+    /// Cost in 1/256 bit of coding one vector component difference.
+    fn mv_comp_bits(&self, comp: usize, want: i32) -> u64 {
+        let force_integer = self.f.hdr.force_integer_mv;
+        let hp = self.f.hdr.allow_high_precision_mv;
+        let v = want.unsigned_abs() as i32 - 1;
+        let class = if v < 16 { 0 } else { v.ilog2() as usize - 3 };
+        let ctx = 0;
+        let mut bits = cdf_cost(&self.cdf.mv_sign[ctx][comp], (want < 0) as usize);
+        bits += cdf_cost(&self.cdf.mv_class[ctx][comp], class);
+        if class == 0 {
+            let bit = (v >> 3) as usize & 1;
+            bits += cdf_cost(&self.cdf.mv_class0[ctx][comp], bit);
+            if !force_integer {
+                bits += cdf_cost(&self.cdf.mv_class0_fp[ctx][comp][bit], ((v >> 1) & 3) as usize);
+            }
+            if hp {
+                bits += cdf_cost(&self.cdf.mv_class0_hp[ctx][comp], (v & 1) as usize);
+            }
+        } else {
+            let d = (v - (8 << class)) >> 3;
+            for i in 0..class {
+                bits += cdf_cost(&self.cdf.mv_bits[ctx][comp][i], ((d >> i) & 1) as usize);
+            }
+            if !force_integer {
+                bits += cdf_cost(&self.cdf.mv_fp[ctx][comp], ((v >> 1) & 3) as usize);
+            }
+            if hp {
+                bits += cdf_cost(&self.cdf.mv_hp[ctx][comp], (v & 1) as usize);
+            }
+        }
+        bits
+    }
+
+    fn mv_diff_bits(&self, diff: [i32; 2]) -> u64 {
+        let joint = match (diff[0] != 0, diff[1] != 0) {
+            (false, false) => 0,
+            (false, true) => 1,
+            (true, false) => 2,
+            (true, true) => 3,
+        };
+        let mut bits = cdf_cost(&self.cdf.mv_joints[0], joint);
+        for comp in 0..2 {
+            if diff[comp] != 0 {
+                bits += self.mv_comp_bits(comp, diff[comp]);
+            }
+        }
+        bits
+    }
+
+    /// Bits of the mode info of a single-reference inter block (1/256 bit), without coefficients.
+    fn inter_mode_bits(&self, t: &Blk, st: &super::mvpred::MvStack, pred: [i32; 2]) -> u64 {
+        let mut bits = 0;
+        let (r, c) = (t.mi_row, t.mi_col);
+        let mut ctx = 0;
+        if t.avail_u {
+            ctx += self.f.skip[self.mi(r - 1, c)] as usize;
+        }
+        if t.avail_l {
+            ctx += self.f.skip[self.mi(r, c - 1)] as usize;
+        }
+        bits += cdf_cost(&self.cdf.skip[ctx], t.skip as usize);
+        bits += cdf_cost(&self.cdf.is_inter[self.is_inter_ctx(t)], 1);
+        bits += 64; // reference frame: always the same one, nearly free once adapted
+        let mode = t.y_mode;
+        bits += cdf_cost(&self.cdf.new_mv[st.new_mv_context], (mode != NEWMV) as usize);
+        if mode != NEWMV {
+            bits += cdf_cost(&self.cdf.zero_mv[st.zero_mv_context], (mode != GLOBALMV) as usize);
+            if mode != GLOBALMV {
+                bits += cdf_cost(&self.cdf.ref_mv[st.ref_mv_context], (mode == NEARMV) as usize);
+            }
+        }
+        if mode == NEWMV {
+            for idx in 0..2 {
+                if st.num_found > idx + 1 {
+                    bits += cdf_cost(&self.cdf.drl_mode[st.drl_ctx[idx]], (t.ref_mv_idx as usize > idx) as usize);
+                    if t.ref_mv_idx as usize <= idx {
+                        break;
+                    }
+                }
+            }
+            bits += self.mv_diff_bits([t.mv[0][0] - pred[0], t.mv[0][1] - pred[1]]);
+        } else if mode == NEARMV {
+            for idx in 1..3 {
+                if st.num_found > idx + 1 {
+                    bits += cdf_cost(&self.cdf.drl_mode[st.drl_ctx[idx]], (t.ref_mv_idx as usize > idx) as usize);
+                    if t.ref_mv_idx as usize <= idx {
+                        break;
+                    }
+                }
+            }
+        }
+        if self.f.hdr.tx_mode_select && t.bsize > BLOCK_4X4 && !t.skip {
+            bits += cdf_cost(&self.cdf.txfm_split[0], 0);
+        }
+        bits
+    }
+
+    /// The best inter candidate (vector predicted or searched) for a block, as (cost, block), or None.
+    pub(crate) fn eval_inter(&mut self, r: usize, c: usize, bsize: u8) -> Option<(f64, Blk)> {
+        if self.f.hdr.is_intra() || self.f.refs.is_none() || self.f.hdr.coded_lossless {
+            return None;
+        }
+        let lambda = self.lambda();
+        let effort = self.enc_src.as_ref().map_or(9, |e| e.effort);
+        let mut base = Blk { mi_row: r, mi_col: c, bsize, ..Default::default() };
+        self.set_block_geometry(&mut base);
+        base.is_inter = true;
+        base.compound_type = COMPOUND_AVERAGE;
+        base.ref_frame = [LAST_FRAME, NONE_FRAME];
+        base.interp_filter = [self.f.hdr.interpolation_filter; 2];
+        base.tx_size = MAX_TX_SIZE_RECT[bsize as usize];
+        base.y_mode = NEARESTMV;
+        base.uv_mode = DC_PRED;
+        let st = self.find_mv_stack(&base, base.ref_frame, false);
+        let nearest = st.mv[0][0];
+        let mut cands: Vec<(u8, u8, [i32; 2])> = vec![(NEARESTMV, 0, nearest)];
+        if st.num_found > 1 {
+            cands.push((NEARMV, 1, st.mv[1][0]));
+        }
+        cands.push((GLOBALMV, 0, st.global_mvs[0]));
+        let searched = self.motion_search(&base, &st);
+        if !cands.iter().any(|&(_, _, mv)| mv == searched) {
+            cands.push((NEWMV, 0, searched));
+        }
+        let mut best: Option<(f64, Blk)> = None;
+        self.full_tx = effort >= 8;
+        let mask: u32 = std::env::var("AV1_INTER_MODES").ok().and_then(|v| v.parse().ok()).unwrap_or(15);
+        for (mode, idx, mv) in cands {
+            let bit = match mode {
+                NEARESTMV => 1,
+                NEARMV => 2,
+                GLOBALMV => 4,
+                _ => 8,
+            };
+            if mask & bit == 0 {
+                continue;
+            }
+            let mut t = base.clone();
+            t.y_mode = mode;
+            t.ref_mv_idx = idx;
+            t.mv = [mv, [0, 0]];
+            let (log, dist, coef_bits) = self.analyze_planes(&mut t, 7);
+            t.skip = log.iter().all(|s| s.eob == 0);
+            let bits = coef_bits + self.inter_mode_bits(&t, &st, nearest);
+            let j = dist + lambda * bits as f64 / 256.0;
+            if best.as_ref().is_none_or(|b| j < b.0) {
+                best = Some((j, t));
+            }
+        }
+        self.full_tx = true;
+        best
+    }
+
+    /// Block matching of the luma block against the previous frame: integer search from several starting points,
+    /// then half and quarter sample refinement. Returns the vector in 1/8 sample units.
+    fn motion_search(&mut self, b: &Blk, st: &super::mvpred::MvStack) -> [i32; 2] {
+        let effort = self.enc_src.as_ref().map_or(9, |e| e.effort);
+        let (bw, bh) = (block_width(b.bsize), block_height(b.bsize));
+        let (bx, by) = ((b.mi_col * 4) as i32, (b.mi_row * 4) as i32);
+        let refs = self.f.refs.clone().expect("reference frames");
+        let view = refs.get(LAST_FRAME).expect("LAST_FRAME");
+        let (rw, rh) = (view.upscaled_width as i32, view.frame_height as i32);
+        let rp = &view.frame.planes[0];
+        let src = &self.enc_src.as_ref().expect("encoder source").planes[0];
+        let lam = self.lambda().sqrt();
+        let pred = st.mv[0][0];
+        let row_step = if bh >= 32 { 2 } else { 1 };
+        let (dx_min, dx_max) = (-(bx + bw as i32) - 16, rw - bx + 16);
+        let (dy_min, dy_max) = (-(by + bh as i32) - 16, rh - by + 16);
+        // Cost of an integer displacement: SAD plus the vector's bits (as a rough Lagrangian).
+        let mvbits = |dy: i32, dx: i32| -> f64 {
+            let d0 = (dy * 8 - pred[0]).abs() as f64 / 8.0;
+            let d1 = (dx * 8 - pred[1]).abs() as f64 / 8.0;
+            2.0 + 2.0 * ((1.0 + d0).log2() + (1.0 + d1).log2())
+        };
+        let sad_int = |dy: i32, dx: i32, limit: f64| -> f64 {
+            let mut sad = 0u64;
+            let mut i = 0;
+            while i < bh {
+                let yy = (by + dy + i as i32).clamp(0, rh - 1) as usize;
+                let row = &rp.data[yy * rp.stride..];
+                let srow = &src.data[(by as usize + i) * src.stride + bx as usize..];
+                for j in 0..bw {
+                    let xx = (bx + dx + j as i32).clamp(0, rw - 1) as usize;
+                    sad += (srow[j] as i64 - row[xx] as i64).unsigned_abs();
+                }
+                if sad as f64 > limit {
+                    break;
+                }
+                i += row_step;
+            }
+            sad as f64 * row_step as f64
+        };
+        let cost_int = |dy: i32, dx: i32, limit: f64| sad_int(dy, dx, limit) + lam * mvbits(dy, dx);
+        let round8 = |v: i32| (v + 4) >> 3;
+        let mut starts: Vec<(i32, i32)> =
+            vec![(0, 0), (round8(pred[0]), round8(pred[1])), (round8(st.mv[1][0][0]), round8(st.mv[1][0][1]))];
+        for (avail, rr, cc) in
+            [(b.avail_u, b.mi_row.wrapping_sub(1), b.mi_col), (b.avail_l, b.mi_row, b.mi_col.wrapping_sub(1))]
+        {
+            if avail {
+                let i = self.mi(rr, cc);
+                if self.f.ref_frame[i][0] == LAST_FRAME {
+                    starts.push((round8(self.f.mvs[i][0][0]), round8(self.f.mvs[i][0][1])));
+                }
+            }
+        }
+        let clampd = |(dy, dx): (i32, i32)| (dy.clamp(dy_min, dy_max), dx.clamp(dx_min, dx_max));
+        let mut best = (f64::MAX, (0, 0));
+        for s in starts {
+            let s = clampd(s);
+            let j = cost_int(s.0, s.1, best.0);
+            if j < best.0 {
+                best = (j, s);
+            }
+        }
+        let steps: &[i32] = if effort >= 5 { &[32, 16, 8, 4, 2, 1] } else { &[16, 4, 1] };
+        for &step in steps {
+            for _ in 0..16 {
+                let centre = best.1;
+                let mut moved = false;
+                for (dy, dx) in [(-1, 0), (1, 0), (0, -1), (0, 1), (-1, -1), (-1, 1), (1, -1), (1, 1)] {
+                    let p = clampd((centre.0 + dy * step, centre.1 + dx * step));
+                    if p == centre {
+                        continue;
+                    }
+                    let j = cost_int(p.0, p.1, best.0);
+                    if j < best.0 {
+                        best = (j, p);
+                        moved = true;
+                    }
+                }
+                if !moved {
+                    break;
+                }
+            }
+        }
+        // Sub-sample refinement with the real interpolation filter.
+        let bd = self.f.seq.color.bit_depth as i32;
+        let rnd = super::inter_pred::Rounding::new(bd, false);
+        let filt = b.interp_filter;
+        let mut mv = [best.1.0 * 8, best.1.1 * 8];
+        let sub_cost = |this: &Self, mv: [i32; 2]| -> f64 {
+            let pred_px = this.block_inter(view, 0, bx as usize, by as usize, bw, bh, mv, filt, rnd);
+            let mut sad = 0u64;
+            for i in 0..bh {
+                let srow = &src.data[(by as usize + i) * src.stride + bx as usize..];
+                for j in 0..bw {
+                    sad += (srow[j] as i64 - pred_px[i * bw + j] as i64).unsigned_abs();
+                }
+            }
+            let d0 = (mv[0] - pred[0]).abs() as f64 / 8.0;
+            let d1 = (mv[1] - pred[1]).abs() as f64 / 8.0;
+            sad as f64 + lam * (2.0 + 2.0 * ((1.0 + d0).log2() + (1.0 + d1).log2()))
+        };
+        let mut best_sub = sub_cost(self, mv);
+        let sub_steps: &[i32] = if effort >= 3 { &[4, 2] } else { &[4] };
+        for &step in sub_steps {
+            let centre = mv;
+            for (dy, dx) in [(-1, 0), (1, 0), (0, -1), (0, 1), (-1, -1), (-1, 1), (1, -1), (1, 1)] {
+                let cand = [centre[0] + dy * step, centre[1] + dx * step];
+                let j = sub_cost(self, cand);
+                if j < best_sub {
+                    best_sub = j;
+                    mv = cand;
+                }
+            }
+        }
+        mv
     }
 }
 

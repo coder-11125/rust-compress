@@ -65,28 +65,30 @@ impl<C: Coder> TileCoder<'_, C> {
         diff
     }
 
-    /// One vector component. Intra frames force integer vectors, so the fraction bits are implied
-    /// (`mv_fr = 3`, `mv_hp = 1`) and only the sign, class and integer bits are coded.
+    /// One vector component (1/8 sample units). With `force_integer_mv` the fraction bits are implied
+    /// (`mv_fr = 3`, `mv_hp = 1`), and so is `mv_hp` without `allow_high_precision_mv`.
     fn read_mv_component(&mut self, ctx: usize, comp: usize, want: i32) -> i32 {
         let force_integer = self.f.hdr.force_integer_mv;
         let hp = self.f.hdr.allow_high_precision_mv;
-        // Encoder: derive the symbols from the wanted value (in whole samples when integer).
-        let (want_sign, want_class, want_c0_bit, want_d) = if C::DECODING {
-            (0, 0, 0, 0)
+        // Encoder: derive the symbols from the wanted value. With v = |want| - 1, class 0 holds v < 16 and class c
+        // holds [8 << c, 16 << c); the low bits are the integer part's remainder, the fraction and the high-precision bit.
+        let (want_sign, want_class, want_c0_bit, want_d, want_fr, want_hp) = if C::DECODING {
+            (0, 0, 0, 0, 0, 0)
         } else {
-            let mag = want.unsigned_abs() as i32;
-            debug_assert!(force_integer && !hp && mag % 8 == 0 && mag >= 8, "unsupported vector difference {want}");
-            let m = mag / 8;
-            let class = if m <= 2 { 0 } else { (m - 1).ilog2() as usize };
-            let d = if class == 0 { 0 } else { m - (1 << class) - 1 };
-            ((want < 0) as usize, class, (m - 1).clamp(0, 1) as usize, d)
+            let v = want.unsigned_abs() as i32 - 1;
+            debug_assert!(v >= 0, "zero vector component cannot be coded");
+            debug_assert!(!force_integer || v & 7 == 7, "vector difference {want} is not an integer");
+            debug_assert!(hp || v & 1 == 1, "vector difference {want} needs high precision");
+            let class = if v < 16 { 0 } else { v.ilog2() as usize - 3 };
+            let d = if class == 0 { 0 } else { (v - (8 << class)) >> 3 };
+            ((want < 0) as usize, class, (v >> 3).clamp(0, 1) as usize, d, ((v >> 1) & 3) as usize, (v & 1) as usize)
         };
         let sign = self.c.symbol(&mut self.cdf.mv_sign[ctx][comp], want_sign);
         let class = self.c.symbol(&mut self.cdf.mv_class[ctx][comp], want_class);
         let mag = if class == 0 {
             let bit = self.c.symbol(&mut self.cdf.mv_class0[ctx][comp], want_c0_bit);
-            let fr = if force_integer { 3 } else { self.c.symbol(&mut self.cdf.mv_class0_fp[ctx][comp][bit], 3) };
-            let hpv = if hp { self.c.symbol(&mut self.cdf.mv_class0_hp[ctx][comp], 1) } else { 1 };
+            let fr = if force_integer { 3 } else { self.c.symbol(&mut self.cdf.mv_class0_fp[ctx][comp][bit], want_fr) };
+            let hpv = if hp { self.c.symbol(&mut self.cdf.mv_class0_hp[ctx][comp], want_hp) } else { 1 };
             ((bit << 3) | (fr << 1) | hpv) as i32 + 1
         } else {
             let mut d = 0usize;
@@ -94,8 +96,8 @@ impl<C: Coder> TileCoder<'_, C> {
                 let bit = self.c.symbol(&mut self.cdf.mv_bits[ctx][comp][i], ((want_d >> i) & 1) as usize);
                 d |= bit << i;
             }
-            let fr = if force_integer { 3 } else { self.c.symbol(&mut self.cdf.mv_fp[ctx][comp], 3) };
-            let hpv = if hp { self.c.symbol(&mut self.cdf.mv_hp[ctx][comp], 1) } else { 1 };
+            let fr = if force_integer { 3 } else { self.c.symbol(&mut self.cdf.mv_fp[ctx][comp], want_fr) };
+            let hpv = if hp { self.c.symbol(&mut self.cdf.mv_hp[ctx][comp], want_hp) } else { 1 };
             (2i32 << (class + 2)) + (((d << 3) | (fr << 1) | hpv) as i32 + 1)
         };
         if sign != 0 { -mag } else { mag }

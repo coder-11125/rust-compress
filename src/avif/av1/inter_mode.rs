@@ -246,6 +246,19 @@ impl<C: Coder> TileCoder<'_, C> {
         self.read_ref_frames(b, n);
         let compound = b.ref_frame[1] > INTRA_FRAME;
         let st = self.find_mv_stack(b, b.ref_frame, compound);
+        if !C::DECODING && !compound && !b.skip_mode && b.y_mode != NEWMV {
+            // The planner chose the vector from the candidates it saw; if the final candidate list differs, code the
+            // vector explicitly so that the reconstruction it analysed stays the one the decoder produces.
+            let pred = match b.y_mode {
+                NEARESTMV => st.mv[0][0],
+                NEARMV => st.mv[b.ref_mv_idx as usize][0],
+                _ => st.global_mvs[0],
+            };
+            if pred != b.mv[0] {
+                b.y_mode = NEWMV;
+                b.ref_mv_idx = 0;
+            }
+        }
         let seg = b.segment_id as usize;
         let h = &self.f.hdr;
         let skip_or_global = h.seg_feature_active(seg, SEG_LVL_SKIP) || h.seg_feature_active(seg, SEG_LVL_GLOBALMV);
