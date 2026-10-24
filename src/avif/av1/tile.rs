@@ -58,6 +58,12 @@ pub struct FrameState {
     pub seg_id: Vec<u8>,
     pub tx_size: Vec<u8>,
     pub is_inter: Vec<u8>,
+    /// `RefFrames` (intra block copy blocks have `INTRA_FRAME` and the vector in `mvs`), `Mvs`, `InterTxSizes` and
+    /// `TxTypes` (luma, at 4x4 granularity).
+    pub ref_frame: Vec<[i8; 2]>,
+    pub mvs: Vec<[[i32; 2]; 2]>,
+    pub inter_tx_size: Vec<u8>,
+    pub tx_types: Vec<u8>,
     pub pal_size: [Vec<u8>; 2],
     pub delta_lf: Vec<[i8; 4]>,
     /// Loop-filter transform sizes per plane, at the plane's 4x4 grid (`lf_stride[plane]` wide).
@@ -123,6 +129,10 @@ impl FrameState {
             seg_id: vec![0; n],
             tx_size: vec![0; n],
             is_inter: vec![0; n],
+            ref_frame: vec![[super::intrabc::UNWRITTEN, super::intrabc::NONE_FRAME]; n],
+            mvs: vec![[[0; 2]; 2]; n],
+            inter_tx_size: vec![0; n],
+            tx_types: vec![0; n],
             pal_size: [vec![0; n], vec![0; n]],
             delta_lf: vec![[0; 4]; n],
             lf_tx,
@@ -156,6 +166,8 @@ pub struct Blk {
     pub segment_id: u8,
     pub lossless: bool,
     pub use_intrabc: bool,
+    /// Intra block copy displacement vector (row, column) in 1/8 sample units, in list 0.
+    pub mv: [[i32; 2]; 2],
     pub y_mode: u8,
     pub uv_mode: u8,
     pub angle_y: i8,
@@ -255,6 +267,8 @@ pub struct TileCoder<'a, C: Coder> {
     pub an_planes: u8,
     /// Whether the transform-type search tries every candidate type (off while ranking modes: DCT only).
     pub full_tx: bool,
+    /// Encoder: the displacement vector of the most recently planned block copy block.
+    pub last_dv: [i32; 2],
     /// Coefficients still to be applied from a block's `pre` list while analysing it.
     pub pre_coefs: std::collections::VecDeque<StoredCoefs>,
     pub an_dist: f64,
@@ -315,6 +329,7 @@ impl<'a, C: Coder> TileCoder<'a, C> {
             dbg_snap: None,
             an_planes: 7,
             full_tx: true,
+            last_dv: [0, 0],
             pre_coefs: Default::default(),
             an_dist: 0.0,
             an_bits: 0,
@@ -330,7 +345,7 @@ impl<'a, C: Coder> TileCoder<'a, C> {
         if self.f.seq.use_128x128_superblock { BLOCK_128X128 } else { BLOCK_64X64 }
     }
 
-    fn is_inside(&self, r: isize, c: isize) -> bool {
+    pub(crate) fn is_inside(&self, r: isize, c: isize) -> bool {
         c >= self.mi_col_start as isize
             && c < self.mi_col_end as isize
             && r >= self.mi_row_start as isize
@@ -794,6 +809,10 @@ impl<'a, C: Coder> TileCoder<'a, C> {
                 self.f.seg_id[i] = b.segment_id;
                 self.f.tx_size[i] = b.tx_size;
                 self.f.is_inter[i] = b.use_intrabc as u8;
+                self.f.ref_frame[i] = [super::intrabc::INTRA_FRAME, super::intrabc::NONE_FRAME];
+                if b.use_intrabc {
+                    self.f.mvs[i][0] = b.mv[0];
+                }
                 self.f.pal_size[0][i] = b.pal_size_y;
                 self.f.pal_size[1][i] = b.pal_size_uv;
                 self.f.delta_lf[i] = dlf;
@@ -896,12 +915,24 @@ impl<'a, C: Coder> TileCoder<'a, C> {
         self.read_delta_qindex(b);
         self.read_delta_lf(b);
         self.read_deltas = false;
-        b.use_intrabc = false;
+        if C::DECODING {
+            b.use_intrabc = false;
+        }
         if self.f.hdr.allow_intrabc {
             b.use_intrabc = self.c.symbol(&mut self.cdf.intrabc, b.use_intrabc as usize) != 0;
+        } else {
+            b.use_intrabc = false;
         }
         if b.use_intrabc {
-            return Err(Error::unsupported("AV1 intra block copy"));
+            b.y_mode = DC_PRED;
+            b.uv_mode = DC_PRED;
+            b.angle_y = 0;
+            b.angle_uv = 0;
+            b.pal_size_y = 0;
+            b.pal_size_uv = 0;
+            b.use_filter_intra = false;
+            self.assign_intrabc_mv(b);
+            return Ok(());
         }
         // intra_frame_y_mode
         let above_mode = if b.avail_u { self.f.y_mode[self.mi(b.mi_row - 1, b.mi_col)] } else { DC_PRED };
@@ -1339,6 +1370,110 @@ impl<'a, C: Coder> TileCoder<'a, C> {
     // ---------------------------------------------------------------------------------------------
 
     fn read_block_tx_size(&mut self, b: &mut Blk) {
+        let bw4 = NUM_4X4_WIDE[b.bsize as usize] as usize;
+        let bh4 = NUM_4X4_HIGH[b.bsize as usize] as usize;
+        if self.f.hdr.tx_mode_select && b.bsize > BLOCK_4X4 && b.use_intrabc && !b.skip && !b.lossless {
+            // Variable transform sizes: a quad/binary tree of `txfm_split` flags per maximum-size transform.
+            let max_tx = MAX_TX_SIZE_RECT[b.bsize as usize];
+            let (tx4w, tx4h) = (TX_W[max_tx as usize] as usize / 4, TX_H[max_tx as usize] as usize / 4);
+            let mut row = b.mi_row;
+            while row < b.mi_row + bh4 {
+                let mut col = b.mi_col;
+                while col < b.mi_col + bw4 {
+                    self.read_var_tx_size(b, row, col, max_tx, 0);
+                    col += tx4w;
+                }
+                row += tx4h;
+            }
+        } else {
+            self.read_tx_size(b, !b.skip || !b.use_intrabc);
+            let (rows, cols) = (self.f.mi_rows, self.f.mi_cols);
+            for row in b.mi_row..(b.mi_row + bh4).min(rows) {
+                for col in b.mi_col..(b.mi_col + bw4).min(cols) {
+                    self.f.inter_tx_size[row * cols + col] = b.tx_size;
+                }
+            }
+        }
+    }
+
+    fn above_tx_width(&self, b: &Blk, row: usize, col: usize) -> usize {
+        if row == b.mi_row {
+            if !b.avail_u {
+                return 64;
+            }
+            let i = self.mi(row - 1, col);
+            if self.f.skip[i] != 0 && self.f.is_inter[i] != 0 {
+                return block_width(self.f.mi_size[i]);
+            }
+        }
+        TX_W[self.f.inter_tx_size[self.mi(row - 1, col)] as usize] as usize
+    }
+
+    fn left_tx_height(&self, b: &Blk, row: usize, col: usize) -> usize {
+        if col == b.mi_col {
+            if !b.avail_l {
+                return 64;
+            }
+            let i = self.mi(row, col - 1);
+            if self.f.skip[i] != 0 && self.f.is_inter[i] != 0 {
+                return block_height(self.f.mi_size[i]);
+            }
+        }
+        TX_H[self.f.inter_tx_size[self.mi(row, col - 1)] as usize] as usize
+    }
+
+    /// `read_var_tx_size`. The encoder only plans unsplit transforms for block copy blocks, so it writes
+    /// `txfm_split = 0` everywhere.
+    fn read_var_tx_size(&mut self, b: &mut Blk, row: usize, col: usize, tx_sz: u8, depth: u32) {
+        let (rows, cols) = (self.f.mi_rows, self.f.mi_cols);
+        if row >= rows || col >= cols {
+            return;
+        }
+        let split = if tx_sz == TX_4X4 || depth == 2 {
+            false
+        } else {
+            let above = (self.above_tx_width(b, row, col) < TX_W[tx_sz as usize] as usize) as usize;
+            let left = (self.left_tx_height(b, row, col) < TX_H[tx_sz as usize] as usize) as usize;
+            let size = 64.min(block_width(b.bsize).max(block_height(b.bsize)));
+            let max_sz = match size {
+                4 => TX_4X4,
+                8 => TX_8X8,
+                16 => TX_16X16,
+                32 => TX_32X32,
+                _ => TX_64X64,
+            } as usize;
+            let sqr_up = TX_SQR_UP[tx_sz as usize] as usize;
+            let ctx = (sqr_up != max_sz) as usize * 3 + (4 - max_sz) * 6 + above + left;
+            self.c.symbol(&mut self.cdf.txfm_split[ctx], 0) != 0
+        };
+        let w4 = TX_W[tx_sz as usize] as usize / 4;
+        let h4 = TX_H[tx_sz as usize] as usize / 4;
+        if split {
+            let sub = SPLIT_TX_SIZE[tx_sz as usize];
+            let (step_w, step_h) = (TX_W[sub as usize] as usize / 4, TX_H[sub as usize] as usize / 4);
+            let mut i = 0;
+            while i < h4 {
+                let mut j = 0;
+                while j < w4 {
+                    self.read_var_tx_size(b, row + i, col + j, sub, depth + 1);
+                    j += step_w;
+                }
+                i += step_h;
+            }
+        } else {
+            for i in 0..h4 {
+                for j in 0..w4 {
+                    if row + i < rows && col + j < cols {
+                        self.f.inter_tx_size[(row + i) * cols + col + j] = tx_sz;
+                    }
+                }
+            }
+            b.tx_size = tx_sz;
+        }
+    }
+
+    /// `read_tx_size(allowSelect)`.
+    fn read_tx_size(&mut self, b: &mut Blk, allow_select: bool) {
         if b.lossless {
             b.tx_size = TX_4X4;
             return;
@@ -1346,14 +1481,30 @@ impl<'a, C: Coder> TileCoder<'a, C> {
         let max_rect = MAX_TX_SIZE_RECT[b.bsize as usize];
         let want = b.tx_size;
         b.tx_size = max_rect;
-        if b.bsize > BLOCK_4X4 && self.f.hdr.tx_mode_select {
+        if b.bsize > BLOCK_4X4 && allow_select && self.f.hdr.tx_mode_select {
             // The context compares neighbouring transform extents with the largest transform.
             let max_w = TX_W[max_rect as usize] as usize;
             let max_h = TX_H[max_rect as usize] as usize;
-            let above_w =
-                if b.avail_u { TX_W[self.f.tx_size[self.mi(b.mi_row - 1, b.mi_col)] as usize] as usize } else { 0 };
-            let left_h =
-                if b.avail_l { TX_H[self.f.tx_size[self.mi(b.mi_row, b.mi_col - 1)] as usize] as usize } else { 0 };
+            let above_w = if b.avail_u {
+                let i = self.mi(b.mi_row - 1, b.mi_col);
+                if self.f.is_inter[i] != 0 {
+                    block_width(self.f.mi_size[i])
+                } else {
+                    self.above_tx_width(b, b.mi_row, b.mi_col)
+                }
+            } else {
+                0
+            };
+            let left_h = if b.avail_l {
+                let i = self.mi(b.mi_row, b.mi_col - 1);
+                if self.f.is_inter[i] != 0 {
+                    block_height(self.f.mi_size[i])
+                } else {
+                    self.left_tx_height(b, b.mi_row, b.mi_col)
+                }
+            } else {
+                0
+            };
             let ctx = (above_w >= max_w) as usize + (left_h >= max_h) as usize;
             let mut depth = 0usize;
             let mut t = max_rect;
@@ -1477,10 +1628,24 @@ impl<C: Coder> TileCoder<'_, C> {
         let width_chunks = (bw >> 6).max(1);
         let height_chunks = (bh >> 6).max(1);
         let planes = if b.has_chroma { 3 } else { 1 };
+        if b.use_intrabc {
+            self.predict_intrabc(b, if self.analyzing { self.an_planes } else { 7 });
+        }
         for chunk_y in 0..height_chunks {
             for chunk_x in 0..width_chunks {
                 for plane in 0..planes {
                     if self.analyzing && (self.an_planes >> plane) & 1 == 0 {
+                        continue;
+                    }
+                    if b.use_intrabc && !b.lossless && plane == 0 {
+                        let chunk_sz = if width_chunks > 1 || height_chunks > 1 { BLOCK_64X64 } else { b.bsize };
+                        self.transform_tree(
+                            b,
+                            (b.mi_col + (chunk_x << 4)) * 4,
+                            (b.mi_row + (chunk_y << 4)) * 4,
+                            block_width(chunk_sz),
+                            block_height(chunk_sz),
+                        );
                         continue;
                     }
                     let tx_sz = if b.lossless { TX_4X4 } else { self.get_tx_size(b, plane) };
@@ -1515,6 +1680,29 @@ impl<C: Coder> TileCoder<'_, C> {
             }
         }
         Ok(())
+    }
+
+    /// `transform_tree`: the luma transform blocks of an inter-style block, following `InterTxSizes`.
+    fn transform_tree(&mut self, b: &Blk, start_x: usize, start_y: usize, w: usize, h: usize) {
+        if start_x >= self.f.mi_cols * 4 || start_y >= self.f.mi_rows * 4 {
+            return;
+        }
+        let luma_tx = self.f.inter_tx_size[self.mi(start_y >> 2, start_x >> 2)] as usize;
+        if w <= TX_W[luma_tx] as usize && h <= TX_H[luma_tx] as usize {
+            let tx_sz = (0..19u8).find(|&t| TX_W[t as usize] as usize == w && TX_H[t as usize] as usize == h);
+            self.transform_block(b, 0, start_x, start_y, tx_sz.unwrap_or(TX_4X4), 0, 0);
+        } else if w > h {
+            self.transform_tree(b, start_x, start_y, w / 2, h);
+            self.transform_tree(b, start_x + w / 2, start_y, w / 2, h);
+        } else if w < h {
+            self.transform_tree(b, start_x, start_y, w, h / 2);
+            self.transform_tree(b, start_x, start_y + h / 2, w, h / 2);
+        } else {
+            self.transform_tree(b, start_x, start_y, w / 2, h / 2);
+            self.transform_tree(b, start_x + w / 2, start_y, w / 2, h / 2);
+            self.transform_tree(b, start_x, start_y + h / 2, w / 2, h / 2);
+            self.transform_tree(b, start_x + w / 2, start_y + h / 2, w / 2, h / 2);
+        }
     }
 
     pub(crate) fn get_tx_size(&self, b: &Blk, plane: usize) -> u8 {
@@ -1552,32 +1740,36 @@ impl<C: Coder> TileCoder<'_, C> {
         if start_x >= max_x || start_y >= max_y {
             return;
         }
-        // Intra prediction (or palette) of this transform block.
-        let is_palette = (plane == 0 && b.pal_size_y > 0) || (plane != 0 && b.pal_size_uv > 0);
-        if is_palette {
-            self.predict_palette(b, plane, start_x, start_y, x, y, tx_sz);
-        } else {
-            let is_cfl = plane > 0 && b.uv_mode == UV_CFL_PRED;
-            let mode = if plane == 0 {
-                b.y_mode
-            } else if is_cfl {
-                DC_PRED
+        // Intra prediction (or palette) of this transform block; block copy blocks were predicted whole.
+        if !b.use_intrabc {
+            let is_palette = (plane == 0 && b.pal_size_y > 0) || (plane != 0 && b.pal_size_uv > 0);
+            if is_palette {
+                self.predict_palette(b, plane, start_x, start_y, x, y, tx_sz);
             } else {
-                b.uv_mode
-            };
-            let have_left = (if plane == 0 { b.avail_l } else { b.avail_l_chroma }) || x > 0;
-            let have_above = (if plane == 0 { b.avail_u } else { b.avail_u_chroma }) || y > 0;
-            let bd = &self.block_decoded[plane];
-            let have_ar = bd[sub_row >> sy][(sub_col >> sx) + step_x + 1];
-            let have_bl = bd[(sub_row >> sy) + step_y + 1][sub_col >> sx];
-            self.predict_intra_block(b, plane, start_x, start_y, tx_sz, have_left, have_above, have_ar, have_bl, mode);
-            if is_cfl {
-                self.predict_cfl(b, plane, start_x, start_y, tx_sz);
+                let is_cfl = plane > 0 && b.uv_mode == UV_CFL_PRED;
+                let mode = if plane == 0 {
+                    b.y_mode
+                } else if is_cfl {
+                    DC_PRED
+                } else {
+                    b.uv_mode
+                };
+                let have_left = (if plane == 0 { b.avail_l } else { b.avail_l_chroma }) || x > 0;
+                let have_above = (if plane == 0 { b.avail_u } else { b.avail_u_chroma }) || y > 0;
+                let bd = &self.block_decoded[plane];
+                let have_ar = bd[sub_row >> sy][(sub_col >> sx) + step_x + 1];
+                let have_bl = bd[(sub_row >> sy) + step_y + 1][sub_col >> sx];
+                self.predict_intra_block(
+                    b, plane, start_x, start_y, tx_sz, have_left, have_above, have_ar, have_bl, mode,
+                );
+                if is_cfl {
+                    self.predict_cfl(b, plane, start_x, start_y, tx_sz);
+                }
             }
-        }
-        if plane == 0 {
-            self.max_luma_w = start_x + step_x * 4;
-            self.max_luma_h = start_y + step_y * 4;
+            if plane == 0 {
+                self.max_luma_w = start_x + step_x * 4;
+                self.max_luma_h = start_y + step_y * 4;
+            }
         }
         if self.analyzing {
             let sc = self.analyze_tx(b, plane, start_x, start_y, tx_sz);
@@ -1765,6 +1957,21 @@ impl<C: Coder> TileCoder<'_, C> {
         }
     }
 
+    /// `get_tx_set` for inter-style blocks: 0 = DCT only, 1 = 16 types, 2 = 12 types, 3 = IDTX and DCT.
+    pub(crate) fn tx_set_inter(&self, tx_sz: u8) -> u8 {
+        let sqr_up = TX_SQR_UP[tx_sz as usize];
+        let sqr = TX_SQR[tx_sz as usize];
+        if sqr_up > TX_32X32 {
+            0
+        } else if self.f.hdr.reduced_tx_set || sqr_up == TX_32X32 {
+            3
+        } else if sqr == TX_16X16 {
+            2
+        } else {
+            1
+        }
+    }
+
     /// Contexts and fixed choices of one transform block's coefficient syntax.
     pub(crate) fn txb_setup(&self, b: &Blk, plane: usize, start_x: usize, start_y: usize, tx_sz: u8) -> TxbSetup {
         let x4 = start_x >> 2;
@@ -1854,11 +2061,18 @@ impl<C: Coder> TileCoder<'_, C> {
             0
         };
         // Transform type signalling.
-        let set = self.tx_set_intra(tx_sz);
+        let inter = b.use_intrabc;
+        let set = if inter { self.tx_set_inter(tx_sz) } else { self.tx_set_intra(tx_sz) };
         let mut fixed_type = Some(0u8);
         let mut read_type = false;
         if !(b.lossless || TX_SQR_UP[tx_sz as usize] > TX_32X32) {
-            if plane > 0 {
+            if plane > 0 && inter {
+                // Chroma follows the luma transform type at the matching position.
+                let cols = self.f.mi_cols;
+                let (cx, cy) = (b.mi_col.max(x4 << sx), b.mi_row.max(y4 << sy));
+                let t = self.f.tx_types[(cy.min(self.f.mi_rows - 1)) * cols + cx.min(cols - 1)];
+                fixed_type = Some(if TX_TYPE_IN_SET_INTER[set as usize][t as usize] { t } else { 0 });
+            } else if plane > 0 {
                 fixed_type = Some(if set == 0 { 0 } else { MODE_TO_TXFM[b.uv_mode as usize] });
             } else {
                 let qidx = if self.f.hdr.seg.enabled {
@@ -1884,6 +2098,7 @@ impl<C: Coder> TileCoder<'_, C> {
             read_type,
             fixed_type,
             intra_dir,
+            is_inter: inter,
             x4,
             y4,
             w4,
@@ -1902,6 +2117,11 @@ impl<C: Coder> TileCoder<'_, C> {
             }
         }
         let out = code_txb(&mut self.c, &mut self.cdf, &s, &mut self.cb);
+        if plane == 0 {
+            // TxTypes: later chroma blocks of inter-style blocks look the luma type up here.
+            let t = if out.eob > 0 { self.cb.tx_type } else { itx::DCT_DCT };
+            self.store_tx_type(s.x4, s.y4, s.w4, s.h4, t);
+        }
         for i in 0..s.w4 {
             self.above_level[plane][s.x4 + i] = out.cul_level as u8;
             self.above_dc[plane][s.x4 + i] = out.dc_category;
@@ -1911,6 +2131,17 @@ impl<C: Coder> TileCoder<'_, C> {
             self.left_dc[plane][s.y4 + i] = out.dc_category;
         }
         out.eob
+    }
+
+    pub(crate) fn store_tx_type(&mut self, x4: usize, y4: usize, w4: usize, h4: usize, t: u8) {
+        let (rows, cols) = (self.f.mi_rows, self.f.mi_cols);
+        for j in 0..h4 {
+            for i in 0..w4 {
+                if y4 + j < rows && x4 + i < cols {
+                    self.f.tx_types[(y4 + j) * cols + x4 + i] = t;
+                }
+            }
+        }
     }
 
     /// Estimated cost, in 1/256 bit, of coding `cb` as a transform block here (contexts are not modified).
@@ -2017,6 +2248,7 @@ pub(crate) struct TxbSetup {
     pub read_type: bool,
     pub fixed_type: Option<u8>,
     pub intra_dir: u8,
+    pub is_inter: bool,
     pub x4: usize,
     pub y4: usize,
     pub w4: usize,
@@ -2043,7 +2275,15 @@ pub(crate) fn code_txb<K: Coder>(k: &mut K, cdf: &mut Cdfs, s: &TxbSetup, cb: &m
         let tx_type = if s.read_type {
             let sqr = TX_SQR[tx_sz as usize] as usize;
             let want = cb.tx_type;
-            if s.tx_set == 1 {
+            if s.is_inter {
+                let (table, cdf): (&[u8], &mut [u16]) = match s.tx_set {
+                    1 => (&TX_TYPE_INTER_INV_SET1, &mut cdf.inter_tx_set1[sqr]),
+                    2 => (&TX_TYPE_INTER_INV_SET2, &mut cdf.inter_tx_set2),
+                    _ => (&TX_TYPE_INTER_INV_SET3, &mut cdf.inter_tx_set3[sqr]),
+                };
+                let want_sym = table.iter().position(|&t| t == want).unwrap_or(0);
+                table[k.symbol(cdf, want_sym)]
+            } else if s.tx_set == 1 {
                 let want_sym = TX_TYPE_INTRA_INV_SET1.iter().position(|&t| t == want).unwrap_or(1);
                 TX_TYPE_INTRA_INV_SET1[k.symbol(&mut cdf.intra_tx_set1[sqr][s.intra_dir as usize], want_sym)]
             } else {

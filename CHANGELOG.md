@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- AVIF: intra block copy. The decoder reads `allow_intrabc` streams bit for bit like dav1d (libaom screen-content
+  streams, 4:2:0/4:4:4, 8/10-bit, tiles); the encoder finds exact repeats with a window hash and keeps the block copy
+  variant when it wins (a text screenshot shrinks about 4.5x; ordinary photos are unaffected).
+
 - Animated AVIF output (`avis`) from animated GIF, APNG, animated WebP and key-frame AVIF sequences. Every frame is a key
   frame; verified with libavif (Pillow) and dav1d (ffmpeg).
 

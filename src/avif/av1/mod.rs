@@ -2,6 +2,7 @@
 
 pub mod bits;
 pub mod cdef;
+pub mod cdf_inter;
 pub mod cdf_tables;
 pub mod coef_tables;
 pub mod consts;
@@ -11,6 +12,8 @@ pub mod encode;
 pub mod entropy;
 pub mod filmgrain;
 pub mod frame;
+pub mod ibc_search;
+pub mod intrabc;
 pub mod ipred;
 pub mod itx;
 pub mod lr;

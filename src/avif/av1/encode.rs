@@ -24,6 +24,8 @@ pub struct EncSrc {
     pub quant_round: i64,
     /// Search effort 0..=9: higher examines more partitions and modes.
     pub effort: u8,
+    /// Index of the source for finding intra block copy vectors, when the frame allows them.
+    pub ibc: Option<std::sync::Arc<super::ibc_search::IbcIndex>>,
 }
 
 /// Pad (replicating edges) the planes of a picture to the size of the frame buffers in `fs`.
@@ -152,6 +154,16 @@ impl<C: Coder> TileCoder<'_, C> {
     /// block of `b`, returning the coefficients in coding order.
     pub(crate) fn analyze_block(&mut self, b: &mut Blk) -> Vec<StoredCoefs> {
         let saved = self.block_decoded;
+        if b.use_intrabc {
+            // The transform tree reads InterTxSizes, which the block's syntax would set; the plan is unsplit.
+            let (rows, cols) = (self.f.mi_rows, self.f.mi_cols);
+            let (bw4, bh4) = (NUM_4X4_WIDE[b.bsize as usize] as usize, NUM_4X4_HIGH[b.bsize as usize] as usize);
+            for row in b.mi_row..(b.mi_row + bh4).min(rows) {
+                for col in b.mi_col..(b.mi_col + bw4).min(cols) {
+                    self.f.inter_tx_size[row * cols + col] = b.tx_size;
+                }
+            }
+        }
         self.pre_coefs.clear();
         if let Some(pre) = &b.pre {
             self.pre_coefs.extend(pre.iter().cloned());
@@ -202,6 +214,9 @@ impl<C: Coder> TileCoder<'_, C> {
                     self.cb.tx_type = sc.tx_type;
                     self.reconstruct(b, plane, x, y, tx_sz);
                 }
+                if plane == 0 {
+                    self.store_tx_type(x >> 2, y >> 2, tw >> 2, th >> 2, if sc.eob > 0 { sc.tx_type } else { DCT_DCT });
+                }
                 return sc;
             }
         }
@@ -209,6 +224,13 @@ impl<C: Coder> TileCoder<'_, C> {
         let effort = self.enc_src.as_ref().map_or(9, |e| e.effort);
         let types: &[u8] = if let Some(t) = setup.fixed_type {
             &[t][..]
+        } else if setup.is_inter {
+            // Block copy residuals are often sparse: the identity transform and 1-D transforms matter.
+            if !self.full_tx || setup.tx_set == 3 {
+                &[DCT_DCT, IDTX]
+            } else {
+                &[DCT_DCT, IDTX, V_DCT, H_DCT, ADST_ADST, ADST_DCT, DCT_ADST]
+            }
         } else if effort < 2 || !self.full_tx {
             &[DCT_DCT]
         } else if effort < 5 {
@@ -247,6 +269,9 @@ impl<C: Coder> TileCoder<'_, C> {
         }
         let (_, tx_type, eob, quant, bits) = best.expect("at least one transform type");
         self.an_bits += bits;
+        if plane == 0 {
+            self.store_tx_type(setup.x4, setup.y4, setup.w4, setup.h4, if eob > 0 { tx_type } else { DCT_DCT });
+        }
         let mut sc = StoredCoefs { tx_type, eob, coefs: Vec::new(), hash };
         if eob > 0 {
             for pos in 0..cw * ch {
@@ -285,6 +310,7 @@ use super::bits::BitWriter;
 use super::cdf_tables::Cdfs;
 use super::entropy::SymbolEncoder;
 use super::frame::Frame;
+use super::ibc_search;
 use super::obu::{self, ColorConfig, FrameHeader, OperatingPoint, SequenceHeader};
 use super::obu_write;
 use crate::error::Result;
@@ -300,6 +326,10 @@ pub struct EncodeParams {
     pub effort: u8,
     /// A single still picture (reduced headers) rather than a frame of a sequence.
     pub still: bool,
+    /// Try intra block copy for pictures with repeated content (and keep it only if it wins).
+    pub intrabc: bool,
+    /// This pass codes the frame with intra block copy allowed (set by the trial, not by callers).
+    pub ibc_frame: bool,
 }
 
 impl Default for EncodeParams {
@@ -311,6 +341,8 @@ impl Default for EncodeParams {
             lambda_scale: 0.09,
             effort: 7,
             still: true,
+            intrabc: true,
+            ibc_frame: false,
         }
     }
 }
@@ -369,8 +401,46 @@ pub fn make_sequence_header(color: &ColorConfig, width: usize, height: usize, st
     }
 }
 
-/// Encode one picture (planes already at the sequence's bit depth and subsampling).
+/// Encode one picture (planes already at the sequence's bit depth and subsampling). For pictures with repeated
+/// content (screenshots, text, UI) a second pass allows intra block copy, and the cheaper of the two in
+/// rate-distortion terms is kept: block copy frames cannot use the deblocking, CDEF and restoration filters.
 pub fn encode_picture(src: &Frame, color: &ColorConfig, p: &EncodeParams) -> Result<Encoded> {
+    let plain = encode_frame(src, color, &EncodeParams { ibc_frame: false, ..p.clone() })?;
+    if !p.intrabc || p.ibc_frame || src.width < 128 || src.height < 64 || p.base_q_idx == 0 {
+        return Ok(plain);
+    }
+    let (w, h) = (src.width, src.height);
+    let probe = ibc_search::IbcIndex::build(&src.planes[0], w, h);
+    if !probe.as_ref().is_some_and(ibc_search::looks_repetitive) {
+        if std::env::var_os("AV1_STATS").is_some() {
+            eprintln!("intra block copy: picture not repetitive enough");
+        }
+        return Ok(plain);
+    }
+    drop(probe);
+    let Ok(copy) = encode_frame(src, color, &EncodeParams { ibc_frame: true, ..p.clone() }) else {
+        return Ok(plain);
+    };
+    // Same quantizer on both sides, so compare error plus lambda times bits.
+    let q = ac_q_for(p.base_q_idx, color.bit_depth) / 8.0;
+    let lambda = p.lambda_scale * q * q;
+    let cost = |e: &Encoded| {
+        let sse: f64 = (0..src.planes.len()).map(|pl| plane_sse(&e.recon, src, pl)).sum();
+        sse + lambda * 8.0 * e.data.len() as f64
+    };
+    if std::env::var_os("AV1_STATS").is_some() {
+        eprintln!(
+            "intra block copy trial: plain {} bytes (J {:.0}), copy {} bytes (J {:.0})",
+            plain.data.len(),
+            cost(&plain),
+            copy.data.len(),
+            cost(&copy)
+        );
+    }
+    Ok(if cost(&copy) < cost(&plain) { copy } else { plain })
+}
+
+fn encode_frame(src: &Frame, color: &ColorConfig, p: &EncodeParams) -> Result<Encoded> {
     let (w, h) = (src.width, src.height);
     let seq = make_sequence_header(color, w, h, p.still);
     let mut hdr = FrameHeader {
@@ -395,9 +465,19 @@ pub fn encode_picture(src: &Frame, color: &ColorConfig, p: &EncodeParams) -> Res
     hdr.loop_filter.ref_deltas = [1, 0, 0, 0, -1, 0, -1, -1];
     hdr.cdef.damping = 3;
     hdr.tx_mode_select = true;
+    if p.ibc_frame {
+        hdr.allow_screen_content_tools = true;
+        hdr.force_integer_mv = true;
+        hdr.allow_intrabc = true;
+    }
 
     let mut fs = FrameState::new(&seq, &hdr)?;
     let planes = pad_source(&fs, src);
+    let ibc = if p.ibc_frame {
+        ibc_search::IbcIndex::build(&planes[0], planes[0].width, planes[0].height).map(std::sync::Arc::new)
+    } else {
+        None
+    };
     let ti = hdr.tile_info.clone();
     let tiles: Vec<((usize, usize), (usize, usize))> = (0..ti.rows)
         .flat_map(|r| {
@@ -431,6 +511,7 @@ pub fn encode_picture(src: &Frame, color: &ColorConfig, p: &EncodeParams) -> Res
                 fixed_bsize: p.fixed_bsize,
                 quant_round: p.quant_round,
                 effort: p.effort,
+                ibc: ibc.clone(),
             });
         }
         tc.decode_tile()?;
@@ -469,7 +550,7 @@ pub fn encode_picture(src: &Frame, color: &ColorConfig, p: &EncodeParams) -> Res
         Ok((data, all_logs))
     };
     let (mut tile_data, tile_logs) = run_tiles(&mut fs, None)?;
-    let filtered = choose_filters(&mut fs, src, p.base_q_idx);
+    let filtered = if p.ibc_frame { None } else { choose_filters(&mut fs, src, p.base_q_idx) };
     let mut hdr = fs.hdr.clone();
 
     // Loop restoration needs the final pictures, but its parameters are coded inside the tile data: choose them,

@@ -401,6 +401,7 @@ pub struct FrameHeader {
     pub disable_cdf_update: bool,
     pub allow_screen_content_tools: bool,
     pub force_integer_mv: bool,
+    pub allow_high_precision_mv: bool,
     pub frame_size_override: bool,
     pub frame_width: usize,
     pub frame_height: usize,
@@ -498,6 +499,8 @@ impl FrameHeader {
             h.force_integer_mv =
                 if seq.seq_force_integer_mv == SELECT_INTEGER_MV { r.flag()? } else { seq.seq_force_integer_mv != 0 };
         }
+        // Intra frames only have integer vectors (intra block copy).
+        h.force_integer_mv = true;
         if seq.frame_id_numbers_present {
             r.bits(seq.additional_frame_id_length + seq.delta_frame_id_length)?;
         }

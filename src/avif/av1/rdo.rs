@@ -79,6 +79,17 @@ impl<C: Coder> TileCoder<'_, C> {
             ctx += self.f.skip[self.mi(r, c - 1)] as usize;
         }
         bits += cdf_cost(&self.cdf.skip[ctx], skip as usize);
+        if self.f.hdr.allow_intrabc {
+            bits += cdf_cost(&self.cdf.intrabc, b.use_intrabc as usize);
+        }
+        if b.use_intrabc {
+            // The vector, and a transform split flag per maximum-size transform (always "not split").
+            bits += self.dv_bits(b.mv[0]);
+            if self.f.hdr.tx_mode_select && b.bsize > BLOCK_4X4 && !skip {
+                bits += cdf_cost(&self.cdf.txfm_split[0], 0);
+            }
+            return bits;
+        }
         let above = if b.avail_u { self.f.y_mode[self.mi(r - 1, c)] } else { DC_PRED };
         let left = if b.avail_l { self.f.y_mode[self.mi(r, c - 1)] } else { DC_PRED };
         let (ac, lc) = (INTRA_MODE_CONTEXT[above as usize] as usize, INTRA_MODE_CONTEXT[left as usize] as usize);
@@ -170,8 +181,77 @@ impl<C: Coder> TileCoder<'_, C> {
         sad
     }
 
-    /// Choose and evaluate the best leaf block of the given size. Returns its cost and syntax.
+    /// Choose and evaluate the best leaf block of the given size, intra or (in a frame that allows it) intra block
+    /// copy. Returns its cost and syntax, with the frame buffer holding the block's reconstruction.
     pub(crate) fn eval_leaf(&mut self, r: usize, c: usize, bsize: u8) -> (f64, Blk) {
+        let ibc = self.eval_ibc(r, c, bsize);
+        let (j, blk) = self.eval_leaf_intra(r, c, bsize);
+        if let Some((jb, mut tb)) = ibc
+            && jb < j
+        {
+            // The intra evaluation overwrote the buffer; put the block copy reconstruction back.
+            self.full_tx = true;
+            let (log, _, _) = self.analyze_planes(&mut tb, 7);
+            tb.skip = log.iter().all(|s| s.eob == 0);
+            tb.pre = Some(std::sync::Arc::new(log));
+            self.last_dv = tb.mv[0];
+            return (jb, tb);
+        }
+        (j, blk)
+    }
+
+    /// The best intra block copy candidate for a block, as (cost, block), or None when there is none.
+    fn eval_ibc(&mut self, r: usize, c: usize, bsize: u8) -> Option<(f64, Blk)> {
+        if !self.f.hdr.allow_intrabc || self.f.hdr.coded_lossless || bsize < BLOCK_8X8 {
+            return None;
+        }
+        let lambda = self.lambda();
+        let effort = self.enc_src.as_ref().map_or(9, |e| e.effort);
+        let mut base = Blk { mi_row: r, mi_col: c, bsize, ..Default::default() };
+        self.set_block_geometry(&mut base);
+        base.use_intrabc = true;
+        base.y_mode = DC_PRED;
+        base.uv_mode = DC_PRED;
+        base.tx_size = MAX_TX_SIZE_RECT[bsize as usize];
+        let mut cands = self.ibc_candidates(&base, if effort >= 8 { 4 } else { 2 });
+        if !cands.contains(&self.last_dv) && self.dv_is_valid(&base, self.last_dv) && self.last_dv != [0, 0] {
+            cands.push(self.last_dv);
+        }
+        let mut best: Option<(f64, Blk)> = None;
+        self.full_tx = effort >= 8;
+        for mv in cands {
+            let mut t = base.clone();
+            t.mv = [mv, [0, 0]];
+            let (log, dist, coef_bits) = self.analyze_planes(&mut t, 7);
+            let skip = log.iter().all(|s| s.eob == 0);
+            t.skip = skip;
+            let bits = coef_bits + self.mode_bits(&t, skip);
+            let j = dist + lambda * bits as f64 / 256.0;
+            if best.as_ref().is_none_or(|b| j < b.0) {
+                best = Some((j, t));
+            }
+        }
+        self.full_tx = true;
+        best
+    }
+
+    /// Rough cost, in 1/256 bit, of a displacement vector: nearly free when it repeats the previous one.
+    fn dv_bits(&self, mv: [i32; 2]) -> u64 {
+        if mv == self.last_dv {
+            return 2 * 256;
+        }
+        let mut bits = 2.0;
+        for v in mv {
+            if v != 0 {
+                let m = (v.abs() / 8).max(1) as f64;
+                bits += 3.0 + 2.0 * m.log2();
+            }
+        }
+        (bits * 256.0) as u64
+    }
+
+    /// Choose and evaluate the best intra leaf block of the given size. Returns its cost and syntax.
+    fn eval_leaf_intra(&mut self, r: usize, c: usize, bsize: u8) -> (f64, Blk) {
         let lambda = self.lambda();
         let mut base = Blk { mi_row: r, mi_col: c, bsize, ..Default::default() };
         self.set_block_geometry(&mut base);

@@ -242,3 +242,25 @@ pub const SGR_RADII: [[u8; 2]; 16] = [
     [2, 0],
     [2, 0],
 ];
+
+/// Transform-type symbol → type for the 16-type inter set (`Tx_Type_Inter_Inv_Set1`).
+pub const TX_TYPE_INTER_INV_SET1: [u8; 16] =
+    [IDTX, V_DCT, H_DCT, V_ADST, H_ADST, V_FLIPADST, H_FLIPADST, 0, 1, 2, 4, 5, 3, 6, 7, 8];
+/// Transform-type symbol → type for the 12-type inter set (`Tx_Type_Inter_Inv_Set2`).
+pub const TX_TYPE_INTER_INV_SET2: [u8; 12] = [IDTX, V_DCT, H_DCT, 0, 1, 2, 4, 5, 3, 6, 7, 8];
+/// Transform-type symbol → type for the 2-type inter set (`Tx_Type_Inter_Inv_Set3`).
+pub const TX_TYPE_INTER_INV_SET3: [u8; 2] = [IDTX, 0];
+
+/// `Tx_Type_In_Set_Inter[set][type]`.
+pub const TX_TYPE_IN_SET_INTER: [[bool; 16]; 4] = [
+    [true, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false],
+    [true; 16],
+    [true, true, true, true, true, true, true, true, true, true, true, true, false, false, false, false],
+    [true, false, false, false, false, false, false, false, false, true, false, false, false, false, false, false],
+];
+/// `Tx_Type_In_Set_Intra[set][type]`.
+pub const TX_TYPE_IN_SET_INTRA: [[bool; 16]; 3] = [
+    [true, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false],
+    [true, true, true, true, false, false, false, false, false, true, true, true, false, false, false, false],
+    [true, true, true, true, false, false, false, false, false, true, false, false, false, false, false, false],
+];
