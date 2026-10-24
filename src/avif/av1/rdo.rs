@@ -210,6 +210,8 @@ impl<C: Coder> TileCoder<'_, C> {
         let mut base = Blk { mi_row: r, mi_col: c, bsize, ..Default::default() };
         self.set_block_geometry(&mut base);
         base.use_intrabc = true;
+        base.is_inter = true;
+        base.ref_frame = [INTRA_FRAME, NONE_FRAME];
         base.y_mode = DC_PRED;
         base.uv_mode = DC_PRED;
         base.tx_size = MAX_TX_SIZE_RECT[bsize as usize];

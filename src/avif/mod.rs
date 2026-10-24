@@ -203,11 +203,13 @@ pub fn decode_animation(data: &[u8]) -> Result<Animation> {
     };
     let nclx = container::parse(data).ok().and_then(|f| f.primary.colour.nclx);
     let mut frames = Vec::with_capacity(color.samples.len());
+    // Frames after the first may predict from earlier ones, so each track keeps one decoder for all its samples.
+    let (mut color_dec, mut alpha_dec) = (av1::decoder::Decoder::new(), av1::decoder::Decoder::new());
+    let shown = |dec: &mut av1::decoder::Decoder, stream: &[u8]| -> Result<av1::decoder::Decoded> {
+        dec.decode_temporal_unit(stream)?.pop().ok_or_else(|| Error::invalid("sample without a shown frame"))
+    };
     for (i, s) in color.samples.iter().enumerate() {
-        if !s.sync {
-            return Err(Error::unsupported("animated AVIF with inter-coded frames"));
-        }
-        let d = av1::decoder::decode(&sample(color, i)?)?;
+        let d = shown(&mut color_dec, &sample(color, i)?)?;
         let mut cc = d.seq.color.clone();
         if let Some(n) = &nclx {
             cc.matrix_coefficients = n.matrix_coefficients as u8;
@@ -215,7 +217,7 @@ pub fn decode_animation(data: &[u8]) -> Result<Animation> {
         }
         let mut img = convert::frame_to_image(&d.frame, &cc)?;
         if let Some(a) = alpha {
-            let ad = av1::decoder::decode(&sample(a, i)?)?;
+            let ad = shown(&mut alpha_dec, &sample(a, i)?)?;
             if ad.frame.width != d.frame.width || ad.frame.height != d.frame.height {
                 return Err(Error::invalid("alpha plane size differs from the colour image"));
             }

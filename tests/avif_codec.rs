@@ -338,3 +338,14 @@ fn absurd_dimensions_are_refused_quickly() {
         });
     }
 }
+
+#[test]
+fn decodes_an_animation_with_inter_frames_like_libavif() {
+    let anim = avif::decode_animation(&fixture("avif_anim.avif")).unwrap();
+    assert_eq!(anim.frames.len(), 3);
+    for (i, f) in anim.frames.iter().enumerate() {
+        let reference = png::decode::decode(&fixture(&format!("avif_anim.frame{i}.png"))).unwrap();
+        let d = max_diff(&f.image, &reference);
+        assert!(d <= 2, "frame {i} differs from libavif by {d}");
+    }
+}

@@ -4447,6 +4447,32 @@ pub struct Cdfs {
     pub inter_tx_set1: [[u16; 17]; 2],
     pub inter_tx_set2: [u16; 13],
     pub inter_tx_set3: [[u16; 3]; 4],
+    // Inter frames.
+    pub y_mode: [[u16; 14]; 4],
+    pub is_inter: [[u16; 3]; 4],
+    pub skip_mode: [[u16; 3]; 3],
+    pub comp_mode: [[u16; 3]; 5],
+    pub comp_ref_type: [[u16; 3]; 5],
+    pub uni_comp_ref: [[[u16; 3]; 3]; 3],
+    pub comp_ref: [[[u16; 3]; 3]; 3],
+    pub comp_bwd_ref: [[[u16; 3]; 2]; 3],
+    pub single_ref: [[[u16; 3]; 6]; 3],
+    pub compound_mode: [[u16; 9]; 8],
+    pub new_mv: [[u16; 3]; 6],
+    pub zero_mv: [[u16; 3]; 2],
+    pub ref_mv: [[u16; 3]; 6],
+    pub drl_mode: [[u16; 3]; 3],
+    pub interp_filter: [[u16; 4]; 16],
+    pub motion_mode: [[u16; 4]; 22],
+    pub use_obmc: [[u16; 3]; 22],
+    pub inter_intra: [[u16; 3]; 3],
+    pub inter_intra_mode: [[u16; 5]; 3],
+    pub wedge_inter_intra: [[u16; 3]; 22],
+    pub wedge_index: [[u16; 17]; 22],
+    pub comp_group_idx: [[u16; 3]; 6],
+    pub compound_idx: [[u16; 3]; 6],
+    pub compound_type: [[u16; 3]; 22],
+    pub seg_id_predicted: [[u16; 3]; 3],
 }
 
 impl Cdfs {
@@ -4527,6 +4553,151 @@ impl Cdfs {
             inter_tx_set1: super::cdf_inter::DEFAULT_INTER_TX_TYPE_SET1,
             inter_tx_set2: super::cdf_inter::DEFAULT_INTER_TX_TYPE_SET2,
             inter_tx_set3: super::cdf_inter::DEFAULT_INTER_TX_TYPE_SET3,
+            y_mode: super::cdf_inter::DEFAULT_Y_MODE,
+            is_inter: super::cdf_inter::DEFAULT_IS_INTER,
+            skip_mode: super::cdf_inter::DEFAULT_SKIP_MODE,
+            comp_mode: super::cdf_inter::DEFAULT_COMP_MODE,
+            comp_ref_type: super::cdf_inter::DEFAULT_COMP_REF_TYPE,
+            uni_comp_ref: super::cdf_inter::DEFAULT_UNI_COMP_REF,
+            comp_ref: super::cdf_inter::DEFAULT_COMP_REF,
+            comp_bwd_ref: super::cdf_inter::DEFAULT_COMP_BWD_REF,
+            single_ref: super::cdf_inter::DEFAULT_SINGLE_REF,
+            compound_mode: super::cdf_inter::DEFAULT_COMPOUND_MODE,
+            new_mv: super::cdf_inter::DEFAULT_NEW_MV,
+            zero_mv: super::cdf_inter::DEFAULT_ZERO_MV,
+            ref_mv: super::cdf_inter::DEFAULT_REF_MV,
+            drl_mode: super::cdf_inter::DEFAULT_DRL_MODE,
+            interp_filter: super::cdf_inter::DEFAULT_INTERP_FILTER,
+            motion_mode: super::cdf_inter::DEFAULT_MOTION_MODE,
+            use_obmc: super::cdf_inter::DEFAULT_USE_OBMC,
+            inter_intra: super::cdf_inter::DEFAULT_INTER_INTRA,
+            inter_intra_mode: super::cdf_inter::DEFAULT_INTER_INTRA_MODE,
+            wedge_inter_intra: super::cdf_inter::DEFAULT_WEDGE_INTER_INTRA,
+            wedge_index: super::cdf_inter::DEFAULT_WEDGE_INDEX,
+            comp_group_idx: super::cdf_inter::DEFAULT_COMP_GROUP_IDX,
+            compound_idx: super::cdf_inter::DEFAULT_COMPOUND_IDX,
+            compound_type: super::cdf_inter::DEFAULT_COMPOUND_TYPE,
+            seg_id_predicted: super::cdf_inter::DEFAULT_SEGMENT_ID_PREDICTED,
         })
+    }
+}
+
+/// A CDF array, or an array of them: the last entry of each innermost array is its adaptation counter.
+trait CdfArray {
+    fn clear_counter(&mut self);
+}
+
+impl<const N: usize> CdfArray for [u16; N] {
+    fn clear_counter(&mut self) {
+        self[N - 1] = 0;
+    }
+}
+
+impl<T: CdfArray, const N: usize> CdfArray for [T; N] {
+    fn clear_counter(&mut self) {
+        for t in self.iter_mut() {
+            t.clear_counter();
+        }
+    }
+}
+
+impl Cdfs {
+    /// Zero every symbol counter (what `load_cdfs` does after loading a saved context), and restore the intra
+    /// frame luma mode CDFs that the specification re-initialises for every tile.
+    pub fn load_reset(&mut self) {
+        self.dc_sign.clear_counter();
+        self.eob_extra.clear_counter();
+        self.use_filter_intra.clear_counter();
+        self.lr_sgrproj.clear_counter();
+        self.lr_wiener.clear_counter();
+        self.palette_uv_mode.clear_counter();
+        self.palette_y_mode.clear_counter();
+        self.skip.clear_counter();
+        self.txb_skip.clear_counter();
+        self.tx_size_8x8.clear_counter();
+        self.coeff_base_eob.clear_counter();
+        self.lr_switchable.clear_counter();
+        self.tx_size.clear_counter();
+        self.coeff_base.clear_counter();
+        self.coeff_br.clear_counter();
+        self.partition_w8.clear_counter();
+        self.eob_pt_16.clear_counter();
+        self.intra_tx_set2.clear_counter();
+        self.eob_pt_32.clear_counter();
+        self.angle_delta.clear_counter();
+        self.eob_pt_64.clear_counter();
+        self.intra_tx_set1.clear_counter();
+        self.cfl_sign.clear_counter();
+        self.eob_pt_128.clear_counter();
+        self.segment_id.clear_counter();
+        self.partition_w128.clear_counter();
+        self.eob_pt_256.clear_counter();
+        self.eob_pt_512.clear_counter();
+        self.partition.clear_counter();
+        self.eob_pt_1024.clear_counter();
+        self.kf_y_mode.clear_counter();
+        self.uv_mode.clear_counter();
+        self.uv_mode_cfl.clear_counter();
+        self.cfl_alpha.clear_counter();
+        self.filter_intra_mode.clear_counter();
+        self.palette_size_y.clear_counter();
+        self.palette_size_uv.clear_counter();
+        self.palette_color_y_2.clear_counter();
+        self.palette_color_y_3.clear_counter();
+        self.palette_color_y_4.clear_counter();
+        self.palette_color_y_5.clear_counter();
+        self.palette_color_y_6.clear_counter();
+        self.palette_color_y_7.clear_counter();
+        self.palette_color_y_8.clear_counter();
+        self.palette_color_uv_2.clear_counter();
+        self.palette_color_uv_3.clear_counter();
+        self.palette_color_uv_4.clear_counter();
+        self.palette_color_uv_5.clear_counter();
+        self.palette_color_uv_6.clear_counter();
+        self.palette_color_uv_7.clear_counter();
+        self.palette_color_uv_8.clear_counter();
+        self.delta_q.clear_counter();
+        self.delta_lf.clear_counter();
+        self.delta_lf_multi.clear_counter();
+        self.intrabc.clear_counter();
+        self.mv_joints.clear_counter();
+        self.mv_class.clear_counter();
+        self.mv_class0_fp.clear_counter();
+        self.mv_fp.clear_counter();
+        self.mv_sign.clear_counter();
+        self.mv_class0_hp.clear_counter();
+        self.mv_hp.clear_counter();
+        self.mv_class0.clear_counter();
+        self.mv_bits.clear_counter();
+        self.txfm_split.clear_counter();
+        self.inter_tx_set1.clear_counter();
+        self.inter_tx_set2.clear_counter();
+        self.inter_tx_set3.clear_counter();
+        self.y_mode.clear_counter();
+        self.is_inter.clear_counter();
+        self.skip_mode.clear_counter();
+        self.comp_mode.clear_counter();
+        self.comp_ref_type.clear_counter();
+        self.uni_comp_ref.clear_counter();
+        self.comp_ref.clear_counter();
+        self.comp_bwd_ref.clear_counter();
+        self.single_ref.clear_counter();
+        self.compound_mode.clear_counter();
+        self.new_mv.clear_counter();
+        self.zero_mv.clear_counter();
+        self.ref_mv.clear_counter();
+        self.drl_mode.clear_counter();
+        self.interp_filter.clear_counter();
+        self.motion_mode.clear_counter();
+        self.use_obmc.clear_counter();
+        self.inter_intra.clear_counter();
+        self.inter_intra_mode.clear_counter();
+        self.wedge_inter_intra.clear_counter();
+        self.wedge_index.clear_counter();
+        self.comp_group_idx.clear_counter();
+        self.compound_idx.clear_counter();
+        self.compound_type.clear_counter();
+        self.seg_id_predicted.clear_counter();
+        self.kf_y_mode = DEFAULT_KF_Y_MODE;
     }
 }

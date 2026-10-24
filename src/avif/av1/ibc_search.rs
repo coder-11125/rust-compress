@@ -5,10 +5,12 @@
 //! `is_mv_valid` (the copied area is inside the tile, already decoded and far enough behind the current
 //! superblock); the best few by prediction error are then coded for real and compared with the intra choice.
 
+use super::consts::INTRA_FRAME;
 use super::consts::*;
 use super::entropy::Coder;
 use super::frame::Plane;
-use super::intrabc::{INTRA_FRAME, INTRABC_DELAY_PIXELS, INTRABC_DELAY_SB64, Mv};
+use super::intrabc::{INTRABC_DELAY_PIXELS, INTRABC_DELAY_SB64};
+use super::mvpred::Mv;
 use super::tile::{Blk, TileCoder};
 
 const WIN: usize = 8;

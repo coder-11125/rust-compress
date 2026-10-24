@@ -418,8 +418,14 @@ pub fn encode_picture(src: &Frame, color: &ColorConfig, p: &EncodeParams) -> Res
         return Ok(plain);
     }
     drop(probe);
-    let Ok(copy) = encode_frame(src, color, &EncodeParams { ibc_frame: true, ..p.clone() }) else {
-        return Ok(plain);
+    let copy = match encode_frame(src, color, &EncodeParams { ibc_frame: true, ..p.clone() }) {
+        Ok(c) => c,
+        Err(e) => {
+            if std::env::var_os("AV1_STATS").is_some() {
+                eprintln!("intra block copy trial failed: {e}");
+            }
+            return Ok(plain);
+        }
     };
     // Same quantizer on both sides, so compare error plus lambda times bits.
     let q = ac_q_for(p.base_q_idx, color.bit_depth) / 8.0;

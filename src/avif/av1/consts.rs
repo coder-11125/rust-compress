@@ -264,3 +264,51 @@ pub const TX_TYPE_IN_SET_INTRA: [[bool; 16]; 3] = [
     [true, true, true, true, false, false, false, false, false, true, true, true, false, false, false, false],
     [true, true, true, true, false, false, false, false, false, true, false, false, false, false, false, false],
 ];
+
+// Inter prediction modes (YMode values above the intra modes).
+pub const NEARESTMV: u8 = 14;
+pub const NEARMV: u8 = 15;
+pub const GLOBALMV: u8 = 16;
+pub const NEWMV: u8 = 17;
+pub const NEAREST_NEARESTMV: u8 = 18;
+pub const NEAR_NEARMV: u8 = 19;
+pub const NEAREST_NEWMV: u8 = 20;
+pub const NEW_NEARESTMV: u8 = 21;
+pub const NEAR_NEWMV: u8 = 22;
+pub const NEW_NEARMV: u8 = 23;
+pub const GLOBAL_GLOBALMV: u8 = 24;
+pub const NEW_NEWMV: u8 = 25;
+
+// Reference frames.
+pub const INTRA_FRAME: i8 = 0;
+pub const LAST_FRAME: i8 = 1;
+pub const LAST2_FRAME: i8 = 2;
+pub const LAST3_FRAME: i8 = 3;
+pub const GOLDEN_FRAME: i8 = 4;
+pub const BWDREF_FRAME: i8 = 5;
+pub const ALTREF2_FRAME: i8 = 6;
+pub const ALTREF_FRAME: i8 = 7;
+pub const NONE_FRAME: i8 = -1;
+
+// Motion modes, compound types and interpolation filters.
+pub const SIMPLE: u8 = 0;
+pub const OBMC: u8 = 1;
+pub const LOCALWARP: u8 = 2;
+pub const COMPOUND_WEDGE: u8 = 0;
+pub const COMPOUND_DIFFWTD: u8 = 1;
+pub const COMPOUND_AVERAGE: u8 = 2;
+pub const COMPOUND_INTRA: u8 = 3;
+pub const COMPOUND_DISTANCE: u8 = 4;
+pub const EIGHTTAP: u8 = 0;
+pub const EIGHTTAP_SMOOTH: u8 = 1;
+pub const EIGHTTAP_SHARP: u8 = 2;
+pub const BILINEAR_FILTER: u8 = 3;
+
+/// `Size_Group[bsize]`.
+pub const SIZE_GROUP: [u8; BLOCK_SIZES] = [0, 0, 0, 1, 1, 1, 2, 2, 2, 3, 3, 3, 3, 3, 3, 3, 0, 0, 1, 1, 2, 2];
+
+/// `Wedge_Bits[bsize]`: bits of the wedge index, 0 where wedges are not allowed.
+pub const WEDGE_BITS: [u8; BLOCK_SIZES] = [0, 0, 0, 4, 4, 4, 4, 4, 4, 4, 0, 0, 0, 0, 0, 0, 0, 0, 4, 4, 0, 0];
+
+/// `Compound_Mode_Ctx_Map[RefMvContext >> 1][min(NewMvContext, 4)]`.
+pub const COMPOUND_MODE_CTX_MAP: [[u8; 5]; 3] = [[0, 1, 1, 1, 1], [1, 2, 3, 4, 4], [4, 4, 5, 6, 7]];

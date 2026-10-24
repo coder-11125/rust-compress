@@ -58,6 +58,10 @@ pub struct FrameState {
     pub seg_id: Vec<u8>,
     pub tx_size: Vec<u8>,
     pub is_inter: Vec<u8>,
+    pub skip_mode: Vec<u8>,
+    pub comp_group_idx: Vec<u8>,
+    pub compound_idx: Vec<u8>,
+    pub interp_filter: Vec<[u8; 2]>,
     /// `RefFrames` (intra block copy blocks have `INTRA_FRAME` and the vector in `mvs`), `Mvs`, `InterTxSizes` and
     /// `TxTypes` (luma, at 4x4 granularity).
     pub ref_frame: Vec<[i8; 2]>,
@@ -74,6 +78,13 @@ pub struct FrameState {
     pub cdef_stride: usize,
     /// Restoration units per plane: (units_per_row, units_per_col, params).
     pub lr_units: [(usize, usize, Vec<LrUnitParams>); 3],
+    /// Reference frames for inter prediction (None in intra frames) and the previous segmentation map.
+    pub refs: Option<std::sync::Arc<super::refs::RefSet>>,
+    pub prev_segment_ids: Option<std::sync::Arc<Vec<u8>>>,
+    /// `MotionFieldMvs[ref][y8 * (mi_cols >> 1) + x8]`, empty unless `use_ref_frame_mvs`.
+    pub motion_field: Vec<Vec<[i16; 2]>>,
+    /// The CDFs every tile of the frame starts from.
+    pub cdf_base: Box<Cdfs>,
     /// Palette colours of the block covering each position of the row above / column to the left.
     pub num_planes: usize,
     pub sub_x: usize,
@@ -129,7 +140,11 @@ impl FrameState {
             seg_id: vec![0; n],
             tx_size: vec![0; n],
             is_inter: vec![0; n],
-            ref_frame: vec![[super::intrabc::UNWRITTEN, super::intrabc::NONE_FRAME]; n],
+            skip_mode: vec![0; n],
+            comp_group_idx: vec![0; n],
+            compound_idx: vec![0; n],
+            interp_filter: vec![[0; 2]; n],
+            ref_frame: vec![[super::mvpred::UNWRITTEN, NONE_FRAME]; n],
             mvs: vec![[[0; 2]; 2]; n],
             inter_tx_size: vec![0; n],
             tx_types: vec![0; n],
@@ -140,6 +155,10 @@ impl FrameState {
             cdef_idx: vec![-1; cdef_stride * cdef_rows],
             cdef_stride,
             lr_units,
+            refs: None,
+            prev_segment_ids: None,
+            motion_field: Vec::new(),
+            cdf_base: Cdfs::new(hdr.quant.base_q_idx as u32),
             num_planes,
             sub_x,
             sub_y,
@@ -166,6 +185,22 @@ pub struct Blk {
     pub segment_id: u8,
     pub lossless: bool,
     pub use_intrabc: bool,
+    /// Inter-style block: block copy or inter prediction.
+    pub is_inter: bool,
+    pub ref_frame: [i8; 2],
+    pub skip_mode: bool,
+    pub interp_filter: [u8; 2],
+    pub motion_mode: u8,
+    pub compound_type: u8,
+    pub interintra: bool,
+    pub interintra_mode: u8,
+    pub wedge_interintra: bool,
+    pub wedge_index: u8,
+    pub wedge_sign: u8,
+    pub mask_type: u8,
+    pub comp_group_idx: u8,
+    pub compound_idx: u8,
+    pub ref_mv_idx: u8,
     /// Intra block copy displacement vector (row, column) in 1/8 sample units, in list 0.
     pub mv: [[i32; 2]; 2],
     pub y_mode: u8,
@@ -232,6 +267,16 @@ pub struct TileCoder<'a, C: Coder> {
     left_dc: [Vec<u8>; 3],
     above_pal: [Vec<[u16; 8]>; 2],
     left_pal: [Vec<[u16; 8]>; 2],
+    pub(crate) above_seg_pred: Vec<u8>,
+    pub(crate) left_seg_pred: Vec<u8>,
+    /// Local warp candidates of the block being parsed (`CandList`).
+    pub(crate) warp_cands: Vec<[i32; 4]>,
+    pub(crate) num_samples: usize,
+    pub(crate) local_warp: Option<[i32; 6]>,
+    pub(crate) mask: Vec<u8>,
+    pub(crate) mask_stride: usize,
+    /// Set when the stream uses a tool this decoder does not implement.
+    pub(crate) unsupported: Option<&'static str>,
     /// `BlockDecoded[plane][y + 1][x + 1]` for the current superblock.
     pub(crate) block_decoded: [[[bool; SB_MI_MAX + 3]; SB_MI_MAX + 3]; 3],
     pub current_q_index: i32,
@@ -302,6 +347,14 @@ impl<'a, C: Coder> TileCoder<'a, C> {
             left_dc: mk(mi_rows),
             above_pal: [vec![[0; 8]; mi_cols + 32], vec![[0; 8]; mi_cols + 32]],
             left_pal: [vec![[0; 8]; mi_rows + 32], vec![[0; 8]; mi_rows + 32]],
+            above_seg_pred: vec![0; mi_cols + 32],
+            left_seg_pred: vec![0; mi_rows + 32],
+            warp_cands: Vec::new(),
+            num_samples: 0,
+            local_warp: None,
+            mask: Vec::new(),
+            mask_stride: 0,
+            unsupported: None,
             block_decoded: [[[false; SB_MI_MAX + 3]; SB_MI_MAX + 3]; 3],
             current_q_index: q,
             delta_lf: [0; 4],
@@ -388,6 +441,7 @@ impl<'a, C: Coder> TileCoder<'a, C> {
         for p in 0..2 {
             self.left_pal[p].fill([0; 8]);
         }
+        self.left_seg_pred.fill(0);
     }
 
     /// Spec `clear_above_context` is implicit: the contexts start zeroed for every tile.
@@ -784,7 +838,14 @@ impl<'a, C: Coder> TileCoder<'a, C> {
         self.set_block_geometry(&mut b);
         let bw4 = NUM_4X4_WIDE[bsize as usize] as usize;
         let bh4 = NUM_4X4_HIGH[bsize as usize] as usize;
-        self.intra_frame_mode_info(&mut b)?;
+        if self.f.hdr.is_intra() {
+            self.intra_frame_mode_info(&mut b)?;
+        } else {
+            self.inter_frame_mode_info(&mut b)?;
+        }
+        if let Some(what) = self.unsupported {
+            return Err(Error::unsupported(what));
+        }
         self.palette_tokens(&b);
         self.read_block_tx_size(&mut b);
         if b.skip {
@@ -808,10 +869,14 @@ impl<'a, C: Coder> TileCoder<'a, C> {
                 self.f.uv_mode[i] = b.uv_mode;
                 self.f.seg_id[i] = b.segment_id;
                 self.f.tx_size[i] = b.tx_size;
-                self.f.is_inter[i] = b.use_intrabc as u8;
-                self.f.ref_frame[i] = [super::intrabc::INTRA_FRAME, super::intrabc::NONE_FRAME];
-                if b.use_intrabc {
-                    self.f.mvs[i][0] = b.mv[0];
+                self.f.is_inter[i] = b.is_inter as u8;
+                self.f.skip_mode[i] = b.skip_mode as u8;
+                self.f.comp_group_idx[i] = b.comp_group_idx;
+                self.f.compound_idx[i] = b.compound_idx;
+                self.f.interp_filter[i] = b.interp_filter;
+                self.f.ref_frame[i] = b.ref_frame;
+                if b.is_inter {
+                    self.f.mvs[i] = b.mv;
                 }
                 self.f.pal_size[0][i] = b.pal_size_y;
                 self.f.pal_size[1][i] = b.pal_size_uv;
@@ -894,19 +959,7 @@ impl<'a, C: Coder> TileCoder<'a, C> {
         if seg_pre_skip {
             self.intra_segment_id(b);
         }
-        // read_skip
-        if seg_pre_skip && self.f.hdr.seg_feature_active(b.segment_id as usize, SEG_LVL_SKIP) {
-            b.skip = true;
-        } else {
-            let mut ctx = 0;
-            if b.avail_u {
-                ctx += self.f.skip[self.mi(b.mi_row - 1, b.mi_col)] as usize;
-            }
-            if b.avail_l {
-                ctx += self.f.skip[self.mi(b.mi_row, b.mi_col - 1)] as usize;
-            }
-            b.skip = self.c.symbol(&mut self.cdf.skip[ctx], b.skip as usize) != 0;
-        }
+        self.read_skip(b);
         if !seg_pre_skip {
             self.intra_segment_id(b);
         }
@@ -924,6 +977,8 @@ impl<'a, C: Coder> TileCoder<'a, C> {
             b.use_intrabc = false;
         }
         if b.use_intrabc {
+            b.is_inter = true;
+            b.ref_frame = [INTRA_FRAME, NONE_FRAME];
             b.y_mode = DC_PRED;
             b.uv_mode = DC_PRED;
             b.angle_y = 0;
@@ -940,6 +995,29 @@ impl<'a, C: Coder> TileCoder<'a, C> {
         let (ac, lc) =
             (INTRA_MODE_CONTEXT[above_mode as usize] as usize, INTRA_MODE_CONTEXT[left_mode as usize] as usize);
         b.y_mode = self.c.symbol(&mut self.cdf.kf_y_mode[ac][lc], b.y_mode as usize) as u8;
+        self.intra_mode_tail(b);
+        Ok(())
+    }
+
+    /// `read_skip()`.
+    pub(crate) fn read_skip(&mut self, b: &mut Blk) {
+        if self.f.hdr.seg.seg_id_pre_skip && self.f.hdr.seg_feature_active(b.segment_id as usize, SEG_LVL_SKIP) {
+            b.skip = true;
+        } else {
+            let mut ctx = 0;
+            if b.avail_u {
+                ctx += self.f.skip[self.mi(b.mi_row - 1, b.mi_col)] as usize;
+            }
+            if b.avail_l {
+                ctx += self.f.skip[self.mi(b.mi_row, b.mi_col - 1)] as usize;
+            }
+            b.skip = self.c.symbol(&mut self.cdf.skip[ctx], b.skip as usize) != 0;
+        }
+    }
+
+    /// The rest of an intra block's mode info after its luma mode: angle deltas, chroma mode, palette and filter
+    /// intra (shared by intra frames and intra blocks in inter frames).
+    pub(crate) fn intra_mode_tail(&mut self, b: &mut Blk) {
         // intra_angle_info_y (the encoder arrives with the planned values already set)
         if C::DECODING {
             b.angle_y = 0;
@@ -997,7 +1075,6 @@ impl<'a, C: Coder> TileCoder<'a, C> {
                     self.c.symbol(&mut self.cdf.filter_intra_mode, b.filter_intra_mode as usize) as u8;
             }
         }
-        Ok(())
     }
 
     fn read_cfl_alphas(&mut self, b: &mut Blk) {
@@ -1036,6 +1113,11 @@ impl<'a, C: Coder> TileCoder<'a, C> {
             b.segment_id = 0;
             return;
         }
+        self.read_segment_id(b);
+    }
+
+    /// `read_segment_id()`.
+    pub(crate) fn read_segment_id(&mut self, b: &mut Blk) {
         let (r, c) = (b.mi_row, b.mi_col);
         let prev_ul = if b.avail_u && b.avail_l { self.f.seg_id[self.mi(r - 1, c - 1)] as i32 } else { -1 };
         let prev_u = if b.avail_u { self.f.seg_id[self.mi(r - 1, c)] as i32 } else { -1 };
@@ -1067,7 +1149,7 @@ impl<'a, C: Coder> TileCoder<'a, C> {
         }
     }
 
-    fn read_cdef(&mut self, b: &Blk) {
+    pub(crate) fn read_cdef(&mut self, b: &Blk) {
         let hdr = &self.f.hdr;
         if b.skip || hdr.coded_lossless || !self.f.seq.enable_cdef || hdr.allow_intrabc {
             return;
@@ -1111,7 +1193,7 @@ impl<'a, C: Coder> TileCoder<'a, C> {
         abs
     }
 
-    fn read_delta_qindex(&mut self, b: &Blk) {
+    pub(crate) fn read_delta_qindex(&mut self, b: &Blk) {
         if b.bsize == self.sb_size() && b.skip {
             return;
         }
@@ -1125,7 +1207,7 @@ impl<'a, C: Coder> TileCoder<'a, C> {
         }
     }
 
-    fn read_delta_lf(&mut self, b: &Blk) {
+    pub(crate) fn read_delta_lf(&mut self, b: &Blk) {
         if b.bsize == self.sb_size() && b.skip {
             return;
         }
@@ -1372,7 +1454,7 @@ impl<'a, C: Coder> TileCoder<'a, C> {
     fn read_block_tx_size(&mut self, b: &mut Blk) {
         let bw4 = NUM_4X4_WIDE[b.bsize as usize] as usize;
         let bh4 = NUM_4X4_HIGH[b.bsize as usize] as usize;
-        if self.f.hdr.tx_mode_select && b.bsize > BLOCK_4X4 && b.use_intrabc && !b.skip && !b.lossless {
+        if self.f.hdr.tx_mode_select && b.bsize > BLOCK_4X4 && b.is_inter && !b.skip && !b.lossless {
             // Variable transform sizes: a quad/binary tree of `txfm_split` flags per maximum-size transform.
             let max_tx = MAX_TX_SIZE_RECT[b.bsize as usize];
             let (tx4w, tx4h) = (TX_W[max_tx as usize] as usize / 4, TX_H[max_tx as usize] as usize / 4);
@@ -1386,7 +1468,7 @@ impl<'a, C: Coder> TileCoder<'a, C> {
                 row += tx4h;
             }
         } else {
-            self.read_tx_size(b, !b.skip || !b.use_intrabc);
+            self.read_tx_size(b, !b.skip || !b.is_inter);
             let (rows, cols) = (self.f.mi_rows, self.f.mi_cols);
             for row in b.mi_row..(b.mi_row + bh4).min(rows) {
                 for col in b.mi_col..(b.mi_col + bw4).min(cols) {
@@ -1628,8 +1710,8 @@ impl<C: Coder> TileCoder<'_, C> {
         let width_chunks = (bw >> 6).max(1);
         let height_chunks = (bh >> 6).max(1);
         let planes = if b.has_chroma { 3 } else { 1 };
-        if b.use_intrabc {
-            self.predict_intrabc(b, if self.analyzing { self.an_planes } else { 7 });
+        if b.is_inter {
+            self.predict_inter_block(b, if self.analyzing { self.an_planes } else { 7 })?;
         }
         for chunk_y in 0..height_chunks {
             for chunk_x in 0..width_chunks {
@@ -1637,7 +1719,7 @@ impl<C: Coder> TileCoder<'_, C> {
                     if self.analyzing && (self.an_planes >> plane) & 1 == 0 {
                         continue;
                     }
-                    if b.use_intrabc && !b.lossless && plane == 0 {
+                    if b.is_inter && !b.lossless && plane == 0 {
                         let chunk_sz = if width_chunks > 1 || height_chunks > 1 { BLOCK_64X64 } else { b.bsize };
                         self.transform_tree(
                             b,
@@ -1741,7 +1823,7 @@ impl<C: Coder> TileCoder<'_, C> {
             return;
         }
         // Intra prediction (or palette) of this transform block; block copy blocks were predicted whole.
-        if !b.use_intrabc {
+        if !b.is_inter {
             let is_palette = (plane == 0 && b.pal_size_y > 0) || (plane != 0 && b.pal_size_uv > 0);
             if is_palette {
                 self.predict_palette(b, plane, start_x, start_y, x, y, tx_sz);
@@ -1848,6 +1930,25 @@ impl<C: Coder> TileCoder<'_, C> {
     ) {
         let w = TX_W[tx_sz as usize] as usize;
         let h = TX_H[tx_sz as usize] as usize;
+        self.predict_intra_wh(b, plane, x, y, w, h, have_left, have_above, have_ar, have_bl, mode);
+    }
+
+    /// Intra prediction of a `w` x `h` region.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn predict_intra_wh(
+        &mut self,
+        b: &Blk,
+        plane: usize,
+        x: usize,
+        y: usize,
+        w: usize,
+        h: usize,
+        have_left: bool,
+        have_above: bool,
+        have_ar: bool,
+        have_bl: bool,
+        mode: u8,
+    ) {
         let (sx, sy) = self.plane_sub(plane);
         let bit_depth = self.f.seq.color.bit_depth;
         let max_x = ((self.f.mi_cols * 4) >> sx) - 1;
@@ -2061,7 +2162,7 @@ impl<C: Coder> TileCoder<'_, C> {
             0
         };
         // Transform type signalling.
-        let inter = b.use_intrabc;
+        let inter = b.is_inter;
         let set = if inter { self.tx_set_inter(tx_sz) } else { self.tx_set_intra(tx_sz) };
         let mut fixed_type = Some(0u8);
         let mut read_type = false;
