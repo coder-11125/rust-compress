@@ -1,0 +1,34 @@
+[package]
+name = "rust-compress"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Fast PNG, JPEG, WebP and AVIF image compressor with a from-scratch engine and no codec dependencies"
+readme = "../README.md"
+keywords = ["png", "jpeg", "image", "compression", "optimizer"]
+categories = ["command-line-utilities", "multimedia::images", "compression"]
+
+[[bin]]
+name = "rc"
+path = "src/main.rs"
+
+[dependencies]
+rc-core.workspace = true
+rc-deflate.workspace = true
+rc-png.workspace = true
+rc-jpeg.workspace = true
+rc-webp.workspace = true
+rc-gif.workspace = true
+rc-avif.workspace = true
+clap.workspace = true
+rayon.workspace = true
+
+[dev-dependencies]
+rc-testutil.workspace = true
+assert_cmd.workspace = true
+image.workspace = true
+tempfile.workspace = true
+
+[lints]
+workspace = true

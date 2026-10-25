@@ -1,0 +1,19 @@
+[package]
+name = "rc-png"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "PNG and APNG decoder and optimizing encoder"
+
+[dependencies]
+rc-core.workspace = true
+rc-deflate.workspace = true
+rayon.workspace = true
+
+[dev-dependencies]
+rc-testutil.workspace = true
+image.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,19 @@
+[package]
+name = "rc-jpeg"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "JPEG decoder (baseline and progressive) and trellis-quantizing encoder"
+
+[dependencies]
+rc-core.workspace = true
+rayon.workspace = true
+
+[dev-dependencies]
+rc-png.workspace = true
+rc-testutil.workspace = true
+image.workspace = true
+
+[lints]
+workspace = true

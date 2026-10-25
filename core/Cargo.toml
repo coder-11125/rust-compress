@@ -1,0 +1,13 @@
+[package]
+name = "rc-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Shared types and utilities of the rust-compress codecs: images, errors, bit I/O, checksums, EXIF, resizing, SSIM"
+
+[dependencies]
+rayon.workspace = true
+
+[lints]
+workspace = true

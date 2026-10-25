@@ -1,0 +1,18 @@
+[package]
+name = "rc-webp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "WebP decoder and encoder (VP8L lossless and VP8 lossy, animation)"
+
+[dependencies]
+rc-core.workspace = true
+rayon.workspace = true
+
+[dev-dependencies]
+rc-testutil.workspace = true
+image.workspace = true
+
+[lints]
+workspace = true

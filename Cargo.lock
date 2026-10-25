@@ -1027,6 +1027,80 @@ dependencies = [
 ]
 
 [[package]]
+name = "rc-avif"
+version = "0.1.0"
+dependencies = [
+ "image",
+ "rayon",
+ "rc-core",
+ "rc-png",
+ "rc-testutil",
+]
+
+[[package]]
+name = "rc-core"
+version = "0.1.0"
+dependencies = [
+ "rayon",
+]
+
+[[package]]
+name = "rc-deflate"
+version = "0.1.0"
+dependencies = [
+ "rayon",
+ "rc-core",
+]
+
+[[package]]
+name = "rc-gif"
+version = "0.1.0"
+dependencies = [
+ "rc-core",
+ "rc-testutil",
+]
+
+[[package]]
+name = "rc-jpeg"
+version = "0.1.0"
+dependencies = [
+ "image",
+ "rayon",
+ "rc-core",
+ "rc-png",
+ "rc-testutil",
+]
+
+[[package]]
+name = "rc-png"
+version = "0.1.0"
+dependencies = [
+ "image",
+ "rayon",
+ "rc-core",
+ "rc-deflate",
+ "rc-testutil",
+]
+
+[[package]]
+name = "rc-testutil"
+version = "0.1.0"
+dependencies = [
+ "image",
+ "rc-core",
+]
+
+[[package]]
+name = "rc-webp"
+version = "0.1.0"
+dependencies = [
+ "image",
+ "rayon",
+ "rc-core",
+ "rc-testutil",
+]
+
+[[package]]
 name = "reborrow"
 version = "0.5.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1052,6 +1126,14 @@ dependencies = [
  "clap",
  "image",
  "rayon",
+ "rc-avif",
+ "rc-core",
+ "rc-deflate",
+ "rc-gif",
+ "rc-jpeg",
+ "rc-png",
+ "rc-testutil",
+ "rc-webp",
  "tempfile",
 ]
 

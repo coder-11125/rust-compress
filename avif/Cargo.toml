@@ -1,0 +1,19 @@
+[package]
+name = "rc-avif"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "AVIF: HEIF container, AV1 decoder (intra, inter, intra block copy) and encoder"
+
+[dependencies]
+rc-core.workspace = true
+rayon.workspace = true
+
+[dev-dependencies]
+rc-png.workspace = true
+rc-testutil.workspace = true
+image.workspace = true
+
+[lints]
+workspace = true

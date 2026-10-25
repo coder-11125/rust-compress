@@ -1,0 +1,14 @@
+[package]
+name = "rc-testutil"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Helpers shared by the integration tests (fixtures, reference decoding)"
+
+[dependencies]
+rc-core.workspace = true
+image.workspace = true
+
+[lints]
+workspace = true

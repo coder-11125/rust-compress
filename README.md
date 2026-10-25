@@ -131,14 +131,14 @@ What it offers beyond ratio: no C dependencies, one binary for all of these form
 
 ## Testing
 
-`cargo test` runs the unit tests and integration suites, which cross-check the decoders against the `image` crate (and, for WebP and CMYK, against files made by libwebp and libjpeg-turbo) and verify encoder output with independent decoders. `tests/hostile.rs` feeds every decoder and encoder path truncated, bit-flipped and header-corrupted variants of every fixture and requires no panic, no hang and (for WebP) an exact re-encode round trip. This is deterministic mutation testing, not coverage-guided fuzzing. For a deeper sweep: `HOSTILE_ROUNDS=20000 cargo test --release --test hostile`.
+`cargo test` runs the unit tests and integration suites, which cross-check the decoders against the `image` crate (and, for WebP and CMYK, against files made by libwebp and libjpeg-turbo) and verify encoder output with independent decoders. `cli/tests/hostile.rs` feeds every decoder and encoder path truncated, bit-flipped and header-corrupted variants of every fixture and requires no panic, no hang and (for WebP) an exact re-encode round trip. This is deterministic mutation testing, not coverage-guided fuzzing. For a deeper sweep: `HOSTILE_ROUNDS=20000 cargo test --release -p rust-compress --test hostile`.
 
 ## Build
 
 ```
 cargo build --release        # binary: target/release/rc
-cargo test                   # unit + integration tests (cross-checked against the `image` crate)
-cargo clippy --all-targets -- -D warnings
+cargo test --workspace        # unit + integration tests (cross-checked against the `image` crate)
+cargo clippy --workspace --all-targets -- -D warnings
 ```
 
 Requires a stable Rust toolchain (edition 2024); `rust-toolchain.toml` pins `stable` with clippy/rustfmt. No C compiler or system libraries are needed.
@@ -146,20 +146,19 @@ Requires a stable Rust toolchain (edition 2024); `rust-toolchain.toml` pins `sta
 ## Layout
 
 ```
-src/util/       bit I/O, CRC-32 / Adler-32, canonical Huffman (shared by DEFLATE, JPEG and WebP)
-src/deflate/    inflate, LZ77 matchers (hash chains; binary tree for levels 7-9), block encoder, optimal parser (levels 7-9)
-src/png/        decoder (all color types/depths, Adam7), filters, encoder (reduction + strategy search), quantizer
-src/jpeg/       decoder (baseline + progressive), DCT, baseline/progressive encoders, trellis quantization, quality search
-src/avif/       HEIF/ISOBMFF container, AV1 decoder (entropy, intra prediction, transforms, loop filters, CDEF, restoration, film grain) and intra encoder
-src/webp/       RIFF container, VP8L decoder and encoder (transforms, LZ77 + optimal parse, tile-group clustering)
-src/gif.rs      GIF decoder (still images)
-src/exif.rs     EXIF editing for kept metadata (orientation, dimensions, thumbnail)
-src/resize.rs   Lanczos-3 downscaling
-src/metrics.rs  SSIM
-src/pipeline.rs per-file policy: read → decode/transcode → never-grow check → atomic write
-examples/       png_probe, deflate_probe, stream_probe, jpeg_probe: developer tools for tuning ratio and speed
-tests/          codec round trips, reference-decoder cross-checks, hostile input, CLI end-to-end
+core/       shared types and utilities (rc-core): image and animation types, errors, bit I/O, CRC-32 / Adler-32, canonical Huffman, EXIF editing, Lanczos-3 downscaling, SSIM
+deflate/    inflate, LZ77 matchers (hash chains; binary tree for levels 7-9), block encoder, optimal parser (levels 7-9)
+png/        decoder (all color types/depths, Adam7, APNG), filters, encoder (reduction + strategy search), quantizer
+jpeg/       decoder (baseline + progressive), DCT, baseline/progressive encoders, trellis quantization, quality search
+webp/       RIFF container, VP8L decoder and encoder (transforms, LZ77 + optimal parse, tile-group clustering), VP8 decoder and key-frame encoder
+gif/        GIF decoder (still and animated)
+avif/       HEIF/ISOBMFF container, AV1 decoder (entropy, intra and inter prediction, transforms, loop filters, CDEF, restoration, film grain) and encoder
+cli/        the `rc` binary: argument parsing, input collection, per-file policy (read → decode/transcode → never-grow check → atomic write)
+testutil/   fixture loading and reference decoding shared by the test suites
+fixtures/   sample files for the tests
 ```
+
+Each codec is its own crate (`rc-png`, `rc-jpeg`, `rc-webp`, `rc-gif`, `rc-avif`, `rc-deflate`) on top of `rc-core`, with its decoder and encoder in separate modules and its own `tests/` and `examples/` (developer tools for tuning ratio and speed); only `cli` depends on all of them. The AV1 tile syntax is written once and shared by the AVIF decoder and encoder, so those two stay together inside `avif/`.
 
 ## Limitations
 

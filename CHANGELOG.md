@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Repository layout: a Cargo workspace with one crate per codec (`core`, `deflate`, `png`, `jpeg`, `webp`, `gif`, `avif`) and a
+  `cli` crate for the `rc` binary; each crate has its own tests and examples, and the fixtures moved to `fixtures/`.
+
 - AVIF: inter prediction. The decoder implements the whole AV1 inter toolset (reference management, compound
   prediction, inter-intra, OBMC, warped motion, temporal motion vectors, scaled references) and matches dav1d bit for
   bit on libaom streams; animated AVIFs from libavif and ffmpeg now decode. Animated AVIF output uses inter frames

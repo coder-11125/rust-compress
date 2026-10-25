@@ -1,0 +1,14 @@
+[package]
+name = "rc-deflate"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "DEFLATE (RFC 1951) decoder and encoder with LZ77 matchers and an optimal parser"
+
+[dependencies]
+rc-core.workspace = true
+rayon.workspace = true
+
+[lints]
+workspace = true

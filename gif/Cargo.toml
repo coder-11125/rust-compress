@@ -1,0 +1,16 @@
+[package]
+name = "rc-gif"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "GIF decoder (still and animated)"
+
+[dependencies]
+rc-core.workspace = true
+
+[dev-dependencies]
+rc-testutil.workspace = true
+
+[lints]
+workspace = true
