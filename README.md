@@ -16,6 +16,16 @@ curl -fsSL https://raw.githubusercontent.com/coder-11125/rust-compress/main/inst
 
 Windows users can download the `.zip` asset from the [releases page](https://github.com/coder-11125/rust-compress/releases). To build from source instead, see [Build](#build).
 
+### Updating
+
+```
+rc update            # shows "Updating rc 0.1.0 -> 0.1.1", downloads, verifies and replaces the binary
+rc update --check    # only report whether a newer release exists
+rc update --to v0.1.0   # install a specific tag (older ones too); --force reinstalls the current one
+```
+
+The newest release is looked up on GitHub, the archive's SHA-256 is checked against the published `.sha256` file, and the new binary must run (`--version`) before it replaces the old one, which is swapped atomically. It needs `curl` and `tar` on `PATH` (both ship with macOS, Linux and Windows 10+). If the binary lives somewhere you cannot write (such as `/usr/local/bin`), re-run with `sudo`. A file literally named `update` has to be passed as `./update`.
+
 ## Quick start
 
 ```

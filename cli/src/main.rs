@@ -4,8 +4,9 @@ mod cli;
 mod collect;
 mod pipeline;
 mod report;
+mod update;
 
-use crate::cli::Cli;
+use crate::cli::{Cli, Command};
 use crate::collect::{collect, is_stdio};
 use crate::pipeline::process;
 use crate::report::{Status, Summary};
@@ -14,6 +15,9 @@ use std::time::Instant;
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
+    if let Some(Command::Update(args)) = &cli.command {
+        return update::run(args);
+    }
     if let Some(n) = cli.jobs {
         if n == 0 {
             eprintln!("error: --jobs must be at least 1");

@@ -1028,7 +1028,7 @@ dependencies = [
 
 [[package]]
 name = "rc-avif"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "image",
  "rayon",
@@ -1039,14 +1039,14 @@ dependencies = [
 
 [[package]]
 name = "rc-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "rayon",
 ]
 
 [[package]]
 name = "rc-deflate"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "rayon",
  "rc-core",
@@ -1054,7 +1054,7 @@ dependencies = [
 
 [[package]]
 name = "rc-gif"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "rc-core",
  "rc-testutil",
@@ -1062,7 +1062,7 @@ dependencies = [
 
 [[package]]
 name = "rc-jpeg"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "image",
  "rayon",
@@ -1073,7 +1073,7 @@ dependencies = [
 
 [[package]]
 name = "rc-png"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "image",
  "rayon",
@@ -1084,7 +1084,7 @@ dependencies = [
 
 [[package]]
 name = "rc-testutil"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "image",
  "rc-core",
@@ -1092,7 +1092,7 @@ dependencies = [
 
 [[package]]
 name = "rc-webp"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "image",
  "rayon",
@@ -1120,7 +1120,7 @@ checksum = "47b34b781b31e5d73e9fbc8689c70551fd1ade9a19e3e28cfec8580a79290cc4"
 
 [[package]]
 name = "rust-compress"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "assert_cmd",
  "clap",

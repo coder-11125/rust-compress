@@ -1,4 +1,4 @@
-use clap::{Parser, ValueEnum};
+use clap::{Parser, Subcommand, ValueEnum};
 use std::path::PathBuf;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
@@ -33,10 +33,19 @@ pub enum SubsamplingArg {
     S420,
 }
 
+#[derive(Subcommand, Debug)]
+pub enum Command {
+    /// Check GitHub for a newer release and replace this binary with it (a file named `update` must be written `./update`).
+    Update(crate::update::UpdateArgs),
+}
+
 /// Fast, high-quality image compression (PNG and JPEG) with a from-scratch engine.
 #[derive(Parser, Debug)]
-#[command(name = "rc", version, about)]
+#[command(name = "rc", version, about, args_conflicts_with_subcommands = true, subcommand_negates_reqs = true)]
 pub struct Cli {
+    #[command(subcommand)]
+    pub command: Option<Command>,
+
     /// Image files and/or directories to compress. Use `-` to read one image from standard input.
     #[arg(required = true, value_name = "INPUT")]
     pub inputs: Vec<PathBuf>,

@@ -1,6 +1,12 @@
 # Changelog
 
-## Unreleased
+## 0.1.1 - 26-10-2026
+
+- `rc update`: checks GitHub for the newest release, shows `current -> newer`, and replaces the running binary.
+  The archive's SHA-256 is verified against the published `.sha256` file and the new binary must pass `--version`
+  before the atomic swap, so a failed update leaves the installed one untouched. `--check` only reports, `--to <tag>`
+  installs a specific release (older ones too), `--force` reinstalls. Needs `curl` and `tar` on `PATH`; a file named
+  `update` must now be passed as `./update`. The Windows swap is implemented but untested.
 
 - Repository layout: a Cargo workspace with one crate per codec (`core`, `deflate`, `png`, `jpeg`, `webp`, `gif`, `avif`) and a
   `cli` crate for the `rc` binary; each crate has its own tests and examples, and the fixtures moved to `fixtures/`.
