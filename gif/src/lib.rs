@@ -6,6 +6,9 @@ use rc_core::animation::{AnimFrame, Animation, MAX_ANIMATION_PIXELS, normalize_d
 use rc_core::error::{Error, Result};
 use rc_core::image::{ColorType, Image, MAX_PIXELS};
 
+pub mod encode;
+pub use encode::{EncodeOptions, encode_animation, palette_is_exact};
+
 pub const SIGNATURES: [&[u8]; 2] = [b"GIF87a", b"GIF89a"];
 
 pub fn is_gif(data: &[u8]) -> bool {
@@ -394,6 +397,35 @@ mod tests {
         // Arbitrary bytes must not panic, whatever they decode to.
         let _ = lzw_decode(&[0xFF; 64], 8, 1000);
         let _ = lzw_decode(&(0..=255).collect::<Vec<u8>>(), 2, 5000);
+    }
+
+    #[test]
+    fn lzw_round_trips_through_the_decoder() {
+        // Runs, noise, a long ramp that overflows the 4096-entry table (forcing clear codes), and tiny inputs.
+        let mut rng = 0x1234_5678u32;
+        let mut noise = |n: usize, modulo: u32| -> Vec<u8> {
+            (0..n)
+                .map(|_| {
+                    rng = rng.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                    ((rng >> 16) % modulo) as u8
+                })
+                .collect()
+        };
+        for min_code in 2u8..=8 {
+            let k = 1u32 << min_code;
+            let cases = [
+                vec![0u8],
+                vec![0, (1 % k) as u8],
+                vec![0; 10_000],
+                noise(50_000, k),
+                (0..30_000u32).map(|i| ((i / 3) % k) as u8).collect(),
+            ];
+            for data in cases {
+                let packed = crate::encode::lzw_encode(&data, min_code);
+                let back = lzw_decode(&packed, min_code, data.len()).unwrap();
+                assert_eq!(back, data, "min_code {min_code}, {} indices", data.len());
+            }
+        }
     }
 
     #[test]

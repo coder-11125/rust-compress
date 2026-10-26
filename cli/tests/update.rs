@@ -34,7 +34,8 @@ fn serve(tag: &str, archive: Vec<u8>, checksum: String) -> String {
             } else {
                 ("404 Not Found", String::new(), Vec::new())
             };
-            let head = format!("HTTP/1.1 {status}\r\n{extra}Content-Length: {}\r\nConnection: close\r\n\r\n", body.len());
+            let head =
+                format!("HTTP/1.1 {status}\r\n{extra}Content-Length: {}\r\nConnection: close\r\n\r\n", body.len());
             let _ = s.write_all(head.as_bytes());
             if method != "HEAD" {
                 let _ = s.write_all(&body);

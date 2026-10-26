@@ -65,21 +65,22 @@ fn converts_to_png_and_jpeg_via_the_cli() {
 }
 
 #[test]
-fn keeping_the_format_is_a_clear_error_and_directories_skip_gifs() {
+fn gifs_keep_their_format_and_directories_include_them() {
     let d = tempdir().unwrap();
+    let original = fixture("gif_plain.gif");
     let input = d.path().join("pic.gif");
-    fs::write(&input, fixture("gif_plain.gif")).unwrap();
-    let out = cmd().arg(&input).assert().failure().get_output().clone();
-    assert!(String::from_utf8_lossy(&out.stderr).contains("--format"), "{}", String::from_utf8_lossy(&out.stderr));
-    // A plain directory run ignores the GIF instead of failing the whole batch.
+    fs::write(&input, &original).unwrap();
+    cmd().arg(&input).assert().success();
+    // Same picture, never larger than the original.
+    let kept = fs::read(d.path().join("pic.min.gif")).unwrap();
+    assert!(kept.len() <= original.len());
+    assert_eq!(gif::decode(&kept).unwrap(), gif::decode(&original).unwrap());
+    // A directory run picks the GIF up along with the other images.
+    fs::remove_file(d.path().join("pic.min.gif")).unwrap();
     fs::write(d.path().join("a.png"), fixture("rgb8.png")).unwrap();
     cmd().arg(d.path()).assert().success();
     assert!(d.path().join("a.min.png").exists());
-    assert!(!d.path().join("pic.min.gif").exists());
-    // With a target format the GIF is picked up too.
-    fs::remove_file(d.path().join("a.min.png")).unwrap();
-    cmd().arg(d.path()).args(["-f", "png"]).assert().success();
-    assert!(d.path().join("pic.min.png").exists());
+    assert!(d.path().join("pic.min.gif").exists());
 }
 
 #[test]

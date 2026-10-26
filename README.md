@@ -1,6 +1,6 @@
 # rust-compress
 
-A fast command-line image compressor for **PNG**, **JPEG**, **WebP** and **AVIF** (GIF files can be converted). The compression engine is written from scratch in Rust — DEFLATE, PNG, JPEG, GIF, WebP (lossless and lossy) and AVIF (AV1) codecs, Huffman coding, DCT, color quantization — with no codec crates. Only [`clap`](https://crates.io/crates/clap) (argument parsing) and [`rayon`](https://crates.io/crates/rayon) (parallelism) are dependencies.
+A fast command-line image compressor for **PNG**, **JPEG**, **WebP**, **AVIF** and **GIF**. The compression engine is written from scratch in Rust — DEFLATE, PNG, JPEG, GIF, WebP (lossless and lossy) and AVIF (AV1) codecs, Huffman coding, DCT, color quantization — with no codec crates. Only [`clap`](https://crates.io/crates/clap) (argument parsing) and [`rayon`](https://crates.io/crates/rayon) (parallelism) are dependencies.
 
 ## Install
 
@@ -70,13 +70,13 @@ cat in.png | rc - > out.png  # stdin to stdout
 **WebP (lossless)** — full VP8L encoder and decoder:
 - Encoder tries a palette transform (bundling up to 8 pixels per symbol) or subtract-green + per-tile predictor + cross-color decorrelation, ranks the pipelines with a cheap estimate and fully encodes the best ones.
 - LZ77 with the format's 2-D distance codes, an optimal (cost-model driven) parse, a colour cache sized by trial, and **entropy-clustered prefix-code groups**: image tiles with similar statistics share one set of codes.
-- 8-bit only: 16-bit inputs are reduced to 8-bit (the report note says so). Images are limited to 16384×16384 by the format. Lossy WebP (VP8) is decoded for conversions or an explicit `--lossy` re-encode; when the format is kept it is left untouched, since recompressing it would only add generation loss. Animated WebP is treated the same way.
+- 8-bit only: 16-bit inputs are reduced to 8-bit (the report note says so). Images are limited to 16384×16384 by the format. Lossy WebP (VP8) is decoded for conversions or an explicit `--lossy` re-encode; when the format is kept it is left untouched, since recompressing it would only add generation loss. Animated WebP is treated the same way: left untouched unless `--lossy` asks for a re-encode.
 
 **Other formats**
-- GIF files (still images: palettes, interlacing, transparency) convert to PNG, JPEG or WebP with `-f`. Animated GIFs convert to PNG or JPEG only as a refusal with a clear message; with `-f avif` they become animated AVIF. There is no GIF output, so directory runs only pick up `.gif` files when `-f` names a target.
+- **GIF** reads and writes still and animated files (palettes, interlacing, transparency, disposal). A GIF kept as a GIF is re-coded without changing a pixel: one shared palette, each frame stored as the rectangle that changed with the unchanged pixels transparent, and a fresh LZW pass; the original is kept when that is not smaller. A GIF whose frames need more than one 256-color palette between them would have to be re-quantized, so it is left unchanged unless `--lossy` (or `--resize`) is given. Converting *to* GIF (`-f gif`, from any format) quantizes to `--colors` entries (default 256) with one palette for the whole animation, no dithering for animations (the noise would change from frame to frame) and `--dither` for stills; GIF transparency is on/off, so pixels below 50% alpha become transparent.
 - CMYK and YCCK JPEGs are transcoded losslessly in the DCT domain (identical coefficients, Adobe colour flag kept); converting or resizing them goes through RGB.
-- Animated PNGs are passed through unchanged instead of failing the batch, unless `-f avif` asks for an animated AVIF.
-- **Animations** — animated GIF, APNG, animated WebP and animated AVIF inputs convert to an animated AVIF (`-f avif`; with `--lossy` for AVIF inputs): full-canvas frames with the files' disposal and blend rules, per-frame durations and looping, alpha as a second track, the first frame a key frame and the others inter frames predicted from the previous output (a key frame instead where that is smaller, e.g. at scene changes). On camera-pan style content this is 6–8 times smaller than key frames at the same PSNR. Output decodes in libavif and dav1d. A finite repeat count is played forever.
+- Animated PNGs are passed through unchanged instead of failing the batch, unless `-f avif`, `-f webp` or `-f gif` asks for an animation in that format.
+- **Animations** — animated GIF, APNG, animated WebP and animated AVIF inputs convert to an animated **AVIF**, **WebP** or **GIF** (`-f avif|webp|gif`; `--lossy` re-encodes an animated WebP or AVIF input). Frames keep the files' disposal and blend rules, per-frame durations and looping (a finite repeat count is played forever). **AVIF**: alpha as a second track, the first frame a key frame and the others inter frames predicted from the previous output (a key frame instead where that is smaller, e.g. at scene changes); on camera-pan style content 6–8 times smaller than key frames at the same PSNR; decodes in libavif and dav1d. **WebP**: lossless by default, lossy VP8 frames with `--lossy`; after the first frame only the changed rectangle is stored, and each lossless frame is tried both replacing the canvas and blended over it with the unchanged pixels transparent, keeping the smaller (lossy frames are measured against the canvas as a decoder reconstructs it, so errors do not build up). Decodes in libwebp (Pillow), pixel for pixel in the lossless case. **GIF**: see above.
 
 **Metadata** — only color information survives by default (ICC profile, PNG color chunks). `--keep-metadata` also keeps EXIF, XMP, JPEG comments / Photoshop blocks and PNG text, time and pixel-density chunks. EXIF and XMP carry across PNG ↔ JPEG ↔ WebP conversions; when an orientation is baked into the pixels the EXIF orientation is reset, its recorded dimensions are corrected and a now-stale thumbnail is dropped.
 
@@ -98,7 +98,7 @@ rc [OPTIONS] <INPUT>...
   -f, --format <FMT>      keep | png | jpeg | webp | avif (default keep)
       --subsampling <S>   auto | 444 | 420
       --bit-depth <D>     AVIF output: auto | 8 | 10 (auto: 10 for 16-bit sources)
-      --lossy             PNG palette quantization, lossy WebP with -f webp, or re-encode an AVIF input (-q = quality)
+      --lossy             PNG palette quantization, lossy WebP with -f webp (animations too), re-encode an AVIF or animated WebP input, or re-quantize a GIF that needs more than one palette (-q = quality)
       --colors <2-256>    with --lossy (default 256)
       --dither <0.0-1.0>  with --lossy (default 0.5)
   -l, --level <0-9>       PNG / WebP effort (default 7; PNG: 1-6 fast, 7-9 optimal parsing, 9 slowest)
@@ -156,12 +156,12 @@ Requires a stable Rust toolchain (edition 2024); `rust-toolchain.toml` pins `sta
 ## Layout
 
 ```
-core/       shared types and utilities (rc-core): image and animation types, errors, bit I/O, CRC-32 / Adler-32, canonical Huffman, EXIF editing, Lanczos-3 downscaling, SSIM
+core/       shared types and utilities (rc-core): image and animation types, errors, bit I/O, CRC-32 / Adler-32, canonical Huffman, EXIF editing, Lanczos-3 downscaling, SSIM, color quantizer
 deflate/    inflate, LZ77 matchers (hash chains; binary tree for levels 7-9), block encoder, optimal parser (levels 7-9)
-png/        decoder (all color types/depths, Adam7, APNG), filters, encoder (reduction + strategy search), quantizer
+png/        decoder (all color types/depths, Adam7, APNG), filters, encoder (reduction + strategy search)
 jpeg/       decoder (baseline + progressive), DCT, baseline/progressive encoders, trellis quantization, quality search
-webp/       RIFF container, VP8L decoder and encoder (transforms, LZ77 + optimal parse, tile-group clustering), VP8 decoder and key-frame encoder
-gif/        GIF decoder (still and animated)
+webp/       RIFF container, VP8L decoder and encoder (transforms, LZ77 + optimal parse, tile-group clustering), VP8 decoder and key-frame encoder, animated WebP writer
+gif/        GIF decoder and encoder (still and animated: shared palette, frame differencing, LZW)
 avif/       HEIF/ISOBMFF container, AV1 decoder (entropy, intra and inter prediction, transforms, loop filters, CDEF, restoration, film grain) and encoder
 cli/        the `rc` binary: argument parsing, input collection, per-file policy (read → decode/transcode → never-grow check → atomic write)
 testutil/   fixture loading and reference decoding shared by the test suites
@@ -172,8 +172,9 @@ Each codec is its own crate (`rc-png`, `rc-jpeg`, `rc-webp`, `rc-gif`, `rc-avif`
 
 ## Limitations
 
-- Formats: PNG, JPEG, WebP (lossless and lossy) and AVIF in and out; GIF in. Animated output only as AVIF. JPEG: 8-bit Huffman, 1, 3 or 4 components (no arithmetic coding or 12-bit).
-- WebP output is 8-bit, and AVIF output is 8-bit unless the source is 16-bit or `--bit-depth 10` is given.
+- Formats: PNG, JPEG, WebP (lossless and lossy), AVIF and GIF in and out. Animations are written as AVIF, WebP or GIF (APNG is read, not written). JPEG: 8-bit Huffman, 1, 3 or 4 components (no arithmetic coding or 12-bit).
+- WebP output is always 8-bit: the WebP format has no higher bit depth. AVIF output is 8-bit unless the source is 16-bit or `--bit-depth 10` is given.
+- GIF output is at most 256 colors and its transparency is on/off, both limits of the GIF format; animated GIFs share one palette and are not dithered. A GIF that needs a separate palette per frame is not re-coded losslessly (it is left unchanged, or re-quantized with `--lossy`).
 - CMYK JPEGs are never requantized (`-q` does not apply to them); YCCK decoding is covered by unit tests but has no real-file fixture.
-- EXIF/XMP/comments are dropped unless `--keep-metadata` is given. An EXIF block too large for a JPEG segment (over 64 KB) cannot be carried into a JPEG.
+- EXIF/XMP/comments are dropped unless `--keep-metadata` is given. An EXIF block over 64 KB cannot be carried into a JPEG: the format allows one 64 KB segment for it.
 - Resizing only shrinks and filters in gamma-encoded space.

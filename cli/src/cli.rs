@@ -11,6 +11,8 @@ pub enum FormatArg {
     Webp,
     /// AVIF (always lossy; -q sets the quality).
     Avif,
+    /// GIF (stills and animations; at most --colors palette entries, so always lossy for photos).
+    Gif,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
@@ -79,15 +81,15 @@ pub struct Cli {
     #[arg(long, value_enum, default_value_t = BitDepthArg::Auto)]
     pub bit_depth: BitDepthArg,
 
-    /// Allow lossy output: PNG palette quantization, lossy (VP8) WebP when the output is WebP, or re-encoding an AVIF source (AVIF is otherwise left unchanged).
+    /// Allow lossy output: PNG palette quantization, lossy (VP8) WebP when the output is WebP (animations too), re-encoding an AVIF source (AVIF is otherwise left unchanged), or re-quantizing a GIF whose frames do not fit one palette (such GIFs are otherwise left unchanged).
     #[arg(long)]
     pub lossy: bool,
 
-    /// With --lossy on PNG: number of palette colors (2-256).
+    /// With --lossy on PNG, and for GIF output: number of palette colors (2-256).
     #[arg(long, default_value_t = 256, value_parser = clap::value_parser!(u16).range(2..=256))]
     pub colors: u16,
 
-    /// With --lossy on PNG: dithering strength 0.0-1.0 (0 disables).
+    /// With --lossy on PNG, and for still GIF output: dithering strength 0.0-1.0 (0 disables). Animated GIFs are never dithered.
     #[arg(long, default_value_t = 0.5)]
     pub dither: f32,
 

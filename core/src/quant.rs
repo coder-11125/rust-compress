@@ -2,8 +2,8 @@
 //! then error-diffusion remapping. The result is an ordinary RGB(A) image with at most
 //! `colors` distinct colors, which the PNG encoder stores as an indexed image.
 
+use crate::image::{ColorType, Image};
 use rayon::prelude::*;
-use rc_core::image::{ColorType, Image};
 use std::collections::HashSet;
 
 /// Perceptual channel weights (R, G, B, A) for color distance.
@@ -337,4 +337,46 @@ pub fn quantize(img: &Image, colors: usize, dither: f32) -> Image {
     }
     let color = if has_alpha { ColorType::Rgba } else { ColorType::Rgb };
     Image { width: src.width, height: src.height, color, depth: 8, data: out, meta: src.meta.clone() }
+}
+
+/// One palette of opaque colors for the pixels of several images (the frames of an animation). Exact when the pixels
+/// use no more than `colors` distinct colors, otherwise median cut with k-means refinement.
+pub struct RgbPalette {
+    pal: Palette,
+    rgb: Vec<[u8; 3]>,
+}
+
+impl RgbPalette {
+    pub fn new(px: &[[u8; 3]], colors: usize) -> Self {
+        let colors = colors.clamp(1, 256);
+        let rgba: Vec<[u8; 4]> = px.iter().map(|p| [p[0], p[1], p[2], 255]).collect();
+        let cols: Vec<[f32; 4]> = if rgba.is_empty() {
+            vec![[0.0, 0.0, 0.0, 255.0]]
+        } else if has_at_most_colors(&rgba, colors) {
+            let set: HashSet<[u8; 4]> = rgba.iter().copied().collect();
+            set.into_iter().map(|p| p.map(f32::from)).collect()
+        } else {
+            let mut entries = exact_histogram(&rgba).unwrap_or_else(|| bucket_histogram(&rgba, false));
+            let cut = median_cut(&mut entries, colors);
+            let cols = refine(&entries, cut, 6);
+            cols.iter().map(|c| c.map(|v| v.round().clamp(0.0, 255.0))).collect()
+        };
+        let pal = Palette::new(cols);
+        let mut rgb: Vec<[u8; 3]> = pal.cols.iter().map(|c| [c[0] as u8, c[1] as u8, c[2] as u8]).collect();
+        // Rounding can merge two entries; keep the list free of repeats (order is irrelevant to callers).
+        let mut seen = HashSet::new();
+        rgb.retain(|c| seen.insert(*c));
+        let pal = Palette::new(rgb.iter().map(|c| [c[0] as f32, c[1] as f32, c[2] as f32, 255.0]).collect());
+        let rgb = pal.cols.iter().map(|c| [c[0] as u8, c[1] as u8, c[2] as u8]).collect();
+        RgbPalette { pal, rgb }
+    }
+
+    /// The palette entries; [`nearest`](Self::nearest) returns indices into this list.
+    pub fn colors(&self) -> &[[u8; 3]] {
+        &self.rgb
+    }
+
+    pub fn nearest(&self, c: [u8; 3]) -> usize {
+        self.pal.nearest(&[c[0] as f32, c[1] as f32, c[2] as f32, 255.0])
+    }
 }

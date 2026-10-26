@@ -5,5 +5,6 @@ pub mod error;
 pub mod exif;
 pub mod image;
 pub mod metrics;
+pub mod quant;
 pub mod resize;
 pub mod util;

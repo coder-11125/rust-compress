@@ -1,5 +1,20 @@
 # Changelog
 
+## Unreleased
+
+- Animated WebP output: `-f webp` turns animated GIF, APNG, animated WebP and animated AVIF into an animated WebP.
+  Lossless by default, lossy (VP8) frames with `--lossy`; after the first frame only the changed rectangle is stored,
+  and each lossless frame is coded both replacing the canvas and blended over it, keeping the smaller. An animated WebP
+  input is now re-encoded with `--lossy` (it was always left unchanged before). Verified frame by frame with Pillow
+  (libwebp): pixel-identical in the lossless case.
+- GIF output: `-f gif` writes stills and animations (any input format). One shared palette (`--colors`, default 256),
+  frames stored as the changed rectangle with unchanged pixels transparent, a new LZW encoder, and disposal handling
+  for frames that make visible pixels transparent again; animations are not dithered, stills use `--dither`. A GIF kept
+  as a GIF is re-coded without changing any pixel (about 30% smaller on the test animation) and is left unchanged when
+  its frames need more than one palette, unless `--lossy` or `--resize` is given. GIFs are now picked up by directory
+  runs. Verified frame by frame with Pillow.
+- The color quantizer moved from `rc-png` to `rc-core` (still available as `rc_png::quant`), so the GIF writer shares it.
+
 ## 0.1.1 - 26-10-2026
 
 - `rc update`: checks GitHub for the newest release, shows `current -> newer`, and replaces the running binary.

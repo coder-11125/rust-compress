@@ -2,11 +2,13 @@
 //! files; [`decode_animation`] reads them.
 
 pub mod alpha;
+pub mod anim_enc;
 pub mod cluster;
 pub mod vp8;
 pub mod vp8l;
 pub mod vp8l_enc;
 
+pub use anim_enc::{AnimOptions, encode_animation};
 use rc_core::animation::Animation;
 use rc_core::error::{Error, Result};
 use rc_core::image::{ColorType, Image, MAX_PIXELS, Metadata};

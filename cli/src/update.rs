@@ -75,7 +75,9 @@ fn update(args: &UpdateArgs) -> Result<(), String> {
             return Ok(());
         }
         None if !explicit => {
-            return Err(format!("could not compare {CURRENT} with release tag {tag:?} (use --to {tag} to install it anyway)"));
+            return Err(format!(
+                "could not compare {CURRENT} with release tag {tag:?} (use --to {tag} to install it anyway)"
+            ));
         }
         _ => {}
     }
@@ -86,7 +88,10 @@ fn update(args: &UpdateArgs) -> Result<(), String> {
     };
     if args.check {
         if order == Some(Ordering::Greater) {
-            println!("A newer release is available: {CURRENT} -> {}. Run `rc update` to install it.", tag.trim_start_matches('v'));
+            println!(
+                "A newer release is available: {CURRENT} -> {}. Run `rc update` to install it.",
+                tag.trim_start_matches('v')
+            );
         }
         return Ok(());
     }
@@ -131,7 +136,8 @@ fn update(args: &UpdateArgs) -> Result<(), String> {
         .ok_or_else(|| format!("{asset} did not contain {bin_name}"))?;
 
     // Stage next to the target so the final rename stays on one filesystem.
-    let staged = exe.with_file_name(format!(".rc-update-{}{}", std::process::id(), if cfg!(windows) { ".exe" } else { "" }));
+    let staged =
+        exe.with_file_name(format!(".rc-update-{}{}", std::process::id(), if cfg!(windows) { ".exe" } else { "" }));
     let result = stage_and_swap(&new_bin, &staged, &exe, &tag);
     if result.is_err() {
         let _ = fs::remove_file(&staged);
@@ -208,7 +214,19 @@ fn target_triple() -> Result<String, String> {
 fn latest_tag(base: &str) -> Result<String, String> {
     let null = if cfg!(windows) { "NUL" } else { "/dev/null" };
     let out = Command::new("curl")
-        .args(["-fsSIL", "--retry", "3", "--connect-timeout", "20", "--max-time", "60", "-o", null, "-w", "%{url_effective}"])
+        .args([
+            "-fsSIL",
+            "--retry",
+            "3",
+            "--connect-timeout",
+            "20",
+            "--max-time",
+            "60",
+            "-o",
+            null,
+            "-w",
+            "%{url_effective}",
+        ])
         .arg(format!("{base}/releases/latest"))
         .stdin(Stdio::null())
         .output()
@@ -244,11 +262,7 @@ fn curl_missing(e: std::io::Error) -> String {
 
 fn run_tool(cmd: &mut Command) -> Result<(), String> {
     let out = cmd.stdin(Stdio::null()).output().map_err(curl_missing)?;
-    if out.status.success() {
-        Ok(())
-    } else {
-        Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
-    }
+    if out.status.success() { Ok(()) } else { Err(String::from_utf8_lossy(&out.stderr).trim().to_string()) }
 }
 
 /// A scratch directory next to the executable, removed when dropped.

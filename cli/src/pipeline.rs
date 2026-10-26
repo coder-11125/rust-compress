@@ -4,7 +4,7 @@ use crate::cli::{BitDepthArg, Cli, SubsamplingArg};
 use crate::collect::{Format, Job, is_stdio, target_format};
 use crate::report::{Report, Status};
 use rc_avif as avif;
-use rc_core::animation::Animation;
+use rc_core::animation::{AnimFrame, Animation};
 use rc_core::error::{Error, Result};
 use rc_core::exif;
 use rc_core::image::{ColorType, Image, Metadata};
@@ -236,7 +236,15 @@ fn encode(img: &Image, fmt: Format, cli: &Cli) -> Result<Encoded> {
             }
             Ok(encoded)
         }
-        Format::Gif => Err(Error::unsupported("GIF output")),
+        Format::Gif => {
+            let frame = AnimFrame { image: img.clone(), duration_ms: rc_core::animation::DEFAULT_DELAY_MS };
+            let still = Animation { width: img.width, height: img.height, frames: vec![frame], loop_forever: false };
+            let mut encoded: Encoded = gif::encode_animation(&still, &gif_options(cli))?.into();
+            if img.depth == 16 {
+                encoded.note = Some("16-bit reduced to 8-bit".into());
+            }
+            Ok(encoded)
+        }
     }
 }
 
@@ -272,15 +280,10 @@ fn write_output(path: &Path, data: &[u8]) -> Result<()> {
 }
 
 fn run(job: &Job, cli: &Cli, data: &[u8]) -> Result<(Status, u64, Option<String>)> {
-    let in_fmt = Format::sniff(data).or_else(|| Format::from_extension(&job.input)).ok_or_else(|| {
-        Error::unsupported("unrecognized image format (supported: PNG, JPEG, WebP, AVIF, and GIF as input)")
-    })?;
+    let in_fmt = Format::sniff(data)
+        .or_else(|| Format::from_extension(&job.input))
+        .ok_or_else(|| Error::unsupported("unrecognized image format (supported: PNG, JPEG, WebP, AVIF, GIF)"))?;
     let out_fmt = target_format(cli, in_fmt);
-    if out_fmt == Format::Gif {
-        return Err(Error::unsupported(
-            "GIF files can only be converted: use --format png, jpeg, webp or avif (animations: avif)",
-        ));
-    }
     if cli.in_place && out_fmt != in_fmt {
         return Err(Error::unsupported("--in-place cannot be combined with a format change"));
     }
@@ -293,8 +296,14 @@ fn run(job: &Job, cli: &Cli, data: &[u8]) -> Result<(Status, u64, Option<String>
     let untouchable = match (in_fmt, out_fmt) {
         (Format::Png, Format::Png) if png::is_animated(data) => Some("animated PNG left unchanged"),
         (Format::Webp, Format::Webp) => webp::unsupported_reason(data)
-            .filter(|r| !(cli.lossy && *r == "lossy WebP"))
-            .map(|r| if r == "lossy WebP" { "lossy WebP left unchanged" } else { "animated WebP left unchanged" }),
+            .filter(|r| !(cli.lossy && matches!(*r, "lossy WebP" | "animated WebP")))
+            .map(|r| {
+                if r == "lossy WebP" {
+                    "lossy WebP left unchanged"
+                } else {
+                    "animated WebP left unchanged (use --lossy to re-encode)"
+                }
+            }),
         // Re-encoding a lossy AVIF would only add generation loss, so it needs an explicit --lossy.
         (Format::Avif, Format::Avif) if !cli.lossy && cli.resize.is_none() => {
             Some("AVIF left unchanged (use --lossy to re-encode)")
@@ -307,9 +316,23 @@ fn run(job: &Job, cli: &Cli, data: &[u8]) -> Result<(Status, u64, Option<String>
         }
         return Ok((Status::NoGain, data.len() as u64, Some(note.into())));
     }
-    let animation = if out_fmt == Format::Avif { decode_animation(data, in_fmt)? } else { None };
+    let animation = if matches!(out_fmt, Format::Avif | Format::Gif | Format::Webp) {
+        decode_animation(data, in_fmt)?
+    } else {
+        None
+    };
     let encoded = if let Some(anim) = animation {
-        animation_to_avif(anim, cli)?
+        match animation_to(anim, in_fmt, out_fmt, cli)? {
+            Some(encoded) => encoded,
+            None => {
+                // A GIF whose frames do not fit one palette would need a lossy re-quantization.
+                if !cli.in_place && !cli.dry_run {
+                    write_output(&job.output, data)?;
+                }
+                let note = "GIF left unchanged (use --lossy to re-quantize)";
+                return Ok((Status::NoGain, data.len() as u64, Some(note.into())));
+            }
+        }
     } else if in_fmt == Format::Jpeg && out_fmt == Format::Jpeg {
         jpeg_to_jpeg(data, cli)?
     } else {
@@ -347,8 +370,13 @@ fn decode_animation(data: &[u8], fmt: Format) -> Result<Option<Animation>> {
     Ok(anim.filter(|a| a.frames.len() > 1))
 }
 
-/// Encode an animation as an animated AVIF, resizing every frame when asked.
-fn animation_to_avif(mut anim: Animation, cli: &Cli) -> Result<Encoded> {
+fn gif_options(cli: &Cli) -> gif::EncodeOptions {
+    gif::EncodeOptions { colors: cli.colors as usize, dither: cli.dither }
+}
+
+/// Encode an animation as an animated AVIF, WebP or GIF, resizing every frame when asked. `None` means the
+/// original GIF should be kept: its frames do not fit one palette and re-quantizing them is lossy.
+fn animation_to(mut anim: Animation, in_fmt: Format, out_fmt: Format, cli: &Cli) -> Result<Option<Encoded>> {
     let mut resized = None;
     if cli.resize.is_some() {
         for f in &mut anim.frames {
@@ -360,18 +388,41 @@ fn animation_to_avif(mut anim: Animation, cli: &Cli) -> Result<Encoded> {
         anim.width = anim.frames[0].image.width;
         anim.height = anim.frames[0].image.height;
     }
-    let full_chroma = match cli.subsampling {
-        SubsamplingArg::Auto => cli.quality >= 90,
-        SubsamplingArg::S444 => true,
-        SubsamplingArg::S420 => false,
-    };
-    let bit_depth = if cli.bit_depth == BitDepthArg::B10 { 10 } else { 8 };
-    let opts = avif::encode::EncodeOptions { quality: cli.quality, full_chroma, effort: cli.level, bit_depth };
     let n = anim.frames.len();
-    let mut encoded: Encoded = avif::encode::encode_animation(&anim, &opts)?.into();
+    let mut encoded: Encoded = match out_fmt {
+        Format::Avif => {
+            let full_chroma = match cli.subsampling {
+                SubsamplingArg::Auto => cli.quality >= 90,
+                SubsamplingArg::S444 => true,
+                SubsamplingArg::S420 => false,
+            };
+            let bit_depth = if cli.bit_depth == BitDepthArg::B10 { 10 } else { 8 };
+            let opts = avif::encode::EncodeOptions { quality: cli.quality, full_chroma, effort: cli.level, bit_depth };
+            let mut e: Encoded = avif::encode::encode_animation(&anim, &opts)?.into();
+            e.forced = true;
+            e
+        }
+        Format::Webp => {
+            let opts = webp::AnimOptions {
+                level: cli.level as u32,
+                clean_alpha: !cli.keep_hidden_pixels,
+                lossy_quality: cli.lossy.then_some(cli.quality),
+            };
+            webp::encode_animation(&anim, &opts)?.into()
+        }
+        Format::Gif => {
+            let opts = gif_options(cli);
+            if in_fmt == Format::Gif && !cli.lossy && resized.is_none() && !gif::palette_is_exact(&anim, opts.colors) {
+                return Ok(None);
+            }
+            gif::encode_animation(&anim, &opts)?.into()
+        }
+        Format::Png | Format::Jpeg => {
+            return Err(Error::unsupported("animations can be written as AVIF, WebP or GIF"));
+        }
+    };
     encoded.note = Some(format!("{n} frames"));
-    encoded.forced = true;
-    Ok(encoded.resized(resized))
+    Ok(Some(encoded.resized(resized)))
 }
 
 pub fn process(job: &Job, cli: &Cli) -> Report {

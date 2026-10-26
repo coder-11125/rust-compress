@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 pub enum Format {
     Png,
     Jpeg,
-    /// Input only: GIFs are converted to PNG, JPEG or WebP.
+    /// GIF (stills and animations).
     Gif,
     /// Lossless WebP.
     Webp,
@@ -69,6 +69,7 @@ pub fn target_format(cli: &Cli, input: Format) -> Format {
         FormatArg::Jpeg => Format::Jpeg,
         FormatArg::Webp => Format::Webp,
         FormatArg::Avif => Format::Avif,
+        FormatArg::Gif => Format::Gif,
     }
 }
 
@@ -90,11 +91,13 @@ fn output_path(cli: &Cli, input: &Path, rel: &Path, dir_mode: bool) -> PathBuf {
         (Some(Format::Png), FormatArg::Png)
         | (Some(Format::Jpeg), FormatArg::Jpeg)
         | (Some(Format::Webp), FormatArg::Webp)
-        | (Some(Format::Avif), FormatArg::Avif) => ext_in.unwrap_or_default(),
+        | (Some(Format::Avif), FormatArg::Avif)
+        | (Some(Format::Gif), FormatArg::Gif) => ext_in.unwrap_or_default(),
         (_, FormatArg::Png) => "png".to_string(),
         (_, FormatArg::Jpeg) => "jpg".to_string(),
         (_, FormatArg::Webp) => "webp".to_string(),
         (_, FormatArg::Avif) => "avif".to_string(),
+        (_, FormatArg::Gif) => "gif".to_string(),
         (None, FormatArg::Keep) => String::new(),
     };
     if cli.in_place {
@@ -110,7 +113,7 @@ fn output_path(cli: &Cli, input: &Path, rel: &Path, dir_mode: bool) -> PathBuf {
     }
 }
 
-fn walk(dir: &Path, recursive: bool, gifs: bool, out: &mut Vec<PathBuf>) -> std::io::Result<()> {
+fn walk(dir: &Path, recursive: bool, out: &mut Vec<PathBuf>) -> std::io::Result<()> {
     let mut entries: Vec<_> = std::fs::read_dir(dir)?.collect::<Result<_, _>>()?;
     entries.sort_by_key(|e| e.file_name());
     for e in entries {
@@ -118,9 +121,9 @@ fn walk(dir: &Path, recursive: bool, gifs: bool, out: &mut Vec<PathBuf>) -> std:
         let ty = e.file_type()?;
         if ty.is_dir() {
             if recursive {
-                walk(&p, recursive, gifs, out)?;
+                walk(&p, recursive, out)?;
             }
-        } else if ty.is_file() && Format::from_extension(&p).is_some_and(|f| gifs || f != Format::Gif) {
+        } else if ty.is_file() && Format::from_extension(&p).is_some() {
             // Skip our own default outputs so reruns do not recompress them.
             let stem = p.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
             if !stem.ends_with(".min") {
@@ -167,8 +170,7 @@ pub fn collect(cli: &Cli) -> (Vec<Job>, Vec<String>) {
     for input in &cli.inputs {
         if input.is_dir() {
             let mut files = Vec::new();
-            // GIFs can only be converted, so directory walks skip them unless a target format was chosen.
-            if let Err(e) = walk(input, cli.recursive, cli.format != FormatArg::Keep, &mut files) {
+            if let Err(e) = walk(input, cli.recursive, &mut files) {
                 problems.push(format!("{}: {e}", input.display()));
                 continue;
             }
