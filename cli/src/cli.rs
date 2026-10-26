@@ -121,6 +121,11 @@ pub struct Cli {
     #[arg(long, value_name = "SIZE", value_parser = rc_core::resize::parse)]
     pub resize: Option<rc_core::resize::Spec>,
 
+    /// With --resize: filter the stored (gamma-encoded) values instead of linear light. A little faster and
+    /// what most tools do, but fine detail comes out darker than the original looks.
+    #[arg(long, requires = "resize")]
+    pub resize_encoded: bool,
+
     /// Keep descriptive metadata: EXIF, XMP, comments, PNG text chunks and pixel density. By default only
     /// color information (ICC profile, PNG color chunks) is kept. EXIF and XMP also carry over when
     /// converting between PNG and JPEG; orientation is reset once it has been baked into the pixels.

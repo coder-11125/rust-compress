@@ -54,7 +54,8 @@ fn resize_image(img: Image, cli: &Cli) -> (Image, Option<String>) {
     if (nw, nh) == (w, h) {
         return (img, None);
     }
-    let mut out = resize::resize(&img, nw, nh);
+    let space = if cli.resize_encoded { resize::Space::Encoded } else { resize::Space::Linear };
+    let mut out = resize::resize_in(&img, nw, nh, space);
     let fix = exif::Fix { dims: Some((nw, nh)), drop_thumbnail: true, ..Default::default() };
     if let Some(e) = out.meta.exif.as_mut() {
         exif::tidy(e, fix);
@@ -147,14 +148,6 @@ fn jpeg_to_jpeg(data: &[u8], cli: &Cli) -> Result<Encoded> {
             SubsamplingArg::S420 => !is420,
             SubsamplingArg::S444 => !is444,
         };
-    if info.cmyk && orientation == 1 && !resizing {
-        // Requantizing would have to guess ink-channel tolerances, so CMYK is only ever transcoded
-        // losslessly: identical coefficients, better entropy coding, Adobe colour flag preserved.
-        let mut ci = parsed.into_coefs()?;
-        apply_metadata_policy(&mut ci.meta, cli);
-        let bytes = jpeg::encode::write_best(&ci);
-        return Ok(Encoded { bytes, note: Some("CMYK, lossless".into()), forced: false });
-    }
     if orientation == 1 && !resample && !info.coded_rgb && !resizing {
         let mut ci = parsed.into_coefs()?;
         apply_metadata_policy(&mut ci.meta, cli);
@@ -168,8 +161,13 @@ fn jpeg_to_jpeg(data: &[u8], cli: &Cli) -> Result<Encoded> {
             let note = format!("q{}, ssim {:.4}", found.quality, found.ssim);
             return Ok(Encoded { bytes: jpeg::encode::write_best(&found.coefs), note: Some(note), forced: false });
         }
+        let before = ci.qtables;
         ci.requantize(cli.quality, !cli.no_trellis);
-        return Ok(jpeg::encode::write_best(&ci).into());
+        let mut encoded: Encoded = jpeg::encode::write_best(&ci).into();
+        if info.cmyk {
+            encoded.note = Some(if ci.qtables == before { "CMYK, lossless" } else { "CMYK, requantized" }.into());
+        }
+        return Ok(encoded);
     }
     let img = upright(parsed.into_image()?, orientation);
     let mut img = img;

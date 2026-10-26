@@ -2,10 +2,32 @@
 //!
 //! Resizing only ever shrinks: a target larger than the source leaves the image alone. Images with
 //! alpha are resampled with premultiplied color, so invisible pixels cannot bleed into visible ones.
-//! Filtering is done on the stored (gamma-encoded) values, as is conventional for image tools.
+//! By default the filter runs in linear light (the sRGB transfer curve is undone before filtering and
+//! applied again after), so a fine black-and-white pattern averages to the brightness the eye sees
+//! instead of coming out too dark; [`Space::Encoded`] filters the stored values directly instead.
 
 use crate::image::Image;
 use rayon::prelude::*;
+
+/// What the filter averages.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum Space {
+    /// Linear light, assuming the sRGB transfer curve (the default).
+    #[default]
+    Linear,
+    /// The stored, gamma-encoded values as they are.
+    Encoded,
+}
+
+/// sRGB decode: encoded 0..=1 to linear light.
+fn srgb_to_linear(v: f32) -> f32 {
+    if v <= 0.04045 { v / 12.92 } else { ((v + 0.055) / 1.055).powf(2.4) }
+}
+
+/// sRGB encode: linear light 0..=1 to the encoded value.
+fn linear_to_srgb(v: f32) -> f32 {
+    if v <= 0.003_130_8 { v * 12.92 } else { 1.055 * v.powf(1.0 / 2.4) - 0.055 }
+}
 
 /// How large the result may be.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -96,8 +118,13 @@ fn contributions(src_len: usize, dst_len: usize) -> Vec<(usize, Vec<f32>)> {
         .collect()
 }
 
-/// Resample `img` to `new_w` x `new_h`.
+/// Resample `img` to `new_w` x `new_h` in linear light.
 pub fn resize(img: &Image, new_w: u32, new_h: u32) -> Image {
+    resize_in(img, new_w, new_h, Space::Linear)
+}
+
+/// Resample `img` to `new_w` x `new_h`, averaging in the given [`Space`].
+pub fn resize_in(img: &Image, new_w: u32, new_h: u32, space: Space) -> Image {
     let (w, h) = (img.width as usize, img.height as usize);
     let (nw, nh) = (new_w as usize, new_h as usize);
     if (w, h) == (nw, nh) || nw == 0 || nh == 0 {
@@ -106,14 +133,22 @@ pub fn resize(img: &Image, new_w: u32, new_h: u32) -> Image {
     let ch = img.color.channels();
     let max = if img.depth == 16 { 65535.0f32 } else { 255.0 };
     let alpha = img.color.has_alpha().then_some(ch - 1);
+    let linear = space == Space::Linear;
+    let bps = img.bytes_per_sample();
+
+    // Working values are 0..=max: linear light when `linear` (color channels only; alpha is coverage and stays
+    // as it is), otherwise the stored values.
+    let decode: Vec<f32> =
+        if !linear { Vec::new() } else { (0..=max as usize).map(|v| srgb_to_linear(v as f32 / max) * max).collect() };
 
     // Samples as f32, premultiplied when there is alpha.
     let mut src = vec![0f32; w * h * ch];
     src.par_chunks_mut(w * ch).enumerate().for_each(|(y, row)| {
-        let bps = img.bytes_per_sample();
         let line = &img.data[y * img.stride()..(y + 1) * img.stride()];
         for (i, v) in row.iter_mut().enumerate() {
-            *v = if bps == 2 { u16::from_be_bytes([line[2 * i], line[2 * i + 1]]) as f32 } else { line[i] as f32 };
+            let q =
+                if bps == 2 { u16::from_be_bytes([line[2 * i], line[2 * i + 1]]) as usize } else { line[i] as usize };
+            *v = if linear && alpha != Some(i % ch) { decode[q] } else { q as f32 };
         }
         if let Some(a) = alpha {
             for px in row.chunks_exact_mut(ch) {
@@ -144,7 +179,14 @@ pub fn resize(img: &Image, new_w: u32, new_h: u32) -> Image {
 
     // Vertical pass: h -> nh.
     let ys = contributions(h, nh);
-    let bps = img.bytes_per_sample();
+    // 8-bit output: the encoded value is the number of decision thresholds the linear value reaches, where
+    // threshold k lies halfway between codes k and k+1 in encoded space (exactly what rounding the encoded
+    // value would give, without a pow per sample).
+    let thresholds: Vec<f32> = if linear && bps == 1 {
+        (0..255).map(|k| srgb_to_linear((k as f32 + 0.5) / 255.0) * 255.0).collect()
+    } else {
+        Vec::new()
+    };
     let mut data = vec![0u8; nw * nh * ch * bps];
     data.par_chunks_mut(nw * ch * bps).enumerate().for_each(|(y, out)| {
         let (lo, weights) = &ys[y];
@@ -166,7 +208,15 @@ pub fn resize(img: &Image, new_w: u32, new_h: u32) -> Image {
             }
         }
         for (i, v) in row.iter().enumerate() {
-            let q = v.clamp(0.0, max).round();
+            let v = v.clamp(0.0, max);
+            let color = linear && alpha != Some(i % ch);
+            let q = if !color {
+                v.round() as u32
+            } else if bps == 1 {
+                thresholds.partition_point(|&t| t <= v) as u32
+            } else {
+                (linear_to_srgb(v / max) * max).round().clamp(0.0, max) as u32
+            };
             if bps == 2 {
                 out[2 * i..2 * i + 2].copy_from_slice(&(q as u16).to_be_bytes());
             } else {
@@ -263,6 +313,54 @@ mod tests {
             }
         }
         assert!(out.data.chunks_exact(4).any(|p| p[3] == 255) && out.data.chunks_exact(4).any(|p| p[3] == 0));
+    }
+
+    fn checkerboard(n: u32, depth: u8) -> Image {
+        let hi: u16 = if depth == 16 { 65535 } else { 255 };
+        let mut data = Vec::new();
+        for y in 0..n {
+            for x in 0..n {
+                let v = if (x + y) % 2 == 0 { hi } else { 0 };
+                if depth == 16 {
+                    data.extend_from_slice(&v.to_be_bytes());
+                } else {
+                    data.push(v as u8);
+                }
+            }
+        }
+        Image::new(n, n, ColorType::Gray, depth, data).unwrap()
+    }
+
+    #[test]
+    fn a_fine_pattern_averages_in_linear_light_by_default() {
+        // Half black, half white pixels look like 50% light, which is sRGB 188, not 128.
+        let img = checkerboard(64, 8);
+        let lin = resize(&img, 8, 8);
+        let enc = resize_in(&img, 8, 8, Space::Encoded);
+        let mid = |i: &Image| i.data[3 * 8 + 3] as i32;
+        assert!((mid(&lin) - 188).abs() <= 3, "linear gave {}", mid(&lin));
+        assert!((mid(&enc) - 128).abs() <= 3, "encoded gave {}", mid(&enc));
+        let wide = checkerboard(64, 16);
+        let v = u16::from_be_bytes([
+            resize(&wide, 8, 8).data[2 * (3 * 8 + 3)],
+            resize(&wide, 8, 8).data[2 * (3 * 8 + 3) + 1],
+        ]);
+        assert!((v as i32 - 188 * 257).abs() <= 3 * 257, "16-bit linear gave {v}");
+    }
+
+    #[test]
+    fn linear_light_keeps_alpha_as_coverage_and_colors_exact() {
+        let img = solid(20, 20, ColorType::Rgba, 8, &[10, 120, 250, 90]);
+        let out = resize(&img, 7, 7);
+        assert!(out.data.chunks_exact(4).all(|p| p == [10, 120, 250, 90]), "{:?}", &out.data[..4]);
+    }
+
+    #[test]
+    fn every_8_bit_value_survives_a_round_trip_through_linear_light() {
+        for v in 0..=255u16 {
+            let out = resize(&solid(12, 12, ColorType::Gray, 8, &[v]), 5, 5);
+            assert!(out.data.iter().all(|&p| p as u16 == v), "{v} -> {}", out.data[0]);
+        }
     }
 
     #[test]

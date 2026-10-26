@@ -88,6 +88,18 @@ impl CoefImage {
         (self.width.div_ceil(8 * hmax), self.height.div_ceil(8 * vmax))
     }
 
+    /// Which standard table a component is quantized toward: 0 luma, 1 chroma. Three-component files have
+    /// one luma channel and two chroma channels. In a four-component file every channel of plain CMYK is an
+    /// ink amount with no perceptual excuse for coarser steps, so all of them use the luma table; in YCCK the
+    /// two color-difference channels are chroma and Y and K are luma-like.
+    fn table_class(&self, ci: usize) -> usize {
+        if self.comps.len() == 4 {
+            usize::from(self.adobe_transform == Some(2) && (ci == 1 || ci == 2))
+        } else {
+            ci.min(1)
+        }
+    }
+
     /// Re-quantize in the DCT domain towards the standard tables at `quality`. Positions where the
     /// source is already coarser than the target are left untouched, so a source at or below the
     /// target quality is transcoded losslessly. With `trellis`, blocks that change are
@@ -96,14 +108,14 @@ impl CoefImage {
         let tables = [luma_table(quality), chroma_table(quality)];
         let mut new_slots: [Option<[u8; 64]>; 4] = [None; 4];
         let mut changed = false;
-        // (class, old table, new table) per component, and the original coefficients for the RDO pass.
-        let mut plan = Vec::new();
+        // (slot, old/new ratio per zigzag position, new table) per component.
+        let mut plan: Vec<(usize, [f32; 64], [u8; 64])> = Vec::new();
         let originals: Vec<Vec<i16>> =
             if trellis { self.comps.iter().map(|c| c.coefs.clone()).collect() } else { Vec::new() };
+        let classes: Vec<usize> = (0..self.comps.len()).map(|ci| self.table_class(ci)).collect();
         for (ci, c) in self.comps.iter_mut().enumerate() {
-            let slot = ci.min(1);
             let old = self.qtables[c.tq].unwrap_or([1; 64]);
-            let mut new = tables[slot];
+            let mut new = tables[classes[ci]];
             for (n, o) in new.iter_mut().zip(&old) {
                 *n = (*n).max(*o);
             }
@@ -120,19 +132,27 @@ impl CoefImage {
                     }
                 }
             });
+            // Components that end up with the same table share a slot; a different table gets the next one.
+            let slot = match new_slots.iter().position(|t| *t == Some(new)) {
+                Some(s) => s,
+                None => {
+                    let s = new_slots.iter().position(Option::is_none).expect("at most four components");
+                    new_slots[s] = Some(new);
+                    s
+                }
+            };
             c.tq = slot;
-            new_slots[slot] = Some(new);
             plan.push((slot, ratio, new));
         }
         self.qtables = new_slots;
         if trellis && changed {
+            // The rate model follows the Huffman table a component is written with (the first component's, or
+            // the shared one of all the others); the quantizer follows the component's own table.
             let lens = ac_code_lengths(self);
-            let rdos = [
-                Rdo::new(&plan[0].2, TRELLIS_KAPPA, &lens[0]),
-                Rdo::new(plan.last().map_or(&plan[0].2, |p| &p.2), TRELLIS_KAPPA, &lens[1]),
-            ];
-            for ((c, orig), (slot, ratio, _)) in self.comps.iter_mut().zip(&originals).zip(&plan) {
-                let rdo = &rdos[*slot];
+            let rdos: Vec<Rdo> =
+                plan.iter().enumerate().map(|(ci, p)| Rdo::new(&p.2, TRELLIS_KAPPA, &lens[ci.min(1)])).collect();
+            for (ci, ((c, orig), (_, ratio, _))) in self.comps.iter_mut().zip(&originals).zip(&plan).enumerate() {
+                let rdo = &rdos[ci];
                 c.coefs.par_chunks_mut(64 * 64).zip(orig.par_chunks(64 * 64)).for_each(|(out, inp)| {
                     for (o, i) in out.chunks_exact_mut(64).zip(inp.chunks_exact(64)) {
                         let mut a = [0f32; 64];

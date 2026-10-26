@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+- Resizing now filters in linear light (assuming the sRGB transfer curve) instead of on the gamma-encoded values, so
+  fine detail keeps its brightness (a black/white checkerboard averages to 188, not 128). `--resize-encoded` brings back
+  the old behavior, which still matches Pillow's Lanczos to within 0.13 levels; the new default differs from Pillow by
+  about 2 levels on a photo-like image.
+- CMYK and YCCK JPEGs are now re-quantized to `-q` in the DCT domain (they were only ever transcoded losslessly, so `-q`
+  did nothing for them). Sources at or below the target quality are still transcoded losslessly. All four ink channels of
+  CMYK use the luma table; in YCCK, Y and K do and Cb/Cr use the chroma table. The requantizer now gives components that
+  end up with the same table one slot and builds the trellis rate model per component, which also fixes files whose Cb
+  and Cr start with different tables. Output decodes in libjpeg with the Adobe flag intact (31-79% smaller on the
+  fixtures).
+- New YCCK test files (`fixtures/ycck*.jpg`, 4:2:0-style and 4:4:4), built by `jpeg/examples/make_ycck.rs` and checked
+  against libjpeg's decode.
 - Animated WebP output: `-f webp` turns animated GIF, APNG, animated WebP and animated AVIF into an animated WebP.
   Lossless by default, lossy (VP8) frames with `--lossy`; after the first frame only the changed rectangle is stored,
   and each lossless frame is coded both replacing the canvas and blended over it, keeping the smaller. An animated WebP

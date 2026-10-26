@@ -74,13 +74,13 @@ cat in.png | rc - > out.png  # stdin to stdout
 
 **Other formats**
 - **GIF** reads and writes still and animated files (palettes, interlacing, transparency, disposal). A GIF kept as a GIF is re-coded without changing a pixel: one shared palette, each frame stored as the rectangle that changed with the unchanged pixels transparent, and a fresh LZW pass; the original is kept when that is not smaller. A GIF whose frames need more than one 256-color palette between them would have to be re-quantized, so it is left unchanged unless `--lossy` (or `--resize`) is given. Converting *to* GIF (`-f gif`, from any format) quantizes to `--colors` entries (default 256) with one palette for the whole animation, no dithering for animations (the noise would change from frame to frame) and `--dither` for stills; GIF transparency is on/off, so pixels below 50% alpha become transparent.
-- CMYK and YCCK JPEGs are transcoded losslessly in the DCT domain (identical coefficients, Adobe colour flag kept); converting or resizing them goes through RGB.
+- CMYK and YCCK JPEGs stay four-channel and are re-quantized in the DCT domain like any other JPEG (never to a finer table than the source had, so a source at or below `-q` is transcoded losslessly with identical coefficients; the Adobe colour flag is kept). All four channels of plain CMYK use the luma table, since each is an ink amount; in YCCK, Y and K use it and the two colour-difference channels use the chroma table. Converting or resizing them goes through RGB.
 - Animated PNGs are passed through unchanged instead of failing the batch, unless `-f avif`, `-f webp` or `-f gif` asks for an animation in that format.
 - **Animations** — animated GIF, APNG, animated WebP and animated AVIF inputs convert to an animated **AVIF**, **WebP** or **GIF** (`-f avif|webp|gif`; `--lossy` re-encodes an animated WebP or AVIF input). Frames keep the files' disposal and blend rules, per-frame durations and looping (a finite repeat count is played forever). **AVIF**: alpha as a second track, the first frame a key frame and the others inter frames predicted from the previous output (a key frame instead where that is smaller, e.g. at scene changes); on camera-pan style content 6–8 times smaller than key frames at the same PSNR; decodes in libavif and dav1d. **WebP**: lossless by default, lossy VP8 frames with `--lossy`; after the first frame only the changed rectangle is stored, and each lossless frame is tried both replacing the canvas and blended over it with the unchanged pixels transparent, keeping the smaller (lossy frames are measured against the canvas as a decoder reconstructs it, so errors do not build up). Decodes in libwebp (Pillow), pixel for pixel in the lossless case. **GIF**: see above.
 
 **Metadata** — only color information survives by default (ICC profile, PNG color chunks). `--keep-metadata` also keeps EXIF, XMP, JPEG comments / Photoshop blocks and PNG text, time and pixel-density chunks. EXIF and XMP carry across PNG ↔ JPEG ↔ WebP conversions; when an orientation is baked into the pixels the EXIF orientation is reset, its recorded dimensions are corrected and a now-stale thumbnail is dropped.
 
-**Resizing** — `--resize WxH | Wx | xH | P%` shrinks to fit (aspect ratio kept, never enlarges) with a Lanczos-3 filter on premultiplied alpha, for 8- and 16-bit images. Output matches Pillow's Lanczos to within ~0.1 level on average. Because the result must differ from the original, the never-grow rule does not apply.
+**Resizing** — `--resize WxH | Wx | xH | P%` shrinks to fit (aspect ratio kept, never enlarges) with a Lanczos-3 filter on premultiplied alpha, for 8- and 16-bit images. The filter averages in linear light (the sRGB curve is undone before and applied after), so a fine black-and-white pattern comes out as the mid-gray the eye sees (188) rather than 128; this assumes the sRGB transfer curve. `--resize-encoded` filters the stored values instead, as most tools do: it is a little faster and matches Pillow's Lanczos to within ~0.1 level on average (the default differs from Pillow by about 2 levels on a photo-like image). Because the result must differ from the original, the never-grow rule does not apply.
 
 **Pipes** — `-` as the input reads one image from standard input; `-o -` (the default for stdin) writes to standard output, with all reporting moved to standard error.
 
@@ -108,6 +108,7 @@ rc [OPTIONS] <INPUT>...
       --strip-icc         drop ICC profiles / PNG color chunks
       --keep-metadata     keep EXIF, XMP, comments, PNG text/time/density
       --resize <SIZE>     shrink to fit: WxH, Wx, xH or P% (never enlarges)
+      --resize-encoded    with --resize: filter the stored values instead of linear light
       --background <HEX>  color for flattening transparency (default ffffff)
   -j, --jobs <N>          worker threads (default: all cores)
       --dry-run           report savings without writing
@@ -141,7 +142,7 @@ What it offers beyond ratio: no C dependencies, one binary for all of these form
 
 ## Testing
 
-`cargo test` runs the unit tests and integration suites, which cross-check the decoders against the `image` crate (and, for WebP and CMYK, against files made by libwebp and libjpeg-turbo) and verify encoder output with independent decoders. `cli/tests/hostile.rs` feeds every decoder and encoder path truncated, bit-flipped and header-corrupted variants of every fixture and requires no panic, no hang and (for WebP) an exact re-encode round trip. This is deterministic mutation testing, not coverage-guided fuzzing. For a deeper sweep: `HOSTILE_ROUNDS=20000 cargo test --release -p rust-compress --test hostile`.
+`cargo test` runs the unit tests and integration suites, which cross-check the decoders against the `image` crate (and, for WebP and CMYK/YCCK, against files made by libwebp and libjpeg-turbo, or decoded by it) and verify encoder output with independent decoders. `cli/tests/hostile.rs` feeds every decoder and encoder path truncated, bit-flipped and header-corrupted variants of every fixture and requires no panic, no hang and (for WebP) an exact re-encode round trip. This is deterministic mutation testing, not coverage-guided fuzzing. For a deeper sweep: `HOSTILE_ROUNDS=20000 cargo test --release -p rust-compress --test hostile`.
 
 ## Build
 
@@ -175,6 +176,6 @@ Each codec is its own crate (`rc-png`, `rc-jpeg`, `rc-webp`, `rc-gif`, `rc-avif`
 - Formats: PNG, JPEG, WebP (lossless and lossy), AVIF and GIF in and out. Animations are written as AVIF, WebP or GIF (APNG is read, not written). JPEG: 8-bit Huffman, 1, 3 or 4 components (no arithmetic coding or 12-bit).
 - WebP output is always 8-bit: the WebP format has no higher bit depth. AVIF output is 8-bit unless the source is 16-bit or `--bit-depth 10` is given.
 - GIF output is at most 256 colors and its transparency is on/off, both limits of the GIF format; animated GIFs share one palette and are not dithered. A GIF that needs a separate palette per frame is not re-coded losslessly (it is left unchanged, or re-quantized with `--lossy`).
-- CMYK JPEGs are never requantized (`-q` does not apply to them); YCCK decoding is covered by unit tests but has no real-file fixture.
 - EXIF/XMP/comments are dropped unless `--keep-metadata` is given. An EXIF block over 64 KB cannot be carried into a JPEG: the format allows one 64 KB segment for it.
-- Resizing only shrinks and filters in gamma-encoded space.
+- Resizing only shrinks, and its linear-light filtering assumes the sRGB transfer curve (images tagged with a different curve are treated as sRGB; `--resize-encoded` skips the assumption).
+- The YCCK test files were built with our own writer (`jpeg/examples/make_ycck.rs`, since no tool here writes YCCK) and checked against libjpeg's decode; a file exported by Photoshop would be a better fixture.

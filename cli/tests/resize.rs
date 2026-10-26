@@ -119,3 +119,29 @@ fn resize_with_format_conversion_and_lossy_palette() {
     let img = png::decode::decode(&out).unwrap();
     assert!(img.width < dims(&src).0);
 }
+
+fn checkerboard_png(n: u32) -> Vec<u8> {
+    let data = (0..n * n).map(|i| if (i % n + i / n).is_multiple_of(2) { 255 } else { 0 }).collect();
+    let img = rc_core::image::Image::new(n, n, rc_core::image::ColorType::Gray, 8, data).unwrap();
+    png::encode::encode(&img, &png::encode::EncodeOptions { level: 1, clean_alpha: true })
+}
+
+fn middle_gray(bytes: &[u8]) -> i32 {
+    let im = image::load_from_memory(bytes).unwrap().to_luma8();
+    im.get_pixel(im.width() / 2, im.height() / 2).0[0] as i32
+}
+
+#[test]
+fn resizing_averages_in_linear_light_unless_asked_otherwise() {
+    // Half the pixels white, half black: that is 50% light, which an sRGB image stores as about 188.
+    let src = checkerboard_png(64);
+    let (linear, _) = run(&src, "png", &["--resize", "8x8"]);
+    let (encoded, _) = run(&src, "png", &["--resize", "8x8", "--resize-encoded"]);
+    assert!((middle_gray(&linear) - 188).abs() <= 3, "linear gave {}", middle_gray(&linear));
+    assert!((middle_gray(&encoded) - 128).abs() <= 3, "encoded gave {}", middle_gray(&encoded));
+}
+
+#[test]
+fn resize_encoded_needs_resize() {
+    cmd().arg("whatever.png").arg("--resize-encoded").assert().failure();
+}
