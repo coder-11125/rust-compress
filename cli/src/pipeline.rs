@@ -1,6 +1,6 @@
 //! Per-file processing: read -> decode -> encode -> never-grow check -> atomic write.
 
-use crate::cli::{BitDepthArg, Cli, SubsamplingArg};
+use crate::cli::{ArithmeticArg, BitDepthArg, Cli, SubsamplingArg};
 use crate::collect::{Format, Job, is_stdio, target_format};
 use crate::report::{Report, Status};
 use rc_avif as avif;
@@ -63,19 +63,53 @@ fn resize_image(img: Image, cli: &Cli) -> (Image, Option<String>) {
     (out, Some(format!("resized {w}x{h} -> {nw}x{nh}")))
 }
 
+/// Whether the JPEG written for this input uses arithmetic coding. `source_arithmetic` says the input was an
+/// arithmetic-coded JPEG, which `--arithmetic auto` keeps.
+fn use_arithmetic(cli: &Cli, source_arithmetic: bool) -> bool {
+    match cli.arithmetic {
+        ArithmeticArg::On => true,
+        ArithmeticArg::Off => false,
+        ArithmeticArg::Auto => source_arithmetic,
+    }
+}
+
+/// Serialize quantized coefficients with the smaller of the baseline/progressive layouts of the chosen coding.
+fn write_jpeg_bytes(ci: &jpeg::encode::CoefImage, arithmetic: bool) -> Vec<u8> {
+    if arithmetic { jpeg::arith::write_arithmetic(ci) } else { jpeg::encode::write_best(ci) }
+}
+
+/// Append `extra` to the report note.
+fn add_note(e: &mut Encoded, extra: &str) {
+    e.note = Some(match e.note.take() {
+        Some(n) => format!("{n}, {extra}"),
+        None => extra.to_string(),
+    });
+}
+
 /// Encode pixels as JPEG, honoring `--target-ssim` when given.
-fn encode_jpeg_pixels(img: &Image, cli: &Cli, quality: u8) -> Result<Encoded> {
-    match cli.target_ssim {
-        None => Ok(jpeg::encode::encode(img, &jpeg_options(cli, quality))?.into()),
+fn encode_jpeg_pixels(img: &Image, cli: &Cli, quality: u8, arithmetic: bool) -> Result<Encoded> {
+    let mut encoded = match cli.target_ssim {
+        None => {
+            if img.width > 65535 || img.height > 65535 {
+                return Err(Error::unsupported("JPEG dimensions are limited to 65535 pixels"));
+            }
+            let flat = img.flatten(cli.background);
+            let ci = jpeg::encode::build_coefs(&flat, &jpeg_options(cli, quality));
+            Encoded::from(write_jpeg_bytes(&ci, arithmetic))
+        }
         Some(target) => {
             let reference = img.flatten(cli.background);
             let found = jpeg::target::find_quality(&reference, target, 100, |q| {
                 jpeg::encode::build_coefs(&reference, &jpeg_options(cli, q))
             });
             let note = format!("q{}, ssim {:.4}", found.quality, found.ssim);
-            Ok(Encoded { bytes: jpeg::encode::write_best(&found.coefs), note: Some(note), forced: false })
+            Encoded { bytes: write_jpeg_bytes(&found.coefs, arithmetic), note: Some(note), forced: false }
         }
+    };
+    if arithmetic {
+        add_note(&mut encoded, "arithmetic coding");
     }
+    Ok(encoded)
 }
 
 /// Apply the metadata policy to a freshly decoded image.
@@ -138,6 +172,7 @@ fn jpeg_to_jpeg(data: &[u8], cli: &Cli) -> Result<Encoded> {
     let is444 = three && info.sampling.iter().all(|&s| s == (1, 1));
     let is420 = three && info.sampling[0] == (2, 2) && info.sampling[1..].iter().all(|&s| s == (1, 1));
     let effective_q = cli.quality.min(info.source_quality);
+    let arithmetic = use_arithmetic(cli, info.arithmetic);
     // Dimensions as they will look once the orientation is applied.
     let (ow, oh) = if orientation >= 5 { (info.height, info.width) } else { (info.width, info.height) };
     let resizing = cli.resize.is_some_and(|s| resize::target_size(s, ow as u32, oh as u32) != (ow as u32, oh as u32));
@@ -148,7 +183,8 @@ fn jpeg_to_jpeg(data: &[u8], cli: &Cli) -> Result<Encoded> {
             SubsamplingArg::S420 => !is420,
             SubsamplingArg::S444 => !is444,
         };
-    if orientation == 1 && !resample && !info.coded_rgb && !resizing {
+    // 12-bit files have no DCT-domain path: they are decoded to 16-bit pixels and written as 8-bit JPEG.
+    if orientation == 1 && !resample && !info.coded_rgb && !resizing && info.precision == 8 {
         let mut ci = parsed.into_coefs()?;
         apply_metadata_policy(&mut ci.meta, cli);
         if let Some(target) = cli.target_ssim {
@@ -159,21 +195,38 @@ fn jpeg_to_jpeg(data: &[u8], cli: &Cli) -> Result<Encoded> {
                 c
             });
             let note = format!("q{}, ssim {:.4}", found.quality, found.ssim);
-            return Ok(Encoded { bytes: jpeg::encode::write_best(&found.coefs), note: Some(note), forced: false });
+            let mut encoded =
+                Encoded { bytes: write_jpeg_bytes(&found.coefs, arithmetic), note: Some(note), forced: false };
+            if arithmetic {
+                add_note(&mut encoded, "arithmetic coding");
+            }
+            encoded.forced = arithmetic != info.arithmetic;
+            return Ok(encoded);
         }
         let before = ci.qtables;
         ci.requantize(cli.quality, !cli.no_trellis);
-        let mut encoded: Encoded = jpeg::encode::write_best(&ci).into();
+        let mut encoded: Encoded = write_jpeg_bytes(&ci, arithmetic).into();
         if info.cmyk {
-            encoded.note = Some(if ci.qtables == before { "CMYK, lossless" } else { "CMYK, requantized" }.into());
+            add_note(&mut encoded, if ci.qtables == before { "CMYK, lossless" } else { "CMYK, requantized" });
         }
+        if arithmetic {
+            add_note(&mut encoded, "arithmetic coding");
+        }
+        // Asking for the other entropy coding is a change the original bytes cannot satisfy, even if the result
+        // is larger (Huffman for a source that was arithmetic-coded, say, to make it open everywhere).
+        encoded.forced = arithmetic != info.arithmetic;
         return Ok(encoded);
     }
     let img = upright(parsed.into_image()?, orientation);
     let mut img = img;
     apply_metadata_policy(&mut img.meta, cli);
     let (img, resized) = resize_image(img, cli);
-    Ok(encode_jpeg_pixels(&img, cli, effective_q)?.resized(resized))
+    let mut encoded = encode_jpeg_pixels(&img, cli, effective_q, arithmetic)?;
+    if info.precision == 12 {
+        add_note(&mut encoded, "12-bit reduced to 8-bit");
+    }
+    encoded.forced |= arithmetic != info.arithmetic;
+    Ok(encoded.resized(resized))
 }
 
 fn encode(img: &Image, fmt: Format, cli: &Cli) -> Result<Encoded> {
@@ -192,7 +245,7 @@ fn encode(img: &Image, fmt: Format, cli: &Cli) -> Result<Encoded> {
             )
             .into())
         }
-        Format::Jpeg => encode_jpeg_pixels(img, cli, cli.quality),
+        Format::Jpeg => encode_jpeg_pixels(img, cli, cli.quality, use_arithmetic(cli, false)),
         Format::Webp => {
             if cli.lossy {
                 let bytes = webp::encode_lossy(img, cli.quality, cli.level as u32, !cli.keep_hidden_pixels)?;

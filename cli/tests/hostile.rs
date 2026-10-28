@@ -28,8 +28,28 @@ const PNGS: &[&str] = &[
     "rgba16_adam7.png",
     "rgba8.png",
 ];
-const JPEGS: &[&str] =
-    &["cmyk.jpg", "gray8.jpg", "icc.jpg", "rgb8.jpg", "rgb8_420.jpg", "rgb8_444.jpg", "rgb8_opt.jpg", "rgb8_prog.jpg"];
+const JPEGS: &[&str] = &[
+    "cmyk.jpg",
+    "gray8.jpg",
+    "icc.jpg",
+    "rgb8.jpg",
+    "rgb8_420.jpg",
+    "rgb8_444.jpg",
+    "rgb8_opt.jpg",
+    "rgb8_prog.jpg",
+    "ycck.jpg",
+    // Arithmetic-coded: sequential, progressive, restart intervals, custom conditioning, gray, CMYK.
+    "arith_420_seq.jpg",
+    "arith_420_prog.jpg",
+    "arith_444_prog_rst.jpg",
+    "arith_cond.jpg",
+    "arith_gray.jpg",
+    "arith_cmyk.jpg",
+    // 12-bit.
+    "jpeg12_gray.jpg",
+    "jpeg12_444.jpg",
+    "jpeg12_420.jpg",
+];
 
 /// Small deterministic generator so failures are reproducible from the printed seed.
 struct Rng(u64);
@@ -65,6 +85,7 @@ fn exercise_jpeg(bytes: &[u8]) {
         if let Ok(mut ci) = parsed.into_coefs() {
             ci.requantize(60, true);
             let _ = jpeg::encode::write_best(&ci);
+            let _ = jpeg::arith::write_arithmetic(&ci);
         }
     }
 }

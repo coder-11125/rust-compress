@@ -1,7 +1,9 @@
-//! JPEG decoder: baseline, extended-sequential and progressive Huffman, 8-bit, 1, 3 or 4 components
-//! (4 = CMYK/YCCK, which the DCT-domain path carries through untouched).
+//! JPEG decoder: baseline, extended-sequential and progressive, Huffman or arithmetic coded, 8 or 12 bits, with 1, 3
+//! or 4 components (4 = CMYK/YCCK, which the DCT-domain path carries through untouched; 12-bit has no CMYK).
+//! 12-bit files decode to 16-bit images.
 
 use super::ZIGZAG;
+use super::arith;
 use super::dct::{AAN, idct, round_f32};
 use super::encode::{CoefComponent, CoefImage};
 use rayon::prelude::*;
@@ -238,6 +240,12 @@ struct Decoder<'a> {
     mcus_x: usize,
     mcus_y: usize,
     progressive: bool,
+    /// Arithmetic entropy coding (SOF9/SOF10) instead of Huffman.
+    arith: bool,
+    /// Sample precision in bits: 8 or 12.
+    precision: u8,
+    /// Arithmetic conditioning from DAC markers.
+    cond: arith::Conditioning,
     restart_interval: usize,
     adobe_transform: Option<u8>,
     scans_seen: usize,
@@ -291,6 +299,10 @@ pub struct Info {
     pub coded_rgb: bool,
     /// Four components: CMYK, or YCCK when `adobe_transform` is 2.
     pub cmyk: bool,
+    /// Bits per sample: 8, or 12 (decoded to a 16-bit image; there is no DCT-domain path for it).
+    pub precision: u8,
+    /// Arithmetic-coded rather than Huffman-coded.
+    pub arithmetic: bool,
 }
 
 /// Pixels a viewer would show for these quantized coefficients (dequantize, IDCT, upsample).
@@ -330,6 +342,9 @@ pub fn reconstruct(ci: &CoefImage) -> Result<Image> {
         mcus_x: 0,
         mcus_y: 0,
         progressive: false,
+        arith: false,
+        precision: 8,
+        cond: arith::Conditioning::default(),
         restart_interval: 0,
         adobe_transform: None,
         scans_seen: 1,
@@ -364,6 +379,9 @@ pub fn parse(data: &[u8]) -> Result<Parsed<'_>> {
         mcus_x: 0,
         mcus_y: 0,
         progressive: false,
+        arith: false,
+        precision: 8,
+        cond: arith::Conditioning::default(),
         restart_interval: 0,
         adobe_transform: None,
         scans_seen: 0,
@@ -392,10 +410,17 @@ impl Parsed<'_> {
             width: d.width,
             height: d.height,
             sampling: d.comps.iter().map(|c| (c.h, c.v)).collect(),
-            source_quality: luma_q.map_or(100, |t| super::quality::estimate_quality(&t)),
+            // The standard tables are 8-bit; a 12-bit file's tables are scaled and say nothing about its quality.
+            source_quality: if d.precision == 8 {
+                luma_q.map_or(100, |t| super::quality::estimate_quality(&t))
+            } else {
+                100
+            },
             coded_rgb: d.comps.len() == 3
                 && (d.adobe_transform == Some(0) || (d.adobe_transform.is_none() && ids == b"RGB")),
             cmyk: d.comps.len() == 4,
+            precision: d.precision,
+            arithmetic: d.arith,
         }
     }
 
@@ -407,6 +432,9 @@ impl Parsed<'_> {
     pub fn into_coefs(self) -> Result<CoefImage> {
         if self.info().coded_rgb {
             return Err(Error::unsupported("RGB-coded JPEG"));
+        }
+        if self.0.precision != 8 {
+            return Err(Error::unsupported("12-bit JPEG in the DCT domain"));
         }
         let d = self.0;
         let mut qtables: [Option<[u8; 64]>; 4] = [None; 4];
@@ -526,15 +554,17 @@ impl Decoder<'_> {
             match m {
                 0xDB => self.read_dqt(body)?,
                 0xC4 => self.read_dht(body)?,
-                0xC0..=0xC2 => {
+                0xC0..=0xC2 | 0xC9 | 0xCA => {
                     if !self.comps.is_empty() {
                         return Err(Error::invalid("multiple SOF markers"));
                     }
-                    self.read_sof(body, m == 0xC2)?;
+                    self.arith = m >= 0xC9;
+                    self.read_sof(body, m == 0xC2 || m == 0xCA)?;
                 }
-                0xC3 | 0xC5..=0xC7 | 0xC9..=0xCB | 0xCD..=0xCF => {
-                    return Err(Error::unsupported("JPEG process (lossless/hierarchical/arithmetic)"));
+                0xC3 | 0xC5..=0xC7 | 0xCB | 0xCD..=0xCF => {
+                    return Err(Error::unsupported("JPEG process (lossless or hierarchical)"));
                 }
+                0xCC => self.read_dac(body)?,
                 0xDD => {
                     if body.len() < 2 {
                         return Err(Error::invalid("bad DRI"));
@@ -576,6 +606,31 @@ impl Decoder<'_> {
         Ok(())
     }
 
+    /// Arithmetic conditioning (T.81 B.2.4.3): DC lower/upper bounds and the AC band split, per table.
+    fn read_dac(&mut self, b: &[u8]) -> Result<()> {
+        for pair in b.chunks_exact(2) {
+            let (index, val) = (pair[0], pair[1]);
+            match index {
+                0..=3 => {
+                    let (l, u) = (val & 15, val >> 4);
+                    if l > u {
+                        return Err(Error::invalid("bad DAC: DC lower bound above upper bound"));
+                    }
+                    self.cond.dc_l[index as usize] = l;
+                    self.cond.dc_u[index as usize] = u;
+                }
+                0x10..=0x13 => {
+                    if !(1..=63).contains(&val) {
+                        return Err(Error::invalid("bad DAC: AC band split out of range"));
+                    }
+                    self.cond.ac_k[(index - 0x10) as usize] = val;
+                }
+                _ => return Err(Error::invalid("bad DAC table index")),
+            }
+        }
+        Ok(())
+    }
+
     fn read_dht(&mut self, mut b: &[u8]) -> Result<()> {
         while !b.is_empty() {
             if b.len() < 17 {
@@ -605,9 +660,10 @@ impl Decoder<'_> {
         if b.len() < 6 {
             return Err(Error::invalid("bad SOF"));
         }
-        if b[0] != 8 {
+        if b[0] != 8 && b[0] != 12 {
             return Err(Error::unsupported(format!("{}-bit JPEG", b[0])));
         }
+        self.precision = b[0];
         let (h, w, nc) = (be16(b, 1)?, be16(b, 3)?, b[5] as usize);
         if w == 0 || h == 0 {
             return Err(Error::invalid("zero JPEG dimension (DNL not supported)"));
@@ -699,7 +755,54 @@ impl Decoder<'_> {
         Ok(())
     }
 
+    /// One arithmetic-coded scan: the same MCU traversal as the Huffman one, with the arithmetic block decoders.
+    fn decode_scan_arith(&mut self, sc: &[ScanComp], p: ScanParams) -> Result<usize> {
+        let mut dec = arith::ScanDecoder::new(self.data, self.pos, self.cond.clone());
+        let interleaved = sc.len() > 1;
+        let (mcus_x, mcus_y) = if interleaved {
+            (self.mcus_x, self.mcus_y)
+        } else {
+            (self.comps[sc[0].idx].real_bw, self.comps[sc[0].idx].real_bh)
+        };
+        let total = mcus_x * mcus_y;
+        let ri = self.restart_interval;
+        for mcu in 0..total {
+            if ri > 0 && mcu > 0 && mcu % ri == 0 {
+                dec.restart();
+            }
+            let (mx, my) = (mcu % mcus_x, mcu / mcus_x);
+            for (si, s) in sc.iter().enumerate() {
+                let c = &mut self.comps[s.idx];
+                let (bh, bv) = if interleaved { (c.h, c.v) } else { (1, 1) };
+                for by in 0..bv {
+                    for bx in 0..bh {
+                        let (col, row) = (mx * bh + bx, my * bv + by);
+                        let off = (row * c.blocks_w + col) * 64;
+                        let blk = &mut c.coefs[off..off + 64];
+                        if !self.progressive {
+                            dec.sequential(blk, si, s.dc, s.ac)?;
+                        } else if p.ss == 0 {
+                            if p.ah == 0 {
+                                dec.dc_first(blk, si, s.dc, p.al)?;
+                            } else {
+                                dec.dc_refine(blk, p.al);
+                            }
+                        } else if p.ah == 0 {
+                            dec.ac_first(blk, s.ac, p.ss, p.se, p.al)?;
+                        } else {
+                            dec.ac_refine(blk, s.ac, p.ss, p.se, p.al)?;
+                        }
+                    }
+                }
+            }
+        }
+        Ok(dec.rd.pos)
+    }
+
     fn decode_scan(&mut self, sc: &[ScanComp], p: ScanParams) -> Result<usize> {
+        if self.arith {
+            return self.decode_scan_arith(sc, p);
+        }
         let need_dc = !self.progressive || (p.ss == 0 && p.ah == 0);
         let need_ac = !self.progressive || p.ss > 0;
         let mut dc_t: Vec<Option<HuffDec>> = Vec::new();
@@ -768,13 +871,10 @@ impl Decoder<'_> {
         Ok(br.pos)
     }
 
-    fn finish(self) -> Result<Image> {
-        if self.scans_seen == 0 || self.comps.is_empty() {
-            return Err(Error::invalid("JPEG contains no image data"));
-        }
-        let (w, h) = (self.width, self.height);
-        // IDCT every component into an 8-bit plane.
-        let mut planes: Vec<(Vec<u8>, usize)> = Vec::new();
+    /// Dequantize and inverse-transform every component into a plane of samples, level-shifted by `center` and
+    /// clamped to `0..=max`.
+    fn idct_planes<T: Sample>(&self, center: i32, max: i32) -> Result<Vec<(Vec<T>, usize)>> {
+        let mut planes = Vec::new();
         for c in &self.comps {
             let q = self.qt[c.tq].ok_or_else(|| Error::invalid("missing quantization table"))?;
             let mut mult = [[0f32; 8]; 8];
@@ -784,7 +884,7 @@ impl Decoder<'_> {
                 }
             }
             let stride = c.blocks_w * 8;
-            let mut plane = vec![0u8; stride * c.blocks_h * 8];
+            let mut plane = vec![T::default(); stride * c.blocks_h * 8];
             plane.par_chunks_mut(stride * 8).enumerate().for_each(|(by, rows)| {
                 for bx in 0..c.blocks_w {
                     let src = &c.coefs[(by * c.blocks_w + bx) * 64..][..64];
@@ -796,13 +896,76 @@ impl Decoder<'_> {
                     idct(&mut blk);
                     for y in 0..8 {
                         for x in 0..8 {
-                            rows[y * stride + bx * 8 + x] = (round_f32(blk[y][x]) + 128).clamp(0, 255) as u8;
+                            rows[y * stride + bx * 8 + x] = T::make((round_f32(blk[y][x]) + center).clamp(0, max));
                         }
                     }
                 }
             });
             planes.push((plane, stride));
         }
+        Ok(planes)
+    }
+
+    /// 12-bit files: the same pipeline on 16-bit planes, delivered as a 16-bit image with the samples scaled to the
+    /// full 16-bit range (the top 4 bits are repeated into the bottom ones, so white stays white).
+    fn finish_wide(self) -> Result<Image> {
+        let (w, h) = (self.width, self.height);
+        if self.comps.len() == 4 {
+            return Err(Error::unsupported("12-bit CMYK JPEG"));
+        }
+        let bits = self.precision as u32;
+        let (center, max) = (1i32 << (bits - 1), (1i32 << bits) - 1);
+        let planes = self.idct_planes::<u16>(center, max)?;
+        let mut full: Vec<Vec<u16>> = Vec::new();
+        for (c, (plane, stride)) in self.comps.iter().zip(&planes) {
+            let cw = (w * c.h).div_ceil(self.hmax);
+            let ch = (h * c.v).div_ceil(self.vmax);
+            if !self.hmax.is_multiple_of(c.h) || !self.vmax.is_multiple_of(c.v) {
+                return Err(Error::unsupported("non-integral chroma subsampling ratio"));
+            }
+            full.push(upsample(plane, *stride, cw, ch, self.hmax / c.h, self.vmax / c.v, w, h));
+        }
+        let meta = build_meta(self.icc_parts, self.extras);
+        let widen = |v: i32| -> [u8; 2] { (((v << (16 - bits)) | (v >> (2 * bits - 16))) as u16).to_be_bytes() };
+        if full.len() == 1 {
+            let data = full[0].iter().flat_map(|&v| widen(v as i32)).collect();
+            let mut img = Image::new(w as u32, h as u32, ColorType::Gray, 16, data)?;
+            img.meta = meta;
+            return Ok(img);
+        }
+        let ids = [self.comps[0].id, self.comps[1].id, self.comps[2].id];
+        let rgb_direct = self.adobe_transform == Some(0) || (self.adobe_transform.is_none() && ids == *b"RGB");
+        let mut data = Vec::with_capacity(w * h * 6);
+        for i in 0..w * h {
+            let (a, b, c) = (full[0][i] as i32, full[1][i] as i32, full[2][i] as i32);
+            let px = if rgb_direct {
+                [a, b, c]
+            } else {
+                let (cb, cr) = (b - center, c - center);
+                [
+                    (a + ((91881 * cr + 32768) >> 16)).clamp(0, max),
+                    (a - ((22554 * cb + 46802 * cr + 32768) >> 16)).clamp(0, max),
+                    (a + ((116130 * cb + 32768) >> 16)).clamp(0, max),
+                ]
+            };
+            for v in px {
+                data.extend_from_slice(&widen(v));
+            }
+        }
+        let mut img = Image::new(w as u32, h as u32, ColorType::Rgb, 16, data)?;
+        img.meta = meta;
+        Ok(img)
+    }
+
+    fn finish(self) -> Result<Image> {
+        if self.scans_seen == 0 || self.comps.is_empty() {
+            return Err(Error::invalid("JPEG contains no image data"));
+        }
+        let (w, h) = (self.width, self.height);
+        if self.precision != 8 {
+            return self.finish_wide();
+        }
+        let planes = self.idct_planes::<u8>(128, 255)?;
         // Upsample to full resolution.
         let mut full: Vec<Vec<u8>> = Vec::new();
         for (c, (plane, stride)) in self.comps.iter().zip(&planes) {
@@ -1004,10 +1167,47 @@ fn decode_ac_refine(br: &mut BitReader, ac: &HuffDec, blk: &mut [i16], eobrun: &
 
 // ---------------------------------------------------------------- upsampling
 
+/// A decoded sample: `u8` for 8-bit files, `u16` for 12-bit ones.
+trait Sample: Copy + Default + Send + Sync {
+    fn get(self) -> i32;
+    fn make(v: i32) -> Self;
+}
+
+impl Sample for u8 {
+    #[inline(always)]
+    fn get(self) -> i32 {
+        self as i32
+    }
+    #[inline(always)]
+    fn make(v: i32) -> Self {
+        v as u8
+    }
+}
+
+impl Sample for u16 {
+    #[inline(always)]
+    fn get(self) -> i32 {
+        self as i32
+    }
+    #[inline(always)]
+    fn make(v: i32) -> Self {
+        v as u16
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
-fn upsample(p: &[u8], stride: usize, cw: usize, ch: usize, fx: usize, fy: usize, w: usize, h: usize) -> Vec<u8> {
-    let mut out = vec![0u8; w * h];
-    let px = |x: usize, y: usize| p[y * stride + x] as i32;
+fn upsample<T: Sample>(
+    p: &[T],
+    stride: usize,
+    cw: usize,
+    ch: usize,
+    fx: usize,
+    fy: usize,
+    w: usize,
+    h: usize,
+) -> Vec<T> {
+    let mut out = vec![T::default(); w * h];
+    let px = |x: usize, y: usize| p[y * stride + x].get();
     match (fx, fy) {
         (1, 1) => {
             for y in 0..h {
@@ -1020,7 +1220,7 @@ fn upsample(p: &[u8], stride: usize, cw: usize, ch: usize, fx: usize, fy: usize,
                     let i = x / 2;
                     let near = px(i, y);
                     let far = if x % 2 == 0 { px(i.saturating_sub(1), y) } else { px((i + 1).min(cw - 1), y) };
-                    *o = ((3 * near + far + if x % 2 == 0 { 1 } else { 2 }) >> 2) as u8;
+                    *o = T::make((3 * near + far + if x % 2 == 0 { 1 } else { 2 }) >> 2);
                 }
             });
         }
@@ -1029,7 +1229,7 @@ fn upsample(p: &[u8], stride: usize, cw: usize, ch: usize, fx: usize, fy: usize,
                 let j = y / 2;
                 let far_y = if y % 2 == 0 { j.saturating_sub(1) } else { (j + 1).min(ch - 1) };
                 for (x, o) in row.iter_mut().enumerate() {
-                    *o = ((3 * px(x, j) + px(x, far_y) + if y % 2 == 0 { 1 } else { 2 }) >> 2) as u8;
+                    *o = T::make((3 * px(x, j) + px(x, far_y) + if y % 2 == 0 { 1 } else { 2 }) >> 2);
                 }
             });
         }
@@ -1042,7 +1242,7 @@ fn upsample(p: &[u8], stride: usize, cw: usize, ch: usize, fx: usize, fy: usize,
                     let i = x / 2;
                     let near = vert(i);
                     let far = if x % 2 == 0 { vert(i.saturating_sub(1)) } else { vert((i + 1).min(cw - 1)) };
-                    *o = ((3 * near + far + if x % 2 == 0 { 8 } else { 7 }) >> 4) as u8;
+                    *o = T::make((3 * near + far + if x % 2 == 0 { 8 } else { 7 }) >> 4);
                 }
             });
         }

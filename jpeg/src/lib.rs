@@ -1,5 +1,6 @@
-//! Baseline/progressive JPEG codec written from scratch.
+//! Baseline/progressive JPEG codec written from scratch: Huffman and arithmetic entropy coding, 8 and 12 bits.
 
+pub mod arith;
 pub mod dct;
 pub mod decode;
 pub mod encode;

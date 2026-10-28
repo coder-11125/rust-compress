@@ -48,6 +48,8 @@ cat in.png | rc - > out.png  # stdin to stdout
 - Higher-quality sources are re-quantized directly on the coefficients (never to a finer table than the source had) with **trellis quantization**: a per-block dynamic program that trades distortion against the bit cost of each run/size symbol, using Huffman code lengths measured on a first pass (`--no-trellis` to skip).
 - `--target-ssim S` replaces the guess-a-quality step: it bisects for the lowest quality whose reconstruction still scores at least SSIM `S` against the original (mean 8×8-window SSIM over all channels). The needed quality varies enormously between images — at 0.95 the sample files needed anywhere from q17 to q85 — so this saves bytes on easy images and protects hard ones.
 - Pixels are only touched when something must change: chroma subsampling (4:4:4 → 4:2:0 below q90, or `--subsampling`), EXIF orientation (baked into the pixels because EXIF is stripped), or PNG → JPEG conversion.
+- **Arithmetic coding** (SOF9 sequential, SOF10 progressive, with restart intervals and `DAC` conditioning) is read and written. A source that is arithmetic-coded stays arithmetic-coded (`--arithmetic auto`, the default), so the result opens wherever the input did; `--arithmetic on` converts any JPEG, `off` converts back to Huffman for compatibility. The coefficients are untouched, so the picture is identical. On five 5120×2880 photographs (55 MB of JPEG) the arithmetic files are 15.1% smaller than the originals and 6.0% smaller (2.0-8.4%) than this tool's own optimized-Huffman output, at about the same encoding CPU time. **The catch:** browsers and many programs cannot open arithmetic-coded JPEG at all (libjpeg and libjpeg-turbo can), which is why it is never switched on by itself for Huffman sources.
+- **12-bit** JPEG (SOF1/SOF2 with 12-bit samples; Huffman or arithmetic) is decoded. There is no DCT-domain path for it, so it is read into a 16-bit image: `-f png` keeps the full precision, `-f jpeg` and the other 8-bit formats reduce it to 8 bits (the report says so). 12-bit CMYK is not supported.
 
 **PNG** — lossless by default, bit-exact pixels:
 - Reduces the representation: drops unused alpha, RGB → gray, ≤256 colors → palette, 1/2/4-bit depths, 16 → 8-bit when lossless.
@@ -97,6 +99,7 @@ rc [OPTIONS] <INPUT>...
   -q, --quality <1-100>   JPEG quality ceiling (default 80)
   -f, --format <FMT>      keep | png | jpeg | webp | avif (default keep)
       --subsampling <S>   auto | 444 | 420
+      --arithmetic <A>    JPEG output coding: auto (keep the source's) | on | off
       --bit-depth <D>     AVIF output: auto | 8 | 10 (auto: 10 for 16-bit sources)
       --lossy             PNG palette quantization, lossy WebP with -f webp (animations too), re-encode an AVIF or animated WebP input, or re-quantize a GIF that needs more than one palette (-q = quality)
       --colors <2-256>    with --lossy (default 256)
@@ -160,7 +163,7 @@ Requires a stable Rust toolchain (edition 2024); `rust-toolchain.toml` pins `sta
 core/       shared types and utilities (rc-core): image and animation types, errors, bit I/O, CRC-32 / Adler-32, canonical Huffman, EXIF editing, Lanczos-3 downscaling, SSIM, color quantizer
 deflate/    inflate, LZ77 matchers (hash chains; binary tree for levels 7-9), block encoder, optimal parser (levels 7-9)
 png/        decoder (all color types/depths, Adam7, APNG), filters, encoder (reduction + strategy search)
-jpeg/       decoder (baseline + progressive), DCT, baseline/progressive encoders, trellis quantization, quality search
+jpeg/       decoder (baseline, progressive, arithmetic-coded; 8 and 12 bit), DCT, baseline/progressive/arithmetic encoders, trellis quantization, quality search
 webp/       RIFF container, VP8L decoder and encoder (transforms, LZ77 + optimal parse, tile-group clustering), VP8 decoder and key-frame encoder, animated WebP writer
 gif/        GIF decoder and encoder (still and animated: shared palette, frame differencing, LZW)
 avif/       HEIF/ISOBMFF container, AV1 decoder (entropy, intra and inter prediction, transforms, loop filters, CDEF, restoration, film grain) and encoder
@@ -173,9 +176,10 @@ Each codec is its own crate (`rc-png`, `rc-jpeg`, `rc-webp`, `rc-gif`, `rc-avif`
 
 ## Limitations
 
-- Formats: PNG, JPEG, WebP (lossless and lossy), AVIF and GIF in and out. Animations are written as AVIF, WebP or GIF (APNG is read, not written). JPEG: 8-bit Huffman, 1, 3 or 4 components (no arithmetic coding or 12-bit).
+- Formats: PNG, JPEG, WebP (lossless and lossy), AVIF and GIF in and out. Animations are written as AVIF, WebP or GIF (APNG is read, not written). JPEG: 1, 3 or 4 components, Huffman or arithmetic coding, 8 or 12 bits (no lossless or hierarchical JPEG, no 12-bit CMYK, and 12-bit input is written back at 8 bits).
 - WebP output is always 8-bit: the WebP format has no higher bit depth. AVIF output is 8-bit unless the source is 16-bit or `--bit-depth 10` is given.
 - GIF output is at most 256 colors and its transparency is on/off, both limits of the GIF format; animated GIFs share one palette and are not dithered. A GIF that needs a separate palette per frame is not re-coded losslessly (it is left unchanged, or re-quantized with `--lossy`).
 - EXIF/XMP/comments are dropped unless `--keep-metadata` is given. An EXIF block over 64 KB cannot be carried into a JPEG: the format allows one 64 KB segment for it.
 - Resizing only shrinks, and its linear-light filtering assumes the sRGB transfer curve (images tagged with a different curve are treated as sRGB; `--resize-encoded` skips the assumption).
+- Arithmetic-coded JPEG is verified against libjpeg-turbo (two versions) decoding our writer's output, pixel for pixel, and our decoder reading it back; no arithmetic file produced by another encoder was available to test with. 12-bit decoding is verified against libjpeg-turbo's 12-bit decoder (within 1-3 levels of 4095, from float versus integer IDCT rounding); no 12-bit arithmetic-coded file exists to test that combination, which shares the verified decoding paths. Some viewers (Pillow among them) cannot decode an arithmetic JPEG larger than 64 KB when it is fed to libjpeg in chunks.
 - The YCCK test files were built with our own writer (`jpeg/examples/make_ycck.rs`, since no tool here writes YCCK) and checked against libjpeg's decode; a file exported by Photoshop would be a better fixture.

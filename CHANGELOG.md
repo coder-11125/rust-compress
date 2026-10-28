@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+- JPEG arithmetic coding: SOF9 (sequential) and SOF10 (progressive) files are decoded and written, including restart
+  intervals and non-default `DAC` conditioning. `--arithmetic auto|on|off` picks the output coding: `auto` (default)
+  keeps an arithmetic-coded source arithmetic-coded and writes Huffman otherwise, `on` converts any JPEG losslessly,
+  `off` converts back to Huffman for compatibility (honoured even when the result is larger). On five 5120x2880 photos
+  the arithmetic files are 15.1% smaller than the originals and 6.0% smaller than our optimized Huffman output, at
+  about the same encoding CPU time; decoding is about 30% slower. Many programs, including every browser, cannot open
+  arithmetic-coded JPEG, so it is never enabled for a Huffman source by default.
+- 12-bit JPEG decoding (SOF1/SOF2, Huffman or arithmetic): read into a 16-bit image, so `-f png` keeps the precision
+  and 8-bit outputs reduce it with a note. Matches libjpeg-turbo's 12-bit decoder to within 1-3 levels of 4095.
+- Verification: the arithmetic files our writer produces decode pixel-identically in libjpeg-turbo 3.1.4 and 3.2.0
+  (50 small files in every mode, and five full-size photos); six of them are kept as fixtures, as are three 12-bit files
+  made by libjpeg-turbo. A QM-coder state-table, carry and termination stress test and a wide-coefficient test cover the
+  coder itself.
 - Resizing now filters in linear light (assuming the sRGB transfer curve) instead of on the gamma-encoded values, so
   fine detail keeps its brightness (a black/white checkerboard averages to 188, not 128). `--resize-encoded` brings back
   the old behavior, which still matches Pillow's Lanczos to within 0.13 levels; the new default differs from Pillow by

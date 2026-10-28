@@ -26,6 +26,14 @@ pub enum BitDepthArg {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum ArithmeticArg {
+    /// Arithmetic coding for arithmetic-coded JPEG sources, Huffman otherwise.
+    Auto,
+    On,
+    Off,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 pub enum SubsamplingArg {
     /// 4:4:4 for quality >= 90, otherwise 4:2:0.
     Auto,
@@ -76,6 +84,12 @@ pub struct Cli {
     /// JPEG chroma subsampling.
     #[arg(long, value_enum, default_value_t = SubsamplingArg::Auto)]
     pub subsampling: SubsamplingArg,
+
+    /// JPEG output entropy coding. Arithmetic coding is lossless against Huffman and makes the file noticeably
+    /// smaller, but browsers and many other programs cannot open such files; `auto` therefore uses it only when
+    /// the source JPEG already was arithmetic-coded.
+    #[arg(long, value_enum, default_value_t = ArithmeticArg::Auto)]
+    pub arithmetic: ArithmeticArg,
 
     /// AVIF output bit depth: auto keeps 16-bit sources at 10 bits, everything else at 8.
     #[arg(long, value_enum, default_value_t = BitDepthArg::Auto)]
