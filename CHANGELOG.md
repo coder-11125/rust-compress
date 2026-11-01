@@ -2,6 +2,24 @@
 
 ## Unreleased
 
+- Hierarchical JPEG decoding is now cross-checked against the JPEG committee's reference libjpeg (Richter's, via
+  `pylibjpeg-libjpeg`) on a matrix of more than a hundred streams, which found and fixed three defects: the
+  two-dimensional upsampling is a single truncating average of four neighbours (it was two truncating steps, up to one
+  level off); reconstructions are no longer clamped between frames (a lossless frame can now correct a DCT frame's
+  overshoot); and each frame is dequantized with the tables in force when it started (a `DQT` before the next frame
+  used to change how the previous one was decoded, which broke every hierarchical file whose frames use different
+  tables). The pyramid writer gained same-size refinement and one-direction `EXP` modes. Fixtures were regenerated.
+- Quantization tables are latched per component at its first scan (as libjpeg does), for all JPEG decoding.
+- Arithmetic-coded lossless JPEG (SOF11/SOF15) is now confirmed by the reference libjpeg: 24 plain files (2-16 bits,
+  gray/RGB/CMYK, with and without restart intervals) and the hierarchical forms decode identically.
+- Arithmetic-coded JPEG written by IJG libjpeg 7, 8, 9 and libjpeg-turbo 2.1 (120 files, sequential and progressive)
+  decodes to coefficients identical to libjpeg's own; eight of them are fixtures with Huffman twins.
+- `rc update` on Windows: uses the system `tar.exe` and `curl.exe` (a `tar` earlier on `PATH`, such as Git's, cannot
+  read `.zip` archives) and removes the `rc.exe.old` a previous update left behind. SHA-256 moved to `rc-core`. A
+  cross-platform test swaps in a real binary on every OS.
+- `tools/crosscheck.py` re-runs these comparisons (libjpeg-turbo, IJG libjpeg, the reference libjpeg, Pillow, libwebp,
+  Chrome). Verified results: Chrome 150 decodes our GIF, animated WebP and animated AVIF frame for frame like Pillow;
+  linear-light resizing matches numpy + Pillow; lossy animated WebP is 5-11% smaller and 0.2-1.6 dB better than libwebp.
 - Hierarchical JPEG (T.81 Annex J) decoding: `DHP`/`EXP` frame sequences with non-differential DCT or lossless first
   frames and differential DCT (Huffman and arithmetic, sequential and progressive) and differential lossless frames,
   reconstructed with the standard's truncating bilinear upsampling. Kept as a JPEG it is left unchanged unless `--lossy`;

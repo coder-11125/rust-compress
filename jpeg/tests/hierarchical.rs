@@ -3,7 +3,7 @@
 use rc_core::image::{ColorType, Image};
 use rc_jpeg::decode::{decode, parse};
 use rc_jpeg::encode::{EncodeOptions, Subsampling};
-use rc_jpeg::hierarchical::{Entropy, HierOptions, Kind, write_hierarchical};
+use rc_jpeg::hierarchical::{Entropy, HierOptions, Kind, Shape, write_hierarchical};
 
 /// A picture with smooth areas, edges and texture, of any size (odd ones included).
 fn picture(w: usize, h: usize, color: ColorType, depth: u8) -> Image {
@@ -36,7 +36,7 @@ fn psnr(a: &Image, b: &Image) -> f64 {
 }
 
 fn opts(levels: usize, entropy: Entropy, kind: Kind, subsample_chroma: bool) -> HierOptions {
-    HierOptions { levels, entropy, kind, subsample_chroma }
+    HierOptions { levels, entropy, kind, subsample_chroma, shape: Shape::Both }
 }
 
 #[test]
@@ -166,6 +166,37 @@ fn refinement_steps_improve_the_picture() {
 }
 
 #[test]
+fn expansion_in_one_direction_and_refinement_without_exp_decode_exactly() {
+    // EXP 1,0 and 0,1, and frames of the same size with no EXP: lossless pyramids reproduce the source in all of them.
+    for shape in [Shape::Horizontal, Shape::Vertical, Shape::Refine, Shape::Both] {
+        for entropy in [Entropy::Huffman, Entropy::Arithmetic] {
+            for color in [ColorType::Gray, ColorType::Rgb] {
+                for (w, h) in [(61, 47), (9, 7), (2, 33)] {
+                    let src = picture(w, h, color, 8);
+                    let o = HierOptions { levels: 3, entropy, kind: Kind::Lossless, subsample_chroma: false, shape };
+                    let bytes = write_hierarchical(&src, &o).unwrap();
+                    assert!(decode(&bytes).unwrap() == src, "{shape:?} {entropy:?} {color:?} {w}x{h}");
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn each_frame_is_dequantized_with_the_tables_it_was_coded_with() {
+    // Refinement frames at the same size use ever finer quantization tables, redefined by a DQT before each frame. A
+    // decoder that applied the last table to every frame would land far from the source (29 dB instead of 49 here).
+    let src = picture(61, 47, ColorType::Gray, 8);
+    for entropy in [Entropy::Huffman, Entropy::Arithmetic] {
+        let kind = Kind::Dct { quality: 75, progressive: false, lossless_last: false };
+        let o = |levels| HierOptions { levels, entropy, kind, subsample_chroma: false, shape: Shape::Refine };
+        let first = psnr(&src, &decode(&write_hierarchical(&src, &o(1)).unwrap()).unwrap());
+        let last = psnr(&src, &decode(&write_hierarchical(&src, &o(3)).unwrap()).unwrap());
+        assert!(last > 45.0 && last > first + 8.0, "{entropy:?}: {first:.1} dB after one frame, {last:.1} after three");
+    }
+}
+
+#[test]
 fn malformed_hierarchical_streams_are_refused_not_crashed_on() {
     let src = picture(40, 30, ColorType::Gray, 8);
     let kind = Kind::Dct { quality: 70, progressive: false, lossless_last: false };
@@ -243,11 +274,19 @@ fn matches_expected(name: &str, exact: bool) {
 #[test]
 fn the_committed_hierarchical_files_decode_to_their_expected_pictures() {
     // Exact: these reproduce their source picture bit for bit.
-    for name in ["hier_gray_lossless", "hier_rgb16_lossless", "hier_gray_dct_then_lossless"] {
+    for name in
+        ["hier_gray_lossless", "hier_rgb16_lossless", "hier_gray_dct_then_lossless", "hier_gray_horizontal_lossless"]
+    {
         matches_expected(name, true);
     }
     // Recorded: the decoder's own output when the file was made (nothing else reads hierarchical JPEG).
-    for name in ["hier_dct_huffman", "hier_dct_progressive", "hier_dct_arith", "hier_dct_arith_progressive"] {
+    for name in [
+        "hier_dct_huffman",
+        "hier_dct_progressive",
+        "hier_dct_arith",
+        "hier_dct_arith_progressive",
+        "hier_gray_refine_dct",
+    ] {
         matches_expected(name, false);
     }
 }

@@ -213,6 +213,9 @@ struct Component {
     coefs: Vec<i16>,
     /// Lossless frames: the decoded samples (`blocks_w` per row, padded to whole MCUs). Empty for DCT frames.
     samples: Vec<u16>,
+    /// The quantization table in force when the component's first scan began. A later `DQT` (between the frames of a
+    /// hierarchical image, say) must not change how this frame is dequantized.
+    qtable: Option<[u16; 64]>,
 }
 
 struct ScanComp {
@@ -345,6 +348,7 @@ pub fn reconstruct(ci: &CoefImage) -> Result<Image> {
             real_bh: c.coefs.len() / 64 / c.blocks_w,
             coefs: c.coefs.clone(),
             samples: Vec::new(),
+            qtable: None,
         })
         .collect();
     let d = Decoder {
@@ -534,7 +538,7 @@ impl Parsed<'_> {
         let d = self.0;
         let mut qtables: [Option<[u8; 64]>; 4] = [None; 4];
         for c in &d.comps {
-            let t = d.qt[c.tq].ok_or_else(|| Error::invalid("missing quantization table"))?;
+            let t = c.qtable.or(d.qt[c.tq]).ok_or_else(|| Error::invalid("missing quantization table"))?;
             if t.iter().any(|&v| v > 255 || v == 0) {
                 return Err(Error::unsupported("16-bit quantization table"));
             }
@@ -826,7 +830,10 @@ impl Decoder<'_> {
             // The differential output is a signed difference: no level shift, no clamping.
             self.idct_planes::<i32>(0, i32::MIN / 4, i32::MAX / 4)?
         } else {
-            self.idct_planes::<i32>(1 << (bits - 1), 0, max)?
+            // Not clamped either: the reconstruction that the next frame builds on keeps the overshoot a DCT leaves
+            // at hard edges (T.81 clamps the picture that is shown; the reference software, checked sample for
+            // sample, clamps only the final one).
+            self.idct_planes::<i32>(1 << (bits - 1), i32::MIN / 4, i32::MAX / 4)?
         };
         let (ex_h, ex_v) = self.frame_expand;
         for (c, (data, stride)) in self.comps.iter().zip(padded) {
@@ -851,10 +858,10 @@ impl Decoder<'_> {
                 for y in 0..ch {
                     for x in 0..cw {
                         let sum = up.data[y * up.w + x] as i64 + frame.data[y * cw + x] as i64;
-                        // Lossless differences are added modulo 2^16; every reconstruction is a sample of the
-                        // image's precision.
+                        // Lossless differences are added modulo 2^16. Nothing is clamped until the picture is
+                        // assembled, so a lossless frame can correct a DCT frame's overshoot exactly.
                         let sum = if self.lossless { sum & 0xFFFF } else { sum };
-                        frame.data[y * cw + x] = sum.clamp(0, max as i64) as i32;
+                        frame.data[y * cw + x] = sum as i32;
                     }
                 }
             }
@@ -1022,6 +1029,7 @@ impl Decoder<'_> {
                 real_bh: ch.div_ceil(unit),
                 coefs: if lossless { Vec::new() } else { vec![0i16; blocks_w * blocks_h * 64] },
                 samples: if lossless { vec![0u16; blocks_w * blocks_h] } else { Vec::new() },
+                qtable: None,
             });
         }
         Ok(())
@@ -1047,6 +1055,12 @@ impl Decoder<'_> {
                 return Err(Error::invalid("duplicate component in scan"));
             }
             sc.push(ScanComp { idx, dc: (t >> 4) as usize & 3, ac: (t & 15) as usize & 3 });
+        }
+        for s in &sc {
+            let c = &mut self.comps[s.idx];
+            if c.qtable.is_none() {
+                c.qtable = self.qt[c.tq];
+            }
         }
         let t = &b[1 + 2 * ns..];
         let p = if self.lossless {
@@ -1291,7 +1305,7 @@ impl Decoder<'_> {
     fn idct_planes<T: Sample>(&self, center: i32, lo: i32, max: i32) -> Result<Vec<(Vec<T>, usize)>> {
         let mut planes = Vec::new();
         for c in &self.comps {
-            let q = self.qt[c.tq].ok_or_else(|| Error::invalid("missing quantization table"))?;
+            let q = c.qtable.or(self.qt[c.tq]).ok_or_else(|| Error::invalid("missing quantization table"))?;
             let mut mult = [[0f32; 8]; 8];
             for v in 0..8 {
                 for u in 0..8 {

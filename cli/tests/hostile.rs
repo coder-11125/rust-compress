@@ -59,6 +59,8 @@ const JPEGS: &[&str] = &[
     "hier_dct_progressive.jpg",
     "hier_dct_arith.jpg",
     "hier_dct_arith_progressive.jpg",
+    "hier_gray_refine_dct.jpg",
+    "hier_gray_horizontal_lossless.jpg",
     // Lossless.
     "lossless_gray_p8_pred1.jpg",
     "lossless_gray_p16_pred7.jpg",

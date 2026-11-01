@@ -187,3 +187,38 @@ fn damaged_twelve_bit_files_never_panic() {
         let _ = decode(&b);
     }
 }
+
+// ---------------------------------------------------------------------------------------------------------------
+// Arithmetic JPEG written by other encoders
+// ---------------------------------------------------------------------------------------------------------------
+
+/// Each `ext_arith_*.jpg` was written by IJG libjpeg 7/8/9 or libjpeg-turbo 2.1 (sequential or progressive, gray or
+/// colour); `.huff.jpg` holds the same quantized coefficients written as Huffman by the same library.
+const EXTERNAL: [&str; 8] = [
+    "ext_arith_ijg7_gray_seq",
+    "ext_arith_ijg8_rgb420_seq",
+    "ext_arith_ijg9_rgb444_prog",
+    "ext_arith_ijg9_rgb420_prog",
+    "ext_arith_turbo_rgb420_seq",
+    "ext_arith_turbo_gray_prog",
+    "ext_arith_ijg7_rgb444_seq",
+    "ext_arith_turbo_rgb444_prog",
+];
+
+#[test]
+fn arithmetic_files_from_other_encoders_decode_to_their_huffman_twins() {
+    for stem in EXTERNAL {
+        let arith = fixture(&format!("{stem}.jpg"));
+        let info = parse(&arith).unwrap().info();
+        assert!(info.arithmetic, "{stem}");
+        let twin = fixture(&format!("{stem}.huff.jpg"));
+        assert!(!parse(&twin).unwrap().info().arithmetic, "{stem} twin");
+        // Same coefficients, so the same picture, and exactly the same coefficients when read back.
+        assert_eq!(decode(&arith).unwrap(), decode(&twin).unwrap(), "{stem}: picture");
+        let (a, b) = (coefs(&arith), coefs(&twin));
+        assert_eq!(a.comps.len(), b.comps.len(), "{stem}");
+        for (x, y) in a.comps.iter().zip(&b.comps) {
+            assert!(x.coefs == y.coefs, "{stem}: coefficients differ");
+        }
+    }
+}

@@ -39,37 +39,29 @@ pub(super) struct Hier {
 /// Upper bound on frames: a pyramid of 2x steps never needs more, and it bounds the work a hostile file can ask for.
 pub(super) const MAX_FRAMES: usize = 32;
 
-/// Upsample by two (T.81 J.1.1.2): bilinear, `(Ra + Rb) / 2` with truncation, the first row and column kept, the last
-/// ones replicated; horizontally first, then vertically.
+/// Upsample by two (T.81 J.1.1.2): bilinear interpolation with truncation, the first row and column kept and the last
+/// ones replicated. A sample halfway between two neighbours is their average, `(Ra + Rb) / 2`; one in the middle of
+/// four is `(Ra + Rb + Rc + Rd) / 4`, truncated once. T.81 words the two-dimensional case as "horizontal expansion,
+/// then vertical", which read literally truncates twice and can differ by one; this follows the single truncation of
+/// the JPEG committee's reference software (Richter's libjpeg), which was checked sample for sample.
 pub(super) fn expand(p: &Plane, horizontal: bool, vertical: bool) -> Plane {
-    let mut cur = p.clone();
-    if horizontal {
-        let nw = cur.w * 2;
-        let mut data = vec![0i32; nw * cur.h];
-        for y in 0..cur.h {
-            let row = &cur.data[y * cur.w..(y + 1) * cur.w];
-            for x in 0..cur.w {
-                let (a, b) = (row[x], row[(x + 1).min(cur.w - 1)]);
-                data[y * nw + 2 * x] = a;
-                data[y * nw + 2 * x + 1] = (a + b) / 2;
-            }
+    let (w, h) = (p.w, p.h);
+    let (nw, nh) = (if horizontal { 2 * w } else { w }, if vertical { 2 * h } else { h });
+    let at = |x: usize, y: usize| p.data[y.min(h - 1) * w + x.min(w - 1)];
+    let mut data = Vec::with_capacity(nw * nh);
+    for oy in 0..nh {
+        let (y, odd_y) = if vertical { (oy / 2, oy % 2 == 1) } else { (oy, false) };
+        for ox in 0..nw {
+            let (x, odd_x) = if horizontal { (ox / 2, ox % 2 == 1) } else { (ox, false) };
+            data.push(match (odd_x, odd_y) {
+                (false, false) => at(x, y),
+                (true, false) => (at(x, y) + at(x + 1, y)) / 2,
+                (false, true) => (at(x, y) + at(x, y + 1)) / 2,
+                (true, true) => (at(x, y) + at(x + 1, y) + at(x, y + 1) + at(x + 1, y + 1)) / 4,
+            });
         }
-        cur = Plane { w: nw, h: cur.h, data };
     }
-    if vertical {
-        let nh = cur.h * 2;
-        let mut data = vec![0i32; cur.w * nh];
-        for y in 0..cur.h {
-            let below = (y + 1).min(cur.h - 1);
-            for x in 0..cur.w {
-                let (a, b) = (cur.data[y * cur.w + x], cur.data[below * cur.w + x]);
-                data[2 * y * cur.w + x] = a;
-                data[(2 * y + 1) * cur.w + x] = (a + b) / 2;
-            }
-        }
-        cur = Plane { w: cur.w, h: nh, data };
-    }
-    cur
+    Plane { w: nw, h: nh, data }
 }
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -103,6 +95,20 @@ pub enum Kind {
     Lossless,
 }
 
+/// How the resolution grows from one frame to the next.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Shape {
+    /// Width and height double (`EXP` 1,1).
+    #[default]
+    Both,
+    /// Only the width doubles (`EXP` 1,0).
+    Horizontal,
+    /// Only the height doubles (`EXP` 0,1).
+    Vertical,
+    /// Every frame has the full size and refines the one before (no `EXP`); DCT kinds quantize more finely each time.
+    Refine,
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct HierOptions {
     /// Number of frames: the image is coded at `levels` resolutions, each twice the size of the one before.
@@ -111,6 +117,7 @@ pub struct HierOptions {
     pub kind: Kind,
     /// DCT kinds: chroma at half resolution (Y sampled 2x2) instead of full.
     pub subsample_chroma: bool,
+    pub shape: Shape,
 }
 
 /// Encode `img` as a hierarchical JPEG: a pyramid of `levels` resolutions whose first frame is non-differential and
@@ -148,15 +155,21 @@ pub fn write_hierarchical(img: &Image, opts: &HierOptions) -> Result<Vec<u8>> {
             });
         }
     }
+    let (grow_x, grow_y) = match opts.shape {
+        Shape::Both => (true, true),
+        Shape::Horizontal => (true, false),
+        Shape::Vertical => (false, true),
+        Shape::Refine => (false, false),
+    };
     let mut pyramid = vec![full];
     for _ in 1..opts.levels {
-        let next = pyramid.last().unwrap().iter().map(halve).collect();
+        let next = pyramid.last().unwrap().iter().map(|p| shrink(p, grow_x, grow_y)).collect();
         pyramid.push(next);
     }
     pyramid.reverse(); // smallest first
 
     // Component layout of the completed image.
-    let subsample = opts.subsample_chroma && channels == 3 && !lossless;
+    let subsample = opts.subsample_chroma && channels == 3 && !lossless && opts.shape == Shape::Both;
     let (ids, sampling): (Vec<u8>, Vec<(usize, usize)>) = match (channels, lossless) {
         (1, _) => (vec![1], vec![(1, 1)]),
         (_, true) => (vec![b'R', b'G', b'B'], vec![(1, 1); 3]),
@@ -182,7 +195,7 @@ pub fn write_hierarchical(img: &Image, opts: &HierOptions) -> Result<Vec<u8>> {
             let mut ycc = rgb_to_ycc(planes);
             if subsample {
                 for p in ycc.iter_mut().skip(1) {
-                    *p = halve(p);
+                    *p = shrink(p, true, true);
                 }
             }
             ycc
@@ -222,7 +235,7 @@ pub fn write_hierarchical(img: &Image, opts: &HierOptions) -> Result<Vec<u8>> {
             .iter()
             .zip(&reference)
             .map(|(s, r)| {
-                let up = expand(r, true, true);
+                let up = expand(r, grow_x, grow_y);
                 let mut data = Vec::with_capacity(s.w * s.h);
                 for y in 0..s.h {
                     for x in 0..s.w {
@@ -232,7 +245,9 @@ pub fn write_hierarchical(img: &Image, opts: &HierOptions) -> Result<Vec<u8>> {
                 Plane { w: s.w, h: s.h, data }
             })
             .collect();
-        segment(&mut out, 0xDF, &[0x11]);
+        if grow_x || grow_y {
+            segment(&mut out, 0xDF, &[(grow_x as u8) << 4 | grow_y as u8]);
+        }
         let last = level + 1 == pyramid.len();
         match opts.kind {
             Kind::Lossless => {
@@ -244,6 +259,9 @@ pub fn write_hierarchical(img: &Image, opts: &HierOptions) -> Result<Vec<u8>> {
                 out.extend_from_slice(&frame.frame_segments(0, sof_diff_lossless, 0, arith)?);
             }
             Kind::Dct { quality, progressive, .. } => {
+                // A refinement of an image that is already at full size gets finer quantization each time.
+                let quality =
+                    if opts.shape == Shape::Refine { (quality as usize + 12 * level).min(98) as u8 } else { quality };
                 let ci = differential_coefs(&diffs, &ids, &sampling, lw, lh, quality);
                 let file = match (opts.entropy, progressive) {
                     (Entropy::Huffman, false) => write_jpeg_with(&ci, true),
@@ -261,16 +279,17 @@ pub fn write_hierarchical(img: &Image, opts: &HierOptions) -> Result<Vec<u8>> {
     Ok(out)
 }
 
-/// 2x2 box average with rounding; edges average what exists.
-fn halve(p: &Plane) -> Plane {
-    let (nw, nh) = (p.w.div_ceil(2), p.h.div_ceil(2));
+/// Halve the width and/or height with a box average and rounding; edges average what exists.
+fn shrink(p: &Plane, horizontal: bool, vertical: bool) -> Plane {
+    let (fx, fy) = (if horizontal { 2 } else { 1 }, if vertical { 2 } else { 1 });
+    let (nw, nh) = (p.w.div_ceil(fx), p.h.div_ceil(fy));
     let mut data = Vec::with_capacity(nw * nh);
     for y in 0..nh {
         for x in 0..nw {
             let (mut sum, mut n) = (0i64, 0i64);
-            for dy in 0..2 {
-                for dx in 0..2 {
-                    let (sx, sy) = (2 * x + dx, 2 * y + dy);
+            for dy in 0..fy {
+                for dx in 0..fx {
+                    let (sx, sy) = (fx * x + dx, fy * y + dy);
                     if sx < p.w && sy < p.h {
                         sum += p.data[sy * p.w + sx] as i64;
                         n += 1;
@@ -438,26 +457,28 @@ mod tests {
         Plane { w, h, data: (0..w * h).map(|i| f(i % w, i / w)).collect() }
     }
 
-    /// The rule written out directly from the text of J.1.1.2, one output sample at a time.
+    /// The rule written out one output sample at a time, from the definition: neighbours at the sample positions
+    /// below and to the right (clamped at the edges), averaged and truncated once.
     fn spec_sample(p: &Plane, x: usize, y: usize, horizontal: bool, vertical: bool) -> i32 {
         let at = |xx: usize, yy: usize| p.data[yy.min(p.h - 1) * p.w + xx.min(p.w - 1)];
-        // Horizontal first, then vertical, each on the result of the previous step.
-        let row = |yy: usize| -> i32 {
-            if !horizontal {
-                at(x, yy)
-            } else if x.is_multiple_of(2) {
-                at(x / 2, yy)
-            } else {
-                (at(x / 2, yy) + at(x / 2 + 1, yy)) / 2
-            }
-        };
-        if !vertical {
-            row(y)
-        } else if y.is_multiple_of(2) {
-            row(y / 2)
-        } else {
-            (row(y / 2) + row(y / 2 + 1)) / 2
+        let (sx, sy) = (if horizontal { x / 2 } else { x }, if vertical { y / 2 } else { y });
+        let between_x = horizontal && x % 2 == 1;
+        let between_y = vertical && y % 2 == 1;
+        let mut sum = at(sx, sy);
+        let mut n = 1;
+        if between_x {
+            sum += at(sx + 1, sy);
+            n += 1;
         }
+        if between_y {
+            sum += at(sx, sy + 1);
+            n += 1;
+        }
+        if between_x && between_y {
+            sum += at(sx + 1, sy + 1);
+            n += 1;
+        }
+        sum / n
     }
 
     #[test]
@@ -472,6 +493,15 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn the_middle_of_four_is_truncated_once() {
+        // Averaging in two truncating steps would give ((0+1)/2 + (1+2)/2) / 2 = 0; the reference software, and this
+        // function, give (0+1+1+2) / 4 = 1.
+        let up = expand(&Plane { w: 2, h: 2, data: vec![0, 1, 1, 2] }, true, true);
+        assert_eq!(up.data[up.w + 1], 1);
+        assert_eq!(up.data[..up.w], [0, 0, 1, 1]);
     }
 
     #[test]

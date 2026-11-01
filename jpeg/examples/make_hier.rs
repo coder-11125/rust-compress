@@ -6,7 +6,7 @@
 //! file was made, so they pin the format against later changes rather than prove it.
 use rc_core::image::{ColorType, Image};
 use rc_jpeg::decode::decode;
-use rc_jpeg::hierarchical::{Entropy, HierOptions, Kind, write_hierarchical};
+use rc_jpeg::hierarchical::{Entropy, HierOptions, Kind, Shape, write_hierarchical};
 use std::path::Path;
 
 fn picture(w: usize, h: usize, color: ColorType, depth: u8) -> Image {
@@ -38,7 +38,13 @@ fn main() {
         std::fs::write(Path::new(&dir).join(format!("{name}.jpg")), jpeg).unwrap();
         std::fs::write(Path::new(&dir).join(format!("{name}.expected.png")), png(expected)).unwrap();
     };
-    let o = |levels, entropy, kind, subsample_chroma| HierOptions { levels, entropy, kind, subsample_chroma };
+    let o = |levels, entropy, kind, subsample_chroma| HierOptions {
+        levels,
+        entropy,
+        kind,
+        subsample_chroma,
+        shape: Shape::Both,
+    };
     let dct = |progressive, lossless_last| Kind::Dct { quality: 85, progressive, lossless_last };
 
     let gray = picture(61, 47, ColorType::Gray, 8);
@@ -58,6 +64,25 @@ fn main() {
         &write_hierarchical(&gray, &o(3, Entropy::Huffman, dct(false, true), false)).unwrap(),
         &gray,
     );
+    // Same-size refinement frames with ever finer quantization tables (no EXP), and a horizontal-only pyramid.
+    let refine = HierOptions {
+        levels: 3,
+        entropy: Entropy::Huffman,
+        kind: dct(false, false),
+        subsample_chroma: false,
+        shape: Shape::Refine,
+    };
+    let bytes = write_hierarchical(&gray, &refine).unwrap();
+    let expected = decode(&bytes).unwrap();
+    save("hier_gray_refine_dct", &bytes, &expected);
+    let horiz = HierOptions {
+        levels: 3,
+        entropy: Entropy::Arithmetic,
+        kind: Kind::Lossless,
+        subsample_chroma: false,
+        shape: Shape::Horizontal,
+    };
+    save("hier_gray_horizontal_lossless", &write_hierarchical(&gray, &horiz).unwrap(), &gray);
     let rgb = picture(64, 48, ColorType::Rgb, 8);
     for (name, entropy, progressive) in [
         ("hier_dct_huffman", Entropy::Huffman, false),

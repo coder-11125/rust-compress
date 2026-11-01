@@ -1,5 +1,5 @@
-//! `rc update` against a throwaway local server that plays GitHub's release endpoints.
-#![cfg(unix)]
+//! `rc update` against a throwaway local server that plays GitHub's release endpoints. The tests that use a shell-script
+//! stand-in for the new binary are Unix-only; the real-binary test also runs on Windows.
 
 use std::fs;
 use std::io::{Read, Write};
@@ -46,10 +46,12 @@ fn serve(tag: &str, archive: Vec<u8>, checksum: String) -> String {
 }
 
 /// A tar.gz holding a fake `rc` (a script that identifies itself as `version`) and its SHA-256 line.
+#[cfg(unix)]
 fn release_archive(dir: &Path, version: &str) -> (Vec<u8>, String) {
     archive_of_script(dir, &format!("#!/bin/sh\necho \"rc {version}\"\n"))
 }
 
+#[cfg(unix)]
 fn archive_of_script(dir: &Path, script: &str) -> (Vec<u8>, String) {
     let src = dir.join("pkg");
     fs::create_dir_all(&src).unwrap();
@@ -73,7 +75,7 @@ fn archive_of_script(dir: &Path, script: &str) -> (Vec<u8>, String) {
 
 /// A private copy of the real binary to update (never the one cargo built).
 fn installed_copy(dir: &Path) -> PathBuf {
-    let copy = dir.join("rc");
+    let copy = dir.join(exe_name());
     fs::copy(assert_cmd::cargo::cargo_bin("rc"), &copy).unwrap();
     copy
 }
@@ -94,6 +96,7 @@ fn leftovers(dir: &Path) -> Vec<String> {
         .collect()
 }
 
+#[cfg(unix)]
 #[test]
 fn replaces_the_binary_and_shows_both_versions() {
     let d = tempdir().unwrap();
@@ -114,6 +117,7 @@ fn replaces_the_binary_and_shows_both_versions() {
     assert!(leftovers(&bin_dir).is_empty(), "{:?}", leftovers(&bin_dir));
 }
 
+#[cfg(unix)]
 #[test]
 fn check_reports_without_touching_anything() {
     let d = tempdir().unwrap();
@@ -132,6 +136,7 @@ fn check_reports_without_touching_anything() {
     assert!(leftovers(&bin_dir).is_empty());
 }
 
+#[cfg(unix)]
 #[test]
 fn already_current_does_nothing() {
     let d = tempdir().unwrap();
@@ -148,6 +153,7 @@ fn already_current_does_nothing() {
     assert_eq!(fs::read(&rc).unwrap(), before);
 }
 
+#[cfg(unix)]
 #[test]
 fn a_bad_checksum_keeps_the_installed_binary() {
     let d = tempdir().unwrap();
@@ -166,6 +172,7 @@ fn a_bad_checksum_keeps_the_installed_binary() {
     assert!(leftovers(&bin_dir).is_empty());
 }
 
+#[cfg(unix)]
 #[test]
 fn a_broken_download_is_not_installed() {
     let d = tempdir().unwrap();
@@ -190,4 +197,68 @@ fn an_unreachable_server_is_a_clean_error() {
     let out = run_update(&rc, "http://127.0.0.1:1", &[]);
     assert!(!out.status.success());
     assert!(text(&out.stderr).contains("could not reach"), "{}", text(&out.stderr));
+}
+
+fn exe_name() -> &'static str {
+    if cfg!(windows) { "rc.exe" } else { "rc" }
+}
+
+/// Pack `file` into this platform's release archive format (`.zip` with the system `tar` on Windows, `.tar.gz`
+/// elsewhere); returns the archive and its checksum line.
+fn archive_of_file(dir: &Path, file: &Path) -> (Vec<u8>, String) {
+    let name = if cfg!(windows) { "release.zip" } else { "release.tar.gz" };
+    let out = dir.join(name);
+    let tar = if cfg!(windows) {
+        let root = std::env::var_os("SystemRoot").unwrap_or_else(|| "C:\\Windows".into());
+        PathBuf::from(root).join("System32").join("tar.exe")
+    } else {
+        PathBuf::from("tar")
+    };
+    let mut c = Command::new(tar);
+    // `-a` picks the format from the `.zip` name.
+    c.arg(if cfg!(windows) { "-acf" } else { "-czf" });
+    c.arg(&out).arg("-C").arg(file.parent().unwrap()).arg(file.file_name().unwrap());
+    assert!(c.status().unwrap().success(), "could not build {name}");
+    let data = fs::read(&out).unwrap();
+    let sum = format!("{}  {name}\n", rc_core::util::sha256::hex(&rc_core::util::sha256::sha256(&data)));
+    (data, sum)
+}
+
+/// The path the whole update is for, on every platform: a real executable, replaced while it runs.
+#[test]
+fn a_real_binary_is_swapped_in_and_keeps_working() {
+    let d = tempdir().unwrap();
+    let payload_dir = d.path().join("payload");
+    fs::create_dir(&payload_dir).unwrap();
+    let payload = payload_dir.join(exe_name());
+    fs::copy(assert_cmd::cargo::cargo_bin("rc"), &payload).unwrap();
+    let (archive, sum) = archive_of_file(d.path(), &payload);
+    let base = serve("v9.9.9", archive, sum);
+
+    let bin_dir = d.path().join("bin");
+    fs::create_dir(&bin_dir).unwrap();
+    let rc = installed_copy(&bin_dir);
+    #[cfg(unix)]
+    let before = std::os::unix::fs::MetadataExt::ino(&fs::metadata(&rc).unwrap());
+
+    let out = run_update(&rc, &base, &[]);
+    let (stdout, stderr) = (text(&out.stdout), text(&out.stderr));
+    assert!(out.status.success(), "{stdout}\n{stderr}");
+    assert!(stdout.contains(&format!("Updating rc {CURRENT} -> 9.9.9")), "{stdout}");
+    assert!(stdout.contains("Checksum verified."), "{stdout}");
+
+    assert_eq!(fs::read(&rc).unwrap(), fs::read(&payload).unwrap(), "the executable is the archive's");
+    #[cfg(unix)]
+    assert_ne!(std::os::unix::fs::MetadataExt::ino(&fs::metadata(&rc).unwrap()), before, "replaced, not rewritten");
+    // Windows cannot overwrite a running executable: the old one is renamed aside instead.
+    #[cfg(windows)]
+    assert!(bin_dir.join("rc.exe.old").exists(), "the previous executable should be parked as rc.exe.old");
+    let version = Command::new(&rc).arg("--version").output().unwrap();
+    assert!(version.status.success(), "the updated binary must run");
+    assert!(leftovers(&bin_dir).is_empty(), "{:?}", leftovers(&bin_dir));
+
+    // Updating again works over the parked file and leaves nothing behind either.
+    let again = run_update(&rc, &base, &[]);
+    assert!(again.status.success(), "{}\n{}", text(&again.stdout), text(&again.stderr));
+    assert!(leftovers(&bin_dir).is_empty());
 }
