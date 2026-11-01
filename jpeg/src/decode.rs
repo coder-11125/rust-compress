@@ -6,6 +6,7 @@ use super::ZIGZAG;
 use super::arith;
 use super::dct::{AAN, idct, round_f32};
 use super::encode::{CoefComponent, CoefImage};
+use super::hierarchical::{Hier, HierComp, MAX_FRAMES, Plane, expand};
 use rayon::prelude::*;
 use rc_core::error::{Error, Result};
 use rc_core::image::{ColorType, Image, MAX_PIXELS, Metadata};
@@ -246,6 +247,12 @@ struct Decoder<'a> {
     arith: bool,
     /// Sample precision in bits: 8 or 12 for DCT frames, 2 to 16 for lossless ones.
     precision: u8,
+    /// A differential frame of a hierarchical image: it codes the difference to the reference reconstruction.
+    differential: bool,
+    /// Hierarchical state (set by the `DHP` marker).
+    hier: Option<Hier>,
+    /// The EXP expansion that precedes this frame's SOF (horizontal, vertical); fixed when the frame starts.
+    frame_expand: (bool, bool),
     /// A lossless frame (SOF3): predictive coding of samples, no DCT.
     lossless: bool,
     /// Predictor and point transform of the lossless scans, and whether every scan used the same ones.
@@ -312,6 +319,8 @@ pub struct Info {
     pub arithmetic: bool,
     /// Lossless JPEG (SOF3): predictive coding, no DCT, 2 to 16 bits.
     pub lossless: bool,
+    /// A hierarchical sequence of frames (DHP marker); the other fields describe the completed image.
+    pub hierarchical: bool,
 }
 
 /// Pixels a viewer would show for these quantized coefficients (dequantize, IDCT, upsample).
@@ -354,6 +363,9 @@ pub fn reconstruct(ci: &CoefImage) -> Result<Image> {
         progressive: false,
         arith: false,
         precision: 8,
+        differential: false,
+        hier: None,
+        frame_expand: (false, false),
         lossless: false,
         ll_params: None,
         ll_uniform: true,
@@ -394,6 +406,9 @@ pub fn parse(data: &[u8]) -> Result<Parsed<'_>> {
         progressive: false,
         arith: false,
         precision: 8,
+        differential: false,
+        hier: None,
+        frame_expand: (false, false),
         lossless: false,
         ll_params: None,
         ll_uniform: true,
@@ -405,6 +420,15 @@ pub fn parse(data: &[u8]) -> Result<Parsed<'_>> {
         extras: Vec::new(),
     };
     d.run()?;
+    if d.hier.is_some() {
+        if !d.comps.is_empty() {
+            d.finish_frame()?;
+        }
+        if d.hier.as_ref().is_none_or(|h| h.frames == 0) {
+            return Err(Error::invalid("hierarchical JPEG contains no frame"));
+        }
+        return Ok(Parsed(d));
+    }
     if d.scans_seen == 0 || d.comps.is_empty() {
         return Err(Error::invalid("JPEG contains no image data"));
     }
@@ -414,6 +438,20 @@ pub fn parse(data: &[u8]) -> Result<Parsed<'_>> {
 impl Parsed<'_> {
     pub fn info(&self) -> Info {
         let d = &self.0;
+        if let Some(h) = &d.hier {
+            return Info {
+                width: h.width,
+                height: h.height,
+                sampling: h.comps.iter().map(|c| (c.h, c.v)).collect(),
+                source_quality: 100,
+                coded_rgb: false,
+                cmyk: h.comps.len() == 4,
+                precision: h.precision,
+                arithmetic: d.arith,
+                lossless: false,
+                hierarchical: true,
+            };
+        }
         let luma_q = d.qt[d.comps[0].tq].map(|t| {
             let mut t8 = [0u8; 64];
             for (o, v) in t8.iter_mut().zip(t) {
@@ -438,6 +476,7 @@ impl Parsed<'_> {
             precision: d.precision,
             arithmetic: d.arith,
             lossless: d.lossless,
+            hierarchical: false,
         }
     }
 
@@ -445,11 +484,21 @@ impl Parsed<'_> {
         self.0.finish()
     }
 
+    /// The reference planes of a hierarchical image as reconstructed so far, in DHP component order. A hierarchical
+    /// encoder builds each differential frame against exactly these.
+    pub(super) fn hier_planes(&self) -> Result<Vec<Plane>> {
+        let h = self.0.hier.as_ref().ok_or_else(|| Error::invalid("not a hierarchical image"))?;
+        h.planes
+            .iter()
+            .map(|p| p.clone().ok_or_else(|| Error::invalid("hierarchical image is missing a component")))
+            .collect()
+    }
+
     /// Hand over the decoded samples of a lossless file for lossless recompression.
     pub fn lossless_frame(self) -> Result<super::lossless::LosslessFrame> {
         let d = self.0;
-        if !d.lossless || d.arith || !d.ll_uniform {
-            return Err(Error::unsupported("not a Huffman lossless JPEG with a single predictor"));
+        if d.hier.is_some() || !d.lossless || !d.ll_uniform {
+            return Err(Error::unsupported("not a lossless JPEG with a single predictor"));
         }
         let point_transform = d.ll_params.map_or(0, |p| p.1);
         let comps = d
@@ -472,6 +521,9 @@ impl Parsed<'_> {
     pub fn into_coefs(self) -> Result<CoefImage> {
         if self.info().coded_rgb {
             return Err(Error::unsupported("RGB-coded JPEG"));
+        }
+        if self.0.hier.is_some() {
+            return Err(Error::unsupported("hierarchical JPEG in the DCT domain"));
         }
         if self.0.lossless {
             return Err(Error::unsupported("lossless JPEG in the DCT domain"));
@@ -597,16 +649,18 @@ impl Decoder<'_> {
             match m {
                 0xDB => self.read_dqt(body)?,
                 0xC4 => self.read_dht(body)?,
-                0xC0..=0xC3 | 0xC9 | 0xCA => {
-                    if !self.comps.is_empty() {
-                        return Err(Error::invalid("multiple SOF markers"));
-                    }
+                0xC0..=0xC3 | 0xC5..=0xC7 | 0xC9..=0xCB | 0xCD..=0xCF => {
+                    let differential = matches!(m, 0xC5..=0xC7 | 0xCD..=0xCF);
+                    self.start_frame(differential)?;
                     self.arith = m >= 0xC9;
-                    self.read_sof(body, m == 0xC2 || m == 0xCA, m == 0xC3)?;
+                    self.read_sof(
+                        body,
+                        matches!(m, 0xC2 | 0xC6 | 0xCA | 0xCE),
+                        matches!(m, 0xC3 | 0xC7 | 0xCB | 0xCF),
+                    )?;
                 }
-                0xC5..=0xC7 | 0xCB | 0xCD..=0xCF => {
-                    return Err(Error::unsupported("JPEG process (hierarchical or lossless arithmetic)"));
-                }
+                0xDE => self.read_dhp(body)?,
+                0xDF => self.read_exp(body)?,
                 0xCC => self.read_dac(body)?,
                 0xDD => {
                     if body.len() < 2 {
@@ -626,6 +680,213 @@ impl Decoder<'_> {
                 _ => {}
             }
         }
+    }
+
+    /// Called at every SOF marker: a hierarchical image completes the previous frame first, anything else may only
+    /// have one frame.
+    fn start_frame(&mut self, differential: bool) -> Result<()> {
+        if self.hier.is_none() {
+            if !self.comps.is_empty() {
+                return Err(Error::invalid("multiple SOF markers"));
+            }
+            if differential {
+                return Err(Error::invalid("differential frame outside a hierarchical image"));
+            }
+        } else if !self.comps.is_empty() {
+            self.finish_frame()?;
+        }
+        if let Some(h) = &self.hier {
+            if h.frames >= MAX_FRAMES {
+                return Err(Error::unsupported("too many hierarchical frames"));
+            }
+            if differential && h.planes.iter().all(Option::is_none) {
+                return Err(Error::invalid("differential frame before any non-differential frame"));
+            }
+        }
+        self.differential = differential;
+        // The EXP marker precedes the SOF of the frame it applies to; a frame is completed only when the next SOF
+        // (or the end of the image) arrives, so the expansion is taken over here and cleared for the frame after.
+        if let Some(h) = self.hier.as_mut() {
+            self.frame_expand = std::mem::take(&mut h.expand);
+        }
+        Ok(())
+    }
+
+    /// Forget everything that belongs to one frame; tables, restart interval and metadata carry on.
+    fn reset_frame(&mut self) {
+        self.comps.clear();
+        self.scans_seen = 0;
+        self.progressive = false;
+        self.arith = false;
+        self.lossless = false;
+        self.differential = false;
+        self.frame_expand = (false, false);
+        self.ll_params = None;
+        self.ll_uniform = true;
+    }
+
+    /// `DHP` (B.3.2): the size and components of the completed image, laid out like a frame header.
+    fn read_dhp(&mut self, b: &[u8]) -> Result<()> {
+        if self.hier.is_some() || !self.comps.is_empty() {
+            return Err(Error::invalid("DHP must be the first frame-level marker, once"));
+        }
+        if b.len() < 6 {
+            return Err(Error::invalid("bad DHP"));
+        }
+        let precision = b[0];
+        let (h, w, nc) = (be16(b, 1)?, be16(b, 3)?, b[5] as usize);
+        if w == 0 || h == 0 {
+            return Err(Error::invalid("zero hierarchical JPEG dimension"));
+        }
+        if (w as u64) * (h as u64) > MAX_PIXELS {
+            return Err(Error::invalid("unreasonable image dimensions"));
+        }
+        if !(2..=16).contains(&precision) {
+            return Err(Error::unsupported(format!("{precision}-bit JPEG")));
+        }
+        if nc != 1 && nc != 3 && nc != 4 {
+            return Err(Error::unsupported(format!("{nc}-component JPEG")));
+        }
+        if b.len() < 6 + 3 * nc {
+            return Err(Error::invalid("bad DHP"));
+        }
+        let mut comps = Vec::new();
+        for i in 0..nc {
+            let c = &b[6 + 3 * i..9 + 3 * i];
+            let (hs, vs) = ((c[1] >> 4) as usize, (c[1] & 15) as usize);
+            if !(1..=4).contains(&hs) || !(1..=4).contains(&vs) || comps.iter().any(|d: &HierComp| d.id == c[0]) {
+                return Err(Error::invalid("bad component description"));
+            }
+            comps.push(HierComp { id: c[0], h: hs, v: vs });
+        }
+        if nc == 1 {
+            comps[0].h = 1;
+            comps[0].v = 1;
+        }
+        self.width = w;
+        self.height = h;
+        self.precision = precision;
+        let planes = vec![None; comps.len()];
+        self.hier = Some(Hier { width: w, height: h, precision, comps, planes, expand: (false, false), frames: 0 });
+        Ok(())
+    }
+
+    /// `EXP` (B.3.3): the next, differential frame expects its reference upsampled by two.
+    fn read_exp(&mut self, b: &[u8]) -> Result<()> {
+        let Some(h) = self.hier.as_mut() else {
+            return Err(Error::invalid("EXP outside a hierarchical image"));
+        };
+        let v = *b.first().ok_or_else(|| Error::invalid("bad EXP"))?;
+        let (eh, ev) = (v >> 4, v & 15);
+        if eh > 1 || ev > 1 {
+            return Err(Error::invalid("bad EXP"));
+        }
+        h.expand = (eh == 1, ev == 1);
+        Ok(())
+    }
+
+    /// Reconstruct one finished frame into the hierarchical reference planes (J.2): a non-differential frame replaces
+    /// the planes of its components, a differential one is added to its upsampled reference.
+    fn finish_frame(&mut self) -> Result<()> {
+        let mut hier = self.hier.take().ok_or_else(|| Error::invalid("not a hierarchical image"))?;
+        let result = self.reconstruct_into(&mut hier);
+        self.hier = Some(hier);
+        result?;
+        self.reset_frame();
+        Ok(())
+    }
+
+    fn reconstruct_into(&self, hier: &mut Hier) -> Result<()> {
+        if self.scans_seen == 0 {
+            return Err(Error::invalid("hierarchical frame without a scan"));
+        }
+        if self.precision != hier.precision {
+            return Err(Error::invalid("frame precision differs from the DHP precision"));
+        }
+        if self.width > hier.width || self.height > hier.height {
+            return Err(Error::invalid("frame larger than the hierarchical image"));
+        }
+        let bits = self.precision as u32;
+        let max = (1i32 << bits) - 1;
+        // The frame's own planes, cropped to the component sizes.
+        let padded: Vec<(Vec<i32>, usize)> = if self.lossless {
+            let pt = self.ll_params.map_or(0, |p| p.1);
+            self.comps
+                .iter()
+                .map(|c| {
+                    let data = c
+                        .samples
+                        .iter()
+                        .map(|&v| if self.differential { (v as i16 as i32) << pt } else { ((v as i32) << pt).min(max) })
+                        .collect();
+                    (data, c.blocks_w)
+                })
+                .collect()
+        } else if self.differential {
+            // The differential output is a signed difference: no level shift, no clamping.
+            self.idct_planes::<i32>(0, i32::MIN / 4, i32::MAX / 4)?
+        } else {
+            self.idct_planes::<i32>(1 << (bits - 1), 0, max)?
+        };
+        let (ex_h, ex_v) = self.frame_expand;
+        for (c, (data, stride)) in self.comps.iter().zip(padded) {
+            let idx = hier
+                .comps
+                .iter()
+                .position(|d| d.id == c.id)
+                .ok_or_else(|| Error::invalid("frame component is not part of the DHP"))?;
+            let (cw, ch) = ((self.width * c.h).div_ceil(self.hmax), (self.height * c.v).div_ceil(self.vmax));
+            let mut frame = Plane { w: cw, h: ch, data: Vec::with_capacity(cw * ch) };
+            for y in 0..ch {
+                frame.data.extend_from_slice(&data[y * stride..y * stride + cw]);
+            }
+            if self.differential {
+                let reference = hier.planes[idx]
+                    .as_ref()
+                    .ok_or_else(|| Error::invalid("differential frame without a reference component"))?;
+                let up = expand(reference, ex_h, ex_v);
+                if up.w < cw || up.h < ch || up.w - cw > 1 || up.h - ch > 1 {
+                    return Err(Error::invalid("reference component size does not match the differential frame"));
+                }
+                for y in 0..ch {
+                    for x in 0..cw {
+                        let sum = up.data[y * up.w + x] as i64 + frame.data[y * cw + x] as i64;
+                        // Lossless differences are added modulo 2^16; every reconstruction is a sample of the
+                        // image's precision.
+                        let sum = if self.lossless { sum & 0xFFFF } else { sum };
+                        frame.data[y * cw + x] = sum.clamp(0, max as i64) as i32;
+                    }
+                }
+            }
+            hier.planes[idx] = Some(frame);
+        }
+        hier.frames += 1;
+        Ok(())
+    }
+
+    /// The completed hierarchical image.
+    fn finish_hier(self) -> Result<Image> {
+        let hier = self.hier.ok_or_else(|| Error::invalid("not a hierarchical image"))?;
+        let (w, h) = (hier.width, hier.height);
+        let hmax = hier.comps.iter().map(|c| c.h).max().unwrap_or(1);
+        let vmax = hier.comps.iter().map(|c| c.v).max().unwrap_or(1);
+        let max = (1i32 << hier.precision) - 1;
+        let mut full = Vec::new();
+        for (c, plane) in hier.comps.iter().zip(&hier.planes) {
+            let plane = plane.as_ref().ok_or_else(|| Error::invalid("hierarchical image is missing a component"))?;
+            let (cw, ch) = ((w * c.h).div_ceil(hmax), (h * c.v).div_ceil(vmax));
+            if plane.w < cw || plane.h < ch {
+                return Err(Error::invalid("hierarchical image never reaches its full size"));
+            }
+            if !hmax.is_multiple_of(c.h) || !vmax.is_multiple_of(c.v) {
+                return Err(Error::unsupported("non-integral chroma subsampling ratio"));
+            }
+            let samples: Vec<u16> = plane.data.iter().map(|&v| v.clamp(0, max) as u16).collect();
+            full.push(upsample(&samples, plane.w, cw, ch, hmax / c.h, vmax / c.v, w, h));
+        }
+        let ids: Vec<u8> = hier.comps.iter().map(|c| c.id).collect();
+        let meta = build_meta(self.icc_parts, self.extras);
+        samples_to_image(full, w, h, hier.precision as u32, self.adobe_transform, &ids, meta)
     }
 
     fn read_dqt(&mut self, mut b: &[u8]) -> Result<()> {
@@ -792,7 +1053,9 @@ impl Decoder<'_> {
             // Ss selects the predictor, Se is 0, Ah is 0 and Al is the point transform.
             let sp =
                 ScanParams { ss: t[0] as usize, se: t[1] as usize, ah: (t[2] >> 4) as u32, al: (t[2] & 15) as u32 };
-            if !(1..=7).contains(&sp.ss) || sp.se != 0 || sp.ah != 0 || sp.al >= self.precision as u32 {
+            // Selection 0 (no prediction) is for differential frames only; they use nothing else.
+            let predictors = if self.differential { 0..=0 } else { 1..=7 };
+            if !predictors.contains(&sp.ss) || sp.se != 0 || sp.ah != 0 || sp.al >= self.precision as u32 {
                 return Err(Error::invalid("bad lossless scan parameters"));
             }
             let used = (sp.ss as u8, sp.al);
@@ -820,6 +1083,7 @@ impl Decoder<'_> {
     /// One arithmetic-coded scan: the same MCU traversal as the Huffman one, with the arithmetic block decoders.
     fn decode_scan_arith(&mut self, sc: &[ScanComp], p: ScanParams) -> Result<usize> {
         let mut dec = arith::ScanDecoder::new(self.data, self.pos, self.cond.clone());
+        dec.differential = self.differential;
         let interleaved = sc.len() > 1;
         let (mcus_x, mcus_y) = if interleaved {
             (self.mcus_x, self.mcus_y)
@@ -862,13 +1126,26 @@ impl Decoder<'_> {
     }
 
     /// One lossless scan (T.81 Annex H): every sample is predicted from its left, upper and upper-left neighbours
-    /// and the difference to the prediction is Huffman coded.
+    /// and the difference to the prediction is Huffman or arithmetic coded. Differential frames of a hierarchical
+    /// image use no prediction (selection 0), so the difference is the sample.
     fn decode_scan_lossless(&mut self, sc: &[ScanComp], p: ScanParams) -> Result<usize> {
         let predictor = p.ss as u8;
         let precision = self.precision as u32;
         let mut tabs = Vec::new();
-        for s in sc {
-            tabs.push(self.dc_tabs[s.dc].clone().ok_or_else(|| Error::invalid("scan uses undefined huffman table"))?);
+        let mut arith_dec = None;
+        // For arithmetic coding the coded differences of the left and upper neighbours condition the statistics.
+        let mut diffs: Vec<Vec<i16>> = Vec::new();
+        if self.arith {
+            let mut dec = arith::ScanDecoder::new(self.data, self.pos, self.cond.clone());
+            dec.differential = self.differential;
+            arith_dec = Some(dec);
+            diffs = sc.iter().map(|s| vec![0i16; self.comps[s.idx].samples.len()]).collect();
+        } else {
+            for s in sc {
+                tabs.push(
+                    self.dc_tabs[s.dc].clone().ok_or_else(|| Error::invalid("scan uses undefined huffman table"))?,
+                );
+            }
         }
         let mut br = BitReader::new(self.data, self.pos);
         let interleaved = sc.len() > 1;
@@ -885,7 +1162,10 @@ impl Decoder<'_> {
         for mcu in 0..total {
             let (mx, my) = (mcu % mcus_x, mcu / mcus_x);
             if ri > 0 && mcu > 0 && mcu % ri == 0 {
-                br.restart();
+                match arith_dec.as_mut() {
+                    Some(dec) => dec.restart(),
+                    None => br.restart(),
+                }
                 for (si, s) in sc.iter().enumerate() {
                     first_row[si] = if interleaved { my * self.comps[s.idx].v } else { my };
                 }
@@ -898,18 +1178,32 @@ impl Decoder<'_> {
                         let (x, y) = (mx * bh + bx, my * bv + by);
                         let stride = c.blocks_w;
                         let pred = predict_sample(&c.samples, stride, x, y, first_row[si], predictor, start);
-                        let t = tabs[si].decode(&mut br)? as u32;
-                        let diff = match t {
-                            0..=15 => extend(br.bits(t), t),
-                            16 => 32768,
-                            _ => return Err(Error::invalid("bad lossless difference category")),
+                        let diff = match arith_dec.as_mut() {
+                            Some(dec) => {
+                                let da = if x == 0 { 0 } else { diffs[si][y * stride + x - 1] as i32 };
+                                let db = if y == first_row[si] { 0 } else { diffs[si][(y - 1) * stride + x] as i32 };
+                                let d = dec.lossless_diff(s.dc, da, db)?;
+                                diffs[si][y * stride + x] = d as i16;
+                                d
+                            }
+                            None => {
+                                let t = tabs[si].decode(&mut br)? as u32;
+                                match t {
+                                    0..=15 => extend(br.bits(t), t),
+                                    16 => 32768,
+                                    _ => return Err(Error::invalid("bad lossless difference category")),
+                                }
+                            }
                         };
                         c.samples[y * stride + x] = ((pred + diff) & 0xFFFF) as u16;
                     }
                 }
             }
         }
-        Ok(br.pos)
+        Ok(match &arith_dec {
+            Some(dec) => dec.rd.pos,
+            None => br.pos,
+        })
     }
 
     fn decode_scan(&mut self, sc: &[ScanComp], p: ScanParams) -> Result<usize> {
@@ -944,6 +1238,7 @@ impl Decoder<'_> {
         let total = mcus_x * mcus_y;
         let ri = self.restart_interval;
         let progressive = self.progressive;
+        let differential = self.differential;
         for mcu in 0..total {
             if ri > 0 && mcu > 0 && mcu % ri == 0 {
                 br.restart();
@@ -959,6 +1254,10 @@ impl Decoder<'_> {
                         let (col, row) = (mx * bh + bx, my * bv + by);
                         let off = (row * c.blocks_w + col) * 64;
                         let blk = &mut c.coefs[off..off + 64];
+                        if differential {
+                            // J.2.3.1: the DC coefficient of a differential frame is decoded without prediction.
+                            pred[si] = 0;
+                        }
                         let r = if !progressive {
                             decode_sequential(
                                 &mut br,
@@ -989,7 +1288,7 @@ impl Decoder<'_> {
 
     /// Dequantize and inverse-transform every component into a plane of samples, level-shifted by `center` and
     /// clamped to `0..=max`.
-    fn idct_planes<T: Sample>(&self, center: i32, max: i32) -> Result<Vec<(Vec<T>, usize)>> {
+    fn idct_planes<T: Sample>(&self, center: i32, lo: i32, max: i32) -> Result<Vec<(Vec<T>, usize)>> {
         let mut planes = Vec::new();
         for c in &self.comps {
             let q = self.qt[c.tq].ok_or_else(|| Error::invalid("missing quantization table"))?;
@@ -1012,7 +1311,7 @@ impl Decoder<'_> {
                     idct(&mut blk);
                     for y in 0..8 {
                         for x in 0..8 {
-                            rows[y * stride + bx * 8 + x] = T::make((round_f32(blk[y][x]) + center).clamp(0, max));
+                            rows[y * stride + bx * 8 + x] = T::make((round_f32(blk[y][x]) + center).clamp(lo, max));
                         }
                     }
                 }
@@ -1042,7 +1341,7 @@ impl Decoder<'_> {
     fn finish_wide(self) -> Result<Image> {
         let bits = self.precision as u32;
         let (center, max) = (1i32 << (bits - 1), (1i32 << bits) - 1);
-        let planes = self.idct_planes::<u16>(center, max)?;
+        let planes = self.idct_planes::<u16>(center, 0, max)?;
         let full = self.upsample_planes(&planes)?;
         let (w, h, adobe) = (self.width, self.height, self.adobe_transform);
         let ids: Vec<u8> = self.comps.iter().map(|c| c.id).collect();
@@ -1068,6 +1367,9 @@ impl Decoder<'_> {
     }
 
     fn finish(self) -> Result<Image> {
+        if self.hier.is_some() {
+            return self.finish_hier();
+        }
         if self.scans_seen == 0 || self.comps.is_empty() {
             return Err(Error::invalid("JPEG contains no image data"));
         }
@@ -1078,7 +1380,7 @@ impl Decoder<'_> {
         if self.precision != 8 {
             return self.finish_wide();
         }
-        let planes = self.idct_planes::<u8>(128, 255)?;
+        let planes = self.idct_planes::<u8>(128, 0, 255)?;
         // Upsample to full resolution.
         let mut full: Vec<Vec<u8>> = Vec::new();
         for (c, (plane, stride)) in self.comps.iter().zip(&planes) {
@@ -1292,6 +1594,9 @@ pub(super) fn predict_sample(
     predictor: u8,
     start: i32,
 ) -> i32 {
+    if predictor == 0 {
+        return 0; // differential frame: the difference itself is the sample
+    }
     let at = |xx: usize, yy: usize| s[yy * stride + xx] as i32;
     if y == first_row {
         return if x == 0 { start } else { at(x - 1, y) };
@@ -1414,6 +1719,17 @@ impl Sample for u8 {
     #[inline(always)]
     fn make(v: i32) -> Self {
         v as u8
+    }
+}
+
+impl Sample for i32 {
+    #[inline(always)]
+    fn get(self) -> i32 {
+        self
+    }
+    #[inline(always)]
+    fn make(v: i32) -> Self {
+        v
     }
 }
 

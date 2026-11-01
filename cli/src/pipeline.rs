@@ -188,13 +188,18 @@ fn jpeg_to_jpeg(data: &[u8], cli: &Cli) -> Result<Encoded> {
     if info.lossless && !cli.lossy && !resizing && orientation == 1 {
         let recoded = parsed.lossless_frame().and_then(|mut frame| {
             apply_metadata_policy(&mut frame.meta, cli);
-            frame.write(&jpeg::lossless::LosslessOptions::default())
+            frame.write(&jpeg::lossless::LosslessOptions { arithmetic, ..Default::default() })
         });
         return Ok(match recoded {
             Ok(r) => Encoded {
                 bytes: r.bytes,
-                note: Some(format!("lossless JPEG, predictor {}", r.predictor)),
-                forced: false,
+                note: Some(format!(
+                    "lossless JPEG, predictor {}{}",
+                    r.predictor,
+                    if arithmetic { ", arithmetic coding" } else { "" }
+                )),
+                // Asking for the other entropy coding is a change the original bytes cannot satisfy.
+                forced: arithmetic != info.arithmetic,
             },
             // A structure that cannot be recoded here (arithmetic coding, mixed predictors) is kept as it is.
             Err(_) => Encoded {
@@ -204,8 +209,25 @@ fn jpeg_to_jpeg(data: &[u8], cli: &Cli) -> Result<Encoded> {
             },
         });
     }
+    // A hierarchical JPEG is a sequence of frames that only a decoder can flatten. Re-encoding it would add a
+    // generation of loss (or, for an exact one, throw exactness away), so like lossy WebP it is left alone unless a
+    // re-encode is asked for.
+    if info.hierarchical && !cli.lossy && !resizing && orientation == 1 {
+        return Ok(Encoded {
+            bytes: data.to_vec(),
+            note: Some("hierarchical JPEG left unchanged (use --lossy to re-encode)".into()),
+            forced: false,
+        });
+    }
     // 12-bit files have no DCT-domain path: they are decoded to 16-bit pixels and written as 8-bit JPEG.
-    if orientation == 1 && !resample && !info.coded_rgb && !resizing && info.precision == 8 && !info.lossless {
+    if orientation == 1
+        && !resample
+        && !info.coded_rgb
+        && !resizing
+        && info.precision == 8
+        && !info.lossless
+        && !info.hierarchical
+    {
         let mut ci = parsed.into_coefs()?;
         apply_metadata_policy(&mut ci.meta, cli);
         if let Some(target) = cli.target_ssim {
@@ -245,6 +267,8 @@ fn jpeg_to_jpeg(data: &[u8], cli: &Cli) -> Result<Encoded> {
     let mut encoded = encode_jpeg_pixels(&img, cli, effective_q, arithmetic)?;
     if info.lossless {
         add_note(&mut encoded, "lossless JPEG re-encoded as lossy");
+    } else if info.hierarchical {
+        add_note(&mut encoded, "hierarchical JPEG re-encoded as an ordinary JPEG");
     } else if info.precision == 12 {
         add_note(&mut encoded, "12-bit reduced to 8-bit");
     }

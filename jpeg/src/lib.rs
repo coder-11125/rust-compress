@@ -4,6 +4,7 @@ pub mod arith;
 pub mod dct;
 pub mod decode;
 pub mod encode;
+pub mod hierarchical;
 pub mod lossless;
 pub mod progressive;
 pub mod quality;

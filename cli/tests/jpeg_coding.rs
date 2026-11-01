@@ -190,3 +190,32 @@ fn lossless_jpeg_can_be_made_lossy_on_request() {
     let (resized, _) = run("lossless_rgb_p8_pred4.jpg", &["--resize", "50%"]);
     assert!(!jpeg::decode::parse(&resized).unwrap().info().lossless);
 }
+
+#[test]
+fn hierarchical_jpeg_converts_to_png_and_is_left_alone_as_jpeg() {
+    // The three exact ones decode to precisely their source picture, through lossless and DCT-then-lossless frames,
+    // at 8 and 16 bits.
+    for name in ["hier_gray_lossless", "hier_rgb16_lossless", "hier_gray_dct_then_lossless"] {
+        let d = tempdir().unwrap();
+        let input = d.path().join(format!("{name}.jpg"));
+        fs::write(&input, fixture(&format!("{name}.jpg"))).unwrap();
+        let out = d.path().join("o.png");
+        cmd().arg(&input).args(["-f", "png", "-o"]).arg(&out).assert().success();
+        let (w, h, got) = reference_rgba16(&fs::read(&out).unwrap());
+        let (ew, eh, want) = reference_rgba16(&fixture(&format!("{name}.expected.png")));
+        assert_eq!((w, h), (ew, eh), "{name}");
+        assert!(got == want, "{name}: PNG differs from the source picture");
+    }
+    // As a JPEG it is kept as it is, by default.
+    for name in ["hier_dct_huffman", "hier_gray_lossless"] {
+        let src = fixture(&format!("{name}.jpg"));
+        let (out, log) = run(&format!("{name}.jpg"), &[]);
+        assert_eq!(out, src, "{name}");
+        assert!(log.contains("hierarchical JPEG left unchanged"), "{log}");
+    }
+    // ... and becomes an ordinary lossy JPEG on request.
+    let (out, log) = run("hier_dct_huffman.jpg", &["--lossy", "-q", "85"]);
+    assert!(log.contains("hierarchical JPEG re-encoded"), "{log}");
+    let info = jpeg::decode::parse(&out).unwrap().info();
+    assert!(!info.hierarchical && !info.lossless);
+}

@@ -51,6 +51,14 @@ const JPEGS: &[&str] = &[
     "jpeg12_420.jpg",
     "jpeg12_cmyk.jpg",
     "jpeg12_ycck.jpg",
+    // Hierarchical: lossless, DCT with each entropy coder, and a DCT pyramid ending in a lossless frame.
+    "hier_gray_lossless.jpg",
+    "hier_rgb16_lossless.jpg",
+    "hier_gray_dct_then_lossless.jpg",
+    "hier_dct_huffman.jpg",
+    "hier_dct_progressive.jpg",
+    "hier_dct_arith.jpg",
+    "hier_dct_arith_progressive.jpg",
     // Lossless.
     "lossless_gray_p8_pred1.jpg",
     "lossless_gray_p16_pred7.jpg",

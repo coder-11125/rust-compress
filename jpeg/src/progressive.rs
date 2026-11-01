@@ -53,6 +53,8 @@ impl ScanSink for Emit<'_> {
 /// Entropy-coder state that persists across the blocks of one scan.
 struct State {
     last_dc: [i32; 4],
+    /// A differential frame: DC coefficients are coded without prediction.
+    differential: bool,
     eobrun: u32,
     /// Correction bits owed to the pending end-of-band run.
     pending: Vec<u8>,
@@ -82,6 +84,9 @@ fn emit_eobrun<S: ScanSink>(st: &mut State, sink: &mut S) {
 
 fn dc_first<S: ScanSink>(st: &mut State, sink: &mut S, blk: &[i16], comp: usize, slot: usize, al: u32) {
     let v = (blk[0] >> al) as i32;
+    if st.differential {
+        st.last_dc[comp] = 0;
+    }
     let diff = v - st.last_dc[comp];
     st.last_dc[comp] = v;
     let nb = nbits(diff.unsigned_abs());
@@ -183,8 +188,8 @@ fn ac_refine<S: ScanSink>(st: &mut State, sink: &mut S, blk: &[i16], sc: &Scan) 
     }
 }
 
-fn run_scan<S: ScanSink>(ci: &CoefImage, sc: &Scan, sink: &mut S) {
-    let mut st = State { last_dc: [0; 4], eobrun: 0, pending: Vec::new(), br: Vec::new() };
+fn run_scan<S: ScanSink>(ci: &CoefImage, sc: &Scan, sink: &mut S, differential: bool) {
+    let mut st = State { last_dc: [0; 4], differential, eobrun: 0, pending: Vec::new(), br: Vec::new() };
     let (hmax, vmax) = ci.hv_max();
     let dc_scan = sc.ss == 0;
     let visit = |st: &mut State, sink: &mut S, ci_idx: usize, blk: &[i16]| {
@@ -304,7 +309,7 @@ fn build_tables(stats: &Stats) -> [[Option<HuffTable>; 2]; 2] {
 /// Size in bytes of one scan (DHT + SOS + entropy data), without emitting it.
 fn scan_cost(ci: &CoefImage, sc: &Scan) -> u64 {
     let mut stats = Stats { freq: [[[0; 256]; 2]; 2], raw_bits: 0 };
-    run_scan(ci, sc, &mut stats);
+    run_scan(ci, sc, &mut stats, false);
     let tables = build_tables(&stats);
     let mut bits = stats.raw_bits;
     let mut total = 0u64;
@@ -346,12 +351,12 @@ pub fn plan(ci: &CoefImage) -> (u64, Vec<Scan>) {
 }
 
 /// Entropy-code every scan of `script` (own optimized Huffman tables per scan).
-fn encode_script(ci: &CoefImage, script: &[Scan]) -> Vec<u8> {
+fn encode_script(ci: &CoefImage, script: &[Scan], differential: bool) -> Vec<u8> {
     let mut out = Vec::new();
     for sc in script {
         // Pass 1: statistics for this scan's tables.
         let mut stats = Stats { freq: [[[0; 256]; 2]; 2], raw_bits: 0 };
-        run_scan(ci, sc, &mut stats);
+        run_scan(ci, sc, &mut stats, differential);
         let tables = build_tables(&stats);
         for class in 0..2 {
             for slot in 0..2 {
@@ -370,7 +375,7 @@ fn encode_script(ci: &CoefImage, script: &[Scan]) -> Vec<u8> {
         segment(&mut out, 0xDA, &sos);
         // Pass 2: emit.
         let mut emit = Emit { w: MsbWriter { out: Vec::new(), acc: 0, n: 0 }, tables: &tables };
-        run_scan(ci, sc, &mut emit);
+        run_scan(ci, sc, &mut emit, differential);
         emit.w.finish();
         out.extend_from_slice(&emit.w.out);
     }
@@ -385,8 +390,13 @@ pub fn write_progressive(ci: &CoefImage) -> Vec<u8> {
 
 /// Serialize with a layout chosen by [`plan`].
 pub fn emit(ci: &CoefImage, script: &[Scan]) -> Vec<u8> {
-    let best = encode_script(ci, script);
-    let mut out = write_headers(ci, 0xC2, best.len() + 1024);
+    emit_with(ci, script, false)
+}
+
+/// As [`emit`]; `differential` writes a differential progressive frame (SOF6) for a hierarchical image.
+pub fn emit_with(ci: &CoefImage, script: &[Scan], differential: bool) -> Vec<u8> {
+    let best = encode_script(ci, script, differential);
+    let mut out = write_headers(ci, if differential { 0xC6 } else { 0xC2 }, best.len() + 1024);
     out.extend_from_slice(&best);
     out.extend_from_slice(&[0xFF, 0xD9]);
     out

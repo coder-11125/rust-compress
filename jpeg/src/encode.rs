@@ -370,6 +370,11 @@ fn code_block<S: Sink>(s: &mut S, blk: &[i16], pred: &mut i16, tbl: usize) {
 }
 
 fn scan<S: Sink>(comps: &[CoefComponent], mcus_x: usize, mcus_y: usize, sink: &mut S) {
+    scan_with(comps, mcus_x, mcus_y, sink, false);
+}
+
+/// `differential`: a differential frame of a hierarchical image, whose DC coefficients are coded without prediction.
+fn scan_with<S: Sink>(comps: &[CoefComponent], mcus_x: usize, mcus_y: usize, sink: &mut S, differential: bool) {
     let mut pred = [0i16; 4];
     for my in 0..mcus_y {
         for mx in 0..mcus_x {
@@ -377,6 +382,9 @@ fn scan<S: Sink>(comps: &[CoefComponent], mcus_x: usize, mcus_y: usize, sink: &m
                 for by in 0..c.v {
                     for bx in 0..c.h {
                         let b = (my * c.v + by) * c.blocks_w + mx * c.h + bx;
+                        if differential {
+                            pred[ci] = 0;
+                        }
                         code_block(sink, &c.coefs[b * 64..b * 64 + 64], &mut pred[ci], ci.min(1));
                     }
                 }
@@ -545,13 +553,18 @@ fn baseline_estimate(ci: &CoefImage) -> u64 {
 
 /// Entropy-code and serialize a [`CoefImage`] as baseline JPEG with optimized Huffman tables.
 pub fn write_jpeg(ci: &CoefImage) -> Vec<u8> {
+    write_jpeg_with(ci, false)
+}
+
+/// As [`write_jpeg`]; `differential` writes a differential sequential frame (SOF5) for a hierarchical image.
+pub fn write_jpeg_with(ci: &CoefImage, differential: bool) -> Vec<u8> {
     let comps = &ci.comps;
     let (mcus_x, mcus_y) = ci.mcus();
     let gray = comps.len() == 1;
     let ntables = if gray { 1 } else { 2 };
     // Pass 1: symbol statistics -> optimal Huffman tables.
     let mut stats = Stats { dc: [[0; 256]; 2], ac: [[0; 256]; 2], raw_bits: 0 };
-    scan(comps, mcus_x, mcus_y, &mut stats);
+    scan_with(comps, mcus_x, mcus_y, &mut stats, differential);
     let dc_tables = [optimal_table(&stats.dc[0]), optimal_table(&stats.dc[1])];
     let ac_tables = [optimal_table(&stats.ac[0]), optimal_table(&stats.ac[1])];
 
@@ -561,11 +574,11 @@ pub fn write_jpeg(ci: &CoefImage) -> Vec<u8> {
         dc: &dc_tables,
         ac: &ac_tables,
     };
-    scan(comps, mcus_x, mcus_y, &mut writer);
+    scan_with(comps, mcus_x, mcus_y, &mut writer, differential);
     writer.w.finish();
     let entropy = writer.w.out;
 
-    let mut out = write_headers(ci, 0xC0, entropy.len() + 1024);
+    let mut out = write_headers(ci, if differential { 0xC5 } else { 0xC0 }, entropy.len() + 1024);
     for t in 0..ntables {
         write_dht(&mut out, t as u8, &dc_tables[t]);
         write_dht(&mut out, 0x10 | t as u8, &ac_tables[t]);

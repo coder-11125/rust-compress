@@ -4,6 +4,7 @@
 //! the symbol statistics of real optimized Huffman tables, and the cheapest is written. The difference to the
 //! prediction is coded modulo 2^16 as in the standard. The reading side is [`super::decode`].
 
+use super::arith::{Conditioning, LosslessEncoder};
 use super::decode::predict_sample;
 use super::encode::{HuffTable, MsbWriter, optimal_table, segment, write_dht, write_metadata};
 use rayon::prelude::*;
@@ -32,6 +33,10 @@ pub struct LosslessFrame {
 
 #[derive(Clone, Debug, Default)]
 pub struct LosslessOptions {
+    /// Arithmetic instead of Huffman coding of the differences (SOF11).
+    pub arithmetic: bool,
+    /// Arithmetic conditioning bounds (written as a DAC marker when they differ from the defaults).
+    pub conditioning: Conditioning,
     /// Predictor 1 to 7, or `None` to try them all and keep the smallest.
     pub predictor: Option<u8>,
     /// Write a restart marker every this many MCU rows (0 for none).
@@ -47,8 +52,9 @@ pub struct Recoded {
 enum Event {
     /// A restart interval ends here.
     Restart,
-    /// The coded difference (-32768..=32767) of a sample of component `.0`.
-    Diff(usize, i32),
+    /// The coded difference (-32768..=32767) of the sample at (`x`, `y`) of component `ci`; `first_row` is the first
+    /// sample row of the current restart interval.
+    Diff { ci: usize, x: usize, y: usize, first_row: usize, d: i32 },
 }
 
 impl LosslessFrame {
@@ -77,7 +83,7 @@ impl LosslessFrame {
                             let (x, y) = (mx * c.h + bx, my * c.v + by);
                             let pred = predict_sample(&c.samples, c.stride, x, y, first_row[ci], predictor, start);
                             let diff = (c.samples[y * c.stride + x] as i32 - pred) & 0xFFFF;
-                            f(Event::Diff(ci, diff as u16 as i16 as i32));
+                            f(Event::Diff { ci, x, y, first_row: first_row[ci], d: diff as u16 as i16 as i32 });
                         }
                     }
                 }
@@ -90,7 +96,7 @@ impl LosslessFrame {
         let mut freq = [[0u32; 256]; 2];
         let mut extra = 0u64;
         self.for_each_diff(predictor, 0, |e| {
-            if let Event::Diff(ci, d) = e {
+            if let Event::Diff { ci, d, .. } = e {
                 let t = category(d);
                 freq[ci.min(1)][t as usize] += 1;
                 extra += if t == 16 { 0 } else { t as u64 };
@@ -108,10 +114,6 @@ impl LosslessFrame {
 
     /// The smallest file for this frame.
     pub fn write(&self, opts: &LosslessOptions) -> Result<Recoded> {
-        let nc = self.comps.len();
-        if nc == 0 || self.width == 0 || self.height == 0 || self.width > 65535 || self.height > 65535 {
-            return Err(Error::unsupported("lossless JPEG dimensions"));
-        }
         let predictor = match opts.predictor {
             Some(p) if (1..=7).contains(&p) => p,
             Some(_) => return Err(Error::invalid("lossless predictor must be 1 to 7")),
@@ -120,57 +122,119 @@ impl LosslessFrame {
                 costs.into_iter().min().expect("seven candidates").1
             }
         };
-        let (mcus_x, _) = self.mcu_grid();
-
-        // Pass 1: the symbol statistics of the chosen predictor give the Huffman tables.
-        let mut freq = [[0u32; 256]; 2];
-        self.for_each_diff(predictor, opts.restart_rows, |e| {
-            if let Event::Diff(ci, d) = e {
-                freq[ci.min(1)][category(d) as usize] += 1;
-            }
-        });
-        let ntables = nc.min(2);
-        let tables: Vec<HuffTable> = (0..ntables).map(|t| optimal_table(&freq[t])).collect();
-
-        // Pass 2: the entropy-coded data.
-        let mut w = MsbWriter { out: Vec::with_capacity(self.width * self.height * nc), acc: 0, n: 0 };
-        let mut rst = 0u8;
-        self.for_each_diff(predictor, opts.restart_rows, |e| match e {
-            Event::Restart => {
-                w.finish();
-                w.out.extend_from_slice(&[0xFF, 0xD0 + rst]);
-                rst = (rst + 1) & 7;
-            }
-            Event::Diff(ci, d) => {
-                let t = category(d);
-                let table = &tables[ci.min(1)];
-                w.put(table.code[t as usize] as u32, table.size[t as usize] as u32);
-                if t > 0 && t < 16 {
-                    let v = if d < 0 { (d - 1) as u32 } else { d as u32 };
-                    w.put(v & ((1 << t) - 1), t);
-                }
-            }
-        });
-        w.finish();
-
+        let sof = if opts.arithmetic { 0xCB } else { 0xC3 };
+        let arith = opts.arithmetic.then_some(&opts.conditioning);
+        let segments = self.frame_segments(predictor, sof, opts.restart_rows, arith)?;
         let mut out = vec![0xFF, 0xD8];
         if let Some(t) = self.adobe_transform {
             segment(&mut out, 0xEE, &[b'A', b'd', b'o', b'b', b'e', 0, 100, 0, 0, 0, 0, t]);
         }
         write_metadata(&mut out, &self.meta);
-        let mut sof = vec![self.precision];
-        sof.extend_from_slice(&(self.height as u16).to_be_bytes());
-        sof.extend_from_slice(&(self.width as u16).to_be_bytes());
-        sof.push(nc as u8);
-        for c in &self.comps {
-            sof.extend_from_slice(&[c.id, (c.h << 4 | c.v) as u8, 0]);
+        out.extend_from_slice(&segments);
+        out.extend_from_slice(&[0xFF, 0xD9]);
+        Ok(Recoded { bytes: out, predictor })
+    }
+
+    /// The frame header, Huffman tables, restart interval, scan header and entropy-coded data, without the markers
+    /// that frame a whole file. `predictor` 0 (no prediction) is for differential frames (`sof` 0xC7) of a
+    /// hierarchical image, where each sample is itself a difference.
+    pub(super) fn frame_segments(
+        &self,
+        predictor: u8,
+        sof: u8,
+        restart_rows: usize,
+        arithmetic: Option<&Conditioning>,
+    ) -> Result<Vec<u8>> {
+        let nc = self.comps.len();
+        if nc == 0 || self.width == 0 || self.height == 0 || self.width > 65535 || self.height > 65535 {
+            return Err(Error::unsupported("lossless JPEG dimensions"));
         }
-        segment(&mut out, 0xC3, &sof);
+        let (mcus_x, _) = self.mcu_grid();
+
+        let (data, tables): (Vec<u8>, Vec<HuffTable>) = match arithmetic {
+            None => {
+                // Pass 1: the symbol statistics give the Huffman tables.
+                let mut freq = [[0u32; 256]; 2];
+                self.for_each_diff(predictor, restart_rows, |e| {
+                    if let Event::Diff { ci, d, .. } = e {
+                        freq[ci.min(1)][category(d) as usize] += 1;
+                    }
+                });
+                let tables: Vec<HuffTable> = (0..nc.min(2)).map(|t| optimal_table(&freq[t])).collect();
+                // Pass 2: the entropy-coded data.
+                let mut w = MsbWriter { out: Vec::with_capacity(self.width * self.height * nc), acc: 0, n: 0 };
+                let mut rst = 0u8;
+                self.for_each_diff(predictor, restart_rows, |e| match e {
+                    Event::Restart => {
+                        w.finish();
+                        w.out.extend_from_slice(&[0xFF, 0xD0 + rst]);
+                        rst = (rst + 1) & 7;
+                    }
+                    Event::Diff { ci, d, .. } => {
+                        let t = category(d);
+                        let table = &tables[ci.min(1)];
+                        w.put(table.code[t as usize] as u32, table.size[t as usize] as u32);
+                        if t > 0 && t < 16 {
+                            let v = if d < 0 { (d - 1) as u32 } else { d as u32 };
+                            w.put(v & ((1 << t) - 1), t);
+                        }
+                    }
+                });
+                w.finish();
+                (w.out, tables)
+            }
+            Some(cond) => {
+                let mut enc = LosslessEncoder::new(cond);
+                let mut data = Vec::new();
+                let mut rst = 0u8;
+                // The differences already coded condition the statistics of their right and lower neighbours.
+                let mut diffs: Vec<Vec<i16>> = self.comps.iter().map(|c| vec![0i16; c.samples.len()]).collect();
+                self.for_each_diff(predictor, restart_rows, |e| match e {
+                    Event::Restart => {
+                        let done = std::mem::replace(&mut enc, LosslessEncoder::new(cond));
+                        data.extend_from_slice(&done.finish());
+                        data.extend_from_slice(&[0xFF, 0xD0 + rst]);
+                        rst = (rst + 1) & 7;
+                    }
+                    Event::Diff { ci, x, y, first_row, d } => {
+                        let stride = self.comps[ci].stride;
+                        let da = if x == 0 { 0 } else { diffs[ci][y * stride + x - 1] as i32 };
+                        let db = if y == first_row { 0 } else { diffs[ci][(y - 1) * stride + x] as i32 };
+                        enc.diff(ci.min(1), da, db, d);
+                        diffs[ci][y * stride + x] = d as i16;
+                    }
+                });
+                data.extend_from_slice(&enc.finish());
+                (data, Vec::new())
+            }
+        };
+
+        let mut out = Vec::with_capacity(data.len() + 256);
+        let mut header = vec![self.precision];
+        header.extend_from_slice(&(self.height as u16).to_be_bytes());
+        header.extend_from_slice(&(self.width as u16).to_be_bytes());
+        header.push(nc as u8);
+        for c in &self.comps {
+            header.extend_from_slice(&[c.id, (c.h << 4 | c.v) as u8, 0]);
+        }
+        segment(&mut out, sof, &header);
         for (t, table) in tables.iter().enumerate() {
             write_dht(&mut out, t as u8, table);
         }
-        if opts.restart_rows > 0 {
-            let interval = (opts.restart_rows * mcus_x).min(0xFFFF) as u16;
+        if let Some(cond) = arithmetic {
+            let dflt = Conditioning::default();
+            let mut dac = Vec::new();
+            for t in 0..nc.min(2) {
+                if cond.dc_l[t] != dflt.dc_l[t] || cond.dc_u[t] != dflt.dc_u[t] {
+                    dac.extend_from_slice(&[t as u8, cond.dc_u[t] << 4 | cond.dc_l[t]]);
+                }
+            }
+            if !dac.is_empty() {
+                segment(&mut out, 0xCC, &dac);
+            }
+        }
+        if restart_rows > 0 {
+            let interval = (restart_rows * mcus_x).min(0xFFFF) as u16;
             segment(&mut out, 0xDD, &interval.to_be_bytes());
         }
         let mut sos = vec![nc as u8];
@@ -179,9 +243,8 @@ impl LosslessFrame {
         }
         sos.extend_from_slice(&[predictor, 0, self.point_transform as u8]);
         segment(&mut out, 0xDA, &sos);
-        out.extend_from_slice(&w.out);
-        out.extend_from_slice(&[0xFF, 0xD9]);
-        Ok(Recoded { bytes: out, predictor })
+        out.extend_from_slice(&data);
+        Ok(out)
     }
 }
 

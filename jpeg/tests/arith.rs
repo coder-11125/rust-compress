@@ -34,7 +34,7 @@ fn same(a: &CoefImage, b: &CoefImage, what: &str) {
 }
 
 fn opts(progressive: bool, restart: usize, cond: Conditioning) -> ArithOptions {
-    ArithOptions { progressive, conditioning: cond, restart_interval: restart }
+    ArithOptions { progressive, conditioning: cond, restart_interval: restart, ..Default::default() }
 }
 
 #[test]

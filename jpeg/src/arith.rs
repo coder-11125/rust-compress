@@ -151,6 +151,29 @@ impl Default for Conditioning {
 
 const DC_BINS: usize = 64;
 const AC_BINS: usize = 256;
+/// Statistics bins of one lossless scan: 25 contexts of four decisions, then two sets of magnitude bins (Table H.3).
+const LL_BINS: usize = 158;
+
+/// How a coded difference counts for conditioning (T.81 F.1.4.4.1.2): 0 zero, 1 small positive, 2 small negative,
+/// 3 large positive, 4 large negative. The bounds are `2^(L-1)` (exclusive, zero for `L = 0`) and `2^U` (inclusive).
+fn difference_class(d: i32, l: u32, u: u32) -> usize {
+    let a = d.unsigned_abs();
+    let low = if l == 0 { 0 } else { 1u32 << (l - 1) };
+    if a <= low {
+        0
+    } else if a <= 1u32 << u {
+        1 + (d < 0) as usize
+    } else {
+        3 + (d < 0) as usize
+    }
+}
+
+/// The statistics context of a lossless difference (Figure H.2 and Table H.3): `S0` from the classes of the
+/// difference to the left (`da`) and above (`db`), and the first magnitude bin `X1` from the class of `db`.
+fn lossless_contexts(da: i32, db: i32, l: u32, u: u32) -> (usize, usize) {
+    let (ca, cb) = (difference_class(da, l, u), difference_class(db, l, u));
+    (20 * ca + 4 * cb, if cb >= 3 { 129 } else { 100 })
+}
 
 // ---------------------------------------------------------------------------------------------------------------
 // Decoder
@@ -283,10 +306,13 @@ pub(super) struct ScanDecoder<'a> {
     pub(super) rd: Reader<'a>,
     dc: [[u8; DC_BINS]; 4],
     ac: [[u8; AC_BINS]; 4],
+    ll: [[u8; LL_BINS]; 4],
     fixed: u8,
     last_dc: [i32; 4],
     ctx: [usize; 4],
     cond: Conditioning,
+    /// A differential frame of a hierarchical image: the DC value is coded without prediction.
+    pub(super) differential: bool,
 }
 
 fn bad() -> Error {
@@ -299,10 +325,12 @@ impl<'a> ScanDecoder<'a> {
             rd: Reader::new(data, pos),
             dc: [[0; DC_BINS]; 4],
             ac: [[0; AC_BINS]; 4],
+            ll: [[0; LL_BINS]; 4],
             fixed: FIXED_BIN,
             last_dc: [0; 4],
             ctx: [0; 4],
             cond,
+            differential: false,
         }
     }
 
@@ -311,12 +339,16 @@ impl<'a> ScanDecoder<'a> {
         self.rd.restart();
         self.dc = [[0; DC_BINS]; 4];
         self.ac = [[0; AC_BINS]; 4];
+        self.ll = [[0; LL_BINS]; 4];
         self.last_dc = [0; 4];
         self.ctx = [0; 4];
     }
 
     /// Decode a DC difference (F.2.4.1) for the `ci`-th component of the scan; returns the new DC value.
     fn dc_value(&mut self, ci: usize, tbl: usize) -> Result<i32> {
+        if self.differential {
+            self.last_dc[ci] = 0;
+        }
         let mut st = self.ctx[ci];
         if self.rd.decode(&mut self.dc[tbl][st]) == 0 {
             self.ctx[ci] = 0;
@@ -360,6 +392,41 @@ impl<'a> ScanDecoder<'a> {
         }
         self.last_dc[ci] = self.last_dc[ci].wrapping_add(v);
         Ok(self.last_dc[ci])
+    }
+
+    /// Decode a lossless difference (H.1.2.3), conditioned on the differences `da` to the left and `db` above.
+    pub(super) fn lossless_diff(&mut self, tbl: usize, da: i32, db: i32) -> Result<i32> {
+        let (l, u) = (self.cond.dc_l[tbl] as u32, self.cond.dc_u[tbl] as u32);
+        let (s0, x1) = lossless_contexts(da, db, l, u);
+        if self.rd.decode(&mut self.ll[tbl][s0]) == 0 {
+            return Ok(0);
+        }
+        let sign = self.rd.decode(&mut self.ll[tbl][s0 + 1]) as usize;
+        let mut st = s0 + 2 + sign;
+        let mut m = self.rd.decode(&mut self.ll[tbl][st]) as i32;
+        if m != 0 {
+            st = x1;
+            while self.rd.decode(&mut self.ll[tbl][st]) != 0 {
+                m <<= 1;
+                if m == 0x8000 {
+                    return Err(bad());
+                }
+                st += 1;
+            }
+        }
+        let mut v = m;
+        st += 14;
+        loop {
+            m >>= 1;
+            if m == 0 {
+                break;
+            }
+            if self.rd.decode(&mut self.ll[tbl][st]) != 0 {
+                v |= m;
+            }
+        }
+        v += 1;
+        Ok(if sign != 0 { -v } else { v })
     }
 
     /// Decode the value of a nonzero AC coefficient at position `k` (F.2.4.2).
@@ -615,6 +682,7 @@ impl Encoder {
 }
 
 struct ScanEncoder<'a> {
+    differential: bool,
     enc: Encoder,
     dc: [[u8; DC_BINS]; 4],
     ac: [[u8; AC_BINS]; 4],
@@ -625,8 +693,9 @@ struct ScanEncoder<'a> {
 }
 
 impl<'a> ScanEncoder<'a> {
-    fn new(cond: &'a Conditioning) -> Self {
+    fn new(cond: &'a Conditioning, differential: bool) -> Self {
         ScanEncoder {
+            differential,
             enc: Encoder::new(),
             dc: [[0; DC_BINS]; 4],
             ac: [[0; AC_BINS]; 4],
@@ -639,6 +708,9 @@ impl<'a> ScanEncoder<'a> {
 
     /// Encode a DC value as a difference from the previous one (F.1.4.1).
     fn dc_value(&mut self, ci: usize, tbl: usize, value: i32) {
+        if self.differential {
+            self.last_dc[ci] = 0;
+        }
         let mut st = self.ctx[ci];
         let mut v = value - self.last_dc[ci];
         if v == 0 {
@@ -801,6 +873,65 @@ impl<'a> ScanEncoder<'a> {
     }
 }
 
+/// Arithmetic encoder for one lossless scan (H.1.2.3).
+pub(super) struct LosslessEncoder<'a> {
+    enc: Encoder,
+    stats: [[u8; LL_BINS]; 4],
+    cond: &'a Conditioning,
+}
+
+impl<'a> LosslessEncoder<'a> {
+    pub(super) fn new(cond: &'a Conditioning) -> Self {
+        LosslessEncoder { enc: Encoder::new(), stats: [[0; LL_BINS]; 4], cond }
+    }
+
+    /// Code the difference `d` (-32768..=32767), given the differences to the left and above.
+    pub(super) fn diff(&mut self, tbl: usize, da: i32, db: i32, d: i32) {
+        let (l, u) = (self.cond.dc_l[tbl] as u32, self.cond.dc_u[tbl] as u32);
+        let (s0, x1) = lossless_contexts(da, db, l, u);
+        let st = &mut self.stats[tbl];
+        if d == 0 {
+            self.enc.encode(&mut st[s0], 0);
+            return;
+        }
+        self.enc.encode(&mut st[s0], 1);
+        let sign = (d < 0) as usize;
+        self.enc.encode(&mut st[s0 + 1], sign as u32);
+        let mut at = s0 + 2 + sign;
+        let v = d.abs() - 1;
+        let mut m = 0i32;
+        if v != 0 {
+            self.enc.encode(&mut st[at], 1);
+            m = 1;
+            let mut v2 = v;
+            at = x1;
+            loop {
+                v2 >>= 1;
+                if v2 == 0 {
+                    break;
+                }
+                self.enc.encode(&mut st[at], 1);
+                m <<= 1;
+                at += 1;
+            }
+        }
+        self.enc.encode(&mut st[at], 0);
+        at += 14;
+        loop {
+            m >>= 1;
+            if m == 0 {
+                break;
+            }
+            self.enc.encode(&mut st[at], ((m & v) != 0) as u32);
+        }
+    }
+
+    /// Close the codeword; the caller writes whatever marker follows.
+    pub(super) fn finish(self) -> Vec<u8> {
+        self.enc.finish()
+    }
+}
+
 // ---------------------------------------------------------------------------------------------------------------
 // Writer
 // ---------------------------------------------------------------------------------------------------------------
@@ -811,6 +942,8 @@ pub struct ArithOptions {
     /// Progressive (SOF10) instead of sequential (SOF9).
     pub progressive: bool,
     pub conditioning: Conditioning,
+    /// A differential frame of a hierarchical image (SOF13/SOF14): DC values are coded without prediction.
+    pub differential: bool,
     /// MCUs between restart markers (0 for none). Each interval starts a new codeword with cleared statistics.
     pub restart_interval: usize,
 }
@@ -851,9 +984,9 @@ struct Restarts {
 impl Restarts {
     /// Call before each MCU: at the start of every interval but the first, close the codeword, write the marker
     /// and start afresh with cleared statistics.
-    fn at_mcu<'c>(&mut self, e: &mut ScanEncoder<'c>, cond: &'c Conditioning, out: &mut Vec<u8>) {
+    fn at_mcu<'c>(&mut self, e: &mut ScanEncoder<'c>, cond: &'c Conditioning, differential: bool, out: &mut Vec<u8>) {
         if self.interval > 0 && self.units > 0 && self.units.is_multiple_of(self.interval) {
-            let done = std::mem::replace(e, ScanEncoder::new(cond));
+            let done = std::mem::replace(e, ScanEncoder::new(cond, differential));
             out.extend_from_slice(&done.enc.finish());
             out.extend_from_slice(&[0xFF, 0xD0 + self.next]);
             self.next = (self.next + 1) & 7;
@@ -862,8 +995,8 @@ impl Restarts {
     }
 }
 
-fn run_scan(ci: &CoefImage, sc: &Scan, cond: &Conditioning, restart: usize) -> Vec<u8> {
-    let mut e = ScanEncoder::new(cond);
+fn run_scan(ci: &CoefImage, sc: &Scan, cond: &Conditioning, restart: usize, differential: bool) -> Vec<u8> {
+    let mut e = ScanEncoder::new(cond, differential);
     let mut out = Vec::new();
     let mut marks = Restarts { interval: restart, units: 0, next: 0 };
     let (hmax, vmax) = ci.hv_max();
@@ -887,7 +1020,7 @@ fn run_scan(ci: &CoefImage, sc: &Scan, cond: &Conditioning, restart: usize) -> V
         let (mcus_x, mcus_y) = ci.mcus();
         for my in 0..mcus_y {
             for mx in 0..mcus_x {
-                marks.at_mcu(&mut e, cond, &mut out);
+                marks.at_mcu(&mut e, cond, differential, &mut out);
                 for (si, &k) in sc.comps.iter().enumerate() {
                     let c = &ci.comps[k];
                     for by in 0..c.v {
@@ -907,7 +1040,7 @@ fn run_scan(ci: &CoefImage, sc: &Scan, cond: &Conditioning, restart: usize) -> V
         let real_h = (ci.height * c.v).div_ceil(vmax).div_ceil(8);
         for by in 0..real_h {
             for bx in 0..real_w {
-                marks.at_mcu(&mut e, cond, &mut out);
+                marks.at_mcu(&mut e, cond, differential, &mut out);
                 let b = by * c.blocks_w + bx;
                 visit(&mut e, 0, k, &c.coefs[b * 64..b * 64 + 64]);
             }
@@ -921,7 +1054,13 @@ fn run_scan(ci: &CoefImage, sc: &Scan, cond: &Conditioning, restart: usize) -> V
 /// exactly; only the entropy coding differs from a Huffman file.
 pub fn write_arithmetic_with(ci: &CoefImage, opts: &ArithOptions) -> Vec<u8> {
     let cond = &opts.conditioning;
-    let mut out = write_headers(ci, if opts.progressive { 0xCA } else { 0xC9 }, ci.width * ci.height / 4 + 1024);
+    let sof = match (opts.differential, opts.progressive) {
+        (false, false) => 0xC9,
+        (false, true) => 0xCA,
+        (true, false) => 0xCD,
+        (true, true) => 0xCE,
+    };
+    let mut out = write_headers(ci, sof, ci.width * ci.height / 4 + 1024);
     // Conditioning that differs from the default, for the (at most two) tables in use.
     let tables = if ci.comps.len() == 1 { 1 } else { 2 };
     let dflt = Conditioning::default();
@@ -953,7 +1092,7 @@ pub fn write_arithmetic_with(ci: &CoefImage, opts: &ArithOptions) -> Vec<u8> {
         }
         sos.extend_from_slice(&[sc.ss as u8, sc.se as u8, (sc.ah << 4 | sc.al) as u8]);
         segment(&mut out, 0xDA, &sos);
-        out.extend_from_slice(&run_scan(ci, sc, cond, opts.restart_interval.min(0xFFFF)));
+        out.extend_from_slice(&run_scan(ci, sc, cond, opts.restart_interval.min(0xFFFF), opts.differential));
     }
     out.extend_from_slice(&[0xFF, 0xD9]);
     out
@@ -1040,7 +1179,7 @@ mod tests {
             })
             .collect();
         let cond = Conditioning::default();
-        let mut e = ScanEncoder::new(&cond);
+        let mut e = ScanEncoder::new(&cond, false);
         for blk in &blocks {
             e.sequential(blk, 0, 0, 0);
         }
@@ -1053,7 +1192,7 @@ mod tests {
             assert_eq!(&got[..], &want[..], "block {i}");
         }
         // First scans at a point transform of 2, then the refinement at 1 and 0, as a progressive file does.
-        let mut e = ScanEncoder::new(&cond);
+        let mut e = ScanEncoder::new(&cond, false);
         for blk in &blocks {
             e.dc_value(0, 0, (blk[0] as i32) >> 2);
         }
@@ -1076,6 +1215,57 @@ mod tests {
                 let m = ((want[k] as i32).abs() >> 2) << 2;
                 assert_eq!(g[k] as i32, if want[k] < 0 { -m } else { m }, "block {i} coefficient {k}");
             }
+        }
+    }
+
+    #[test]
+    fn lossless_conditioning_follows_figure_h2() {
+        // Default bounds L = 0, U = 1: zero, then +-1 and +-2 are small, the rest large.
+        let c = |d| difference_class(d, 0, 1);
+        assert_eq!([c(0), c(1), c(-1), c(2), c(-2), c(3), c(-3), c(-32768)], [0, 1, 2, 1, 2, 3, 4, 4]);
+        // L = 2 widens the zero class to |d| <= 2; U = 3 makes |d| <= 8 small.
+        let c = |d| difference_class(d, 2, 3);
+        assert_eq!([c(2), c(-2), c(3), c(8), c(-8), c(9)], [0, 0, 1, 1, 2, 3]);
+        // S0 = 20 * class(left) + 4 * class(above); the first magnitude bin is 100, or 129 for a large `above`.
+        assert_eq!(lossless_contexts(0, 0, 0, 1), (0, 100));
+        assert_eq!(lossless_contexts(0, -1, 0, 1), (8, 100));
+        assert_eq!(lossless_contexts(1, 0, 0, 1), (20, 100));
+        assert_eq!(lossless_contexts(-1, 5, 0, 1), (40 + 12, 129));
+        assert_eq!(lossless_contexts(9, -9, 0, 1), (60 + 16, 129));
+        // The largest context plus its decisions and the largest magnitude bins stay inside the 158 bins.
+        let (s0, x1) = lossless_contexts(-9, -9, 0, 1);
+        assert!(s0 + 3 < 100 && x1 + 14 + 14 < LL_BINS);
+    }
+
+    #[test]
+    fn lossless_differences_round_trip_in_every_context() {
+        let cond = Conditioning { dc_l: [0, 2, 0, 0], dc_u: [1, 4, 1, 1], ac_k: [5; 4] };
+        let mut rng = 0xFEEDu32;
+        let mut next = move |m: u32| {
+            rng = rng.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (rng >> 8) % m
+        };
+        // (table, left, above, difference) with every magnitude class and the extremes of the 16-bit range.
+        let mut cases = Vec::new();
+        for _ in 0..20_000 {
+            let mag = [0, 1, 2, 3, 7, 40, 300, 5000, 32767][next(9) as usize];
+            let d = if next(2) == 0 { mag } else { -mag };
+            let table = next(2) as usize;
+            let left = next(13) as i32 - 6;
+            let above = (next(13) as i32 - 6) * (1 + next(50) as i32);
+            cases.push((table, left, above, d));
+        }
+        cases.push((0, 0, 0, -32768));
+        cases.push((1, 40000 - 65536, 32767, 32767));
+        let mut e = LosslessEncoder::new(&cond);
+        for &(t, da, db, d) in &cases {
+            e.diff(t, da, db, d);
+        }
+        let mut bytes = e.finish();
+        bytes.extend_from_slice(&[0xFF, 0xD9]);
+        let mut d = ScanDecoder::new(&bytes, 0, cond.clone());
+        for (i, &(t, da, db, want)) in cases.iter().enumerate() {
+            assert_eq!(d.lossless_diff(t, da, db).unwrap(), want, "case {i}: table {t} left {da} above {db}");
         }
     }
 

@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- Hierarchical JPEG (T.81 Annex J) decoding: `DHP`/`EXP` frame sequences with non-differential DCT or lossless first
+  frames and differential DCT (Huffman and arithmetic, sequential and progressive) and differential lossless frames,
+  reconstructed with the standard's truncating bilinear upsampling. Kept as a JPEG it is left unchanged unless `--lossy`;
+  other targets (`-f png`, ...) flatten it. Includes `rc_jpeg::hierarchical::write_hierarchical`, a pyramid writer used
+  to test the decoder. Verified only against that writer (no other program reads hierarchical JPEG here): lossless
+  pyramids and DCT-then-lossless pyramids reproduce the source exactly; seven fixtures are kept.
+- Arithmetic-coded lossless JPEG (SOF11, and SOF15 inside hierarchical images) per Annex H: read, and written with
+  `--arithmetic on`. libjpeg-turbo is built without it, so this is checked against our own writer only.
 - Lossless JPEG (SOF3, Huffman): decoded exactly at 2 to 16 bits (gray, colour, CMYK; predictors 1-7; point transform;
   restart intervals; subsampled components) and recoded without changing a sample, trying all seven predictors and
   optimizing the Huffman tables: 4.2% smaller on nine photo-based files (0% to 15.4%). A lossless JPEG stays lossless
