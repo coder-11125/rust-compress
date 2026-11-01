@@ -1,5 +1,5 @@
-//! JPEG decoder: baseline, extended-sequential and progressive, Huffman or arithmetic coded, 8 or 12 bits, with 1, 3
-//! or 4 components (4 = CMYK/YCCK, which the DCT-domain path carries through untouched; 12-bit has no CMYK).
+//! JPEG decoder: baseline, extended-sequential and progressive, Huffman or arithmetic coded, 8 or 12 bits, plus
+//! lossless (SOF3, 2 to 16 bits), with 1, 3 or 4 components (4 = CMYK/YCCK, which the DCT-domain path carries through untouched at 8 bits).
 //! 12-bit files decode to 16-bit images.
 
 use super::ZIGZAG;
@@ -210,6 +210,8 @@ struct Component {
     real_bw: usize,
     real_bh: usize,
     coefs: Vec<i16>,
+    /// Lossless frames: the decoded samples (`blocks_w` per row, padded to whole MCUs). Empty for DCT frames.
+    samples: Vec<u16>,
 }
 
 struct ScanComp {
@@ -242,8 +244,13 @@ struct Decoder<'a> {
     progressive: bool,
     /// Arithmetic entropy coding (SOF9/SOF10) instead of Huffman.
     arith: bool,
-    /// Sample precision in bits: 8 or 12.
+    /// Sample precision in bits: 8 or 12 for DCT frames, 2 to 16 for lossless ones.
     precision: u8,
+    /// A lossless frame (SOF3): predictive coding of samples, no DCT.
+    lossless: bool,
+    /// Predictor and point transform of the lossless scans, and whether every scan used the same ones.
+    ll_params: Option<(u8, u32)>,
+    ll_uniform: bool,
     /// Arithmetic conditioning from DAC markers.
     cond: arith::Conditioning,
     restart_interval: usize,
@@ -303,6 +310,8 @@ pub struct Info {
     pub precision: u8,
     /// Arithmetic-coded rather than Huffman-coded.
     pub arithmetic: bool,
+    /// Lossless JPEG (SOF3): predictive coding, no DCT, 2 to 16 bits.
+    pub lossless: bool,
 }
 
 /// Pixels a viewer would show for these quantized coefficients (dequantize, IDCT, upsample).
@@ -326,6 +335,7 @@ pub fn reconstruct(ci: &CoefImage) -> Result<Image> {
             real_bw: c.blocks_w,
             real_bh: c.coefs.len() / 64 / c.blocks_w,
             coefs: c.coefs.clone(),
+            samples: Vec::new(),
         })
         .collect();
     let d = Decoder {
@@ -344,6 +354,9 @@ pub fn reconstruct(ci: &CoefImage) -> Result<Image> {
         progressive: false,
         arith: false,
         precision: 8,
+        lossless: false,
+        ll_params: None,
+        ll_uniform: true,
         cond: arith::Conditioning::default(),
         restart_interval: 0,
         adobe_transform: None,
@@ -381,6 +394,9 @@ pub fn parse(data: &[u8]) -> Result<Parsed<'_>> {
         progressive: false,
         arith: false,
         precision: 8,
+        lossless: false,
+        ll_params: None,
+        ll_uniform: true,
         cond: arith::Conditioning::default(),
         restart_interval: 0,
         adobe_transform: None,
@@ -411,7 +427,7 @@ impl Parsed<'_> {
             height: d.height,
             sampling: d.comps.iter().map(|c| (c.h, c.v)).collect(),
             // The standard tables are 8-bit; a 12-bit file's tables are scaled and say nothing about its quality.
-            source_quality: if d.precision == 8 {
+            source_quality: if d.precision == 8 && !d.lossless {
                 luma_q.map_or(100, |t| super::quality::estimate_quality(&t))
             } else {
                 100
@@ -421,6 +437,7 @@ impl Parsed<'_> {
             cmyk: d.comps.len() == 4,
             precision: d.precision,
             arithmetic: d.arith,
+            lossless: d.lossless,
         }
     }
 
@@ -428,10 +445,36 @@ impl Parsed<'_> {
         self.0.finish()
     }
 
+    /// Hand over the decoded samples of a lossless file for lossless recompression.
+    pub fn lossless_frame(self) -> Result<super::lossless::LosslessFrame> {
+        let d = self.0;
+        if !d.lossless || d.arith || !d.ll_uniform {
+            return Err(Error::unsupported("not a Huffman lossless JPEG with a single predictor"));
+        }
+        let point_transform = d.ll_params.map_or(0, |p| p.1);
+        let comps = d
+            .comps
+            .into_iter()
+            .map(|c| super::lossless::LosslessComp { id: c.id, h: c.h, v: c.v, stride: c.blocks_w, samples: c.samples })
+            .collect();
+        Ok(super::lossless::LosslessFrame {
+            width: d.width,
+            height: d.height,
+            precision: d.precision,
+            point_transform,
+            adobe_transform: d.adobe_transform,
+            meta: build_meta(d.icc_parts, d.extras),
+            comps,
+        })
+    }
+
     /// Hand over the quantized coefficients for DCT-domain recompression.
     pub fn into_coefs(self) -> Result<CoefImage> {
         if self.info().coded_rgb {
             return Err(Error::unsupported("RGB-coded JPEG"));
+        }
+        if self.0.lossless {
+            return Err(Error::unsupported("lossless JPEG in the DCT domain"));
         }
         if self.0.precision != 8 {
             return Err(Error::unsupported("12-bit JPEG in the DCT domain"));
@@ -554,15 +597,15 @@ impl Decoder<'_> {
             match m {
                 0xDB => self.read_dqt(body)?,
                 0xC4 => self.read_dht(body)?,
-                0xC0..=0xC2 | 0xC9 | 0xCA => {
+                0xC0..=0xC3 | 0xC9 | 0xCA => {
                     if !self.comps.is_empty() {
                         return Err(Error::invalid("multiple SOF markers"));
                     }
                     self.arith = m >= 0xC9;
-                    self.read_sof(body, m == 0xC2 || m == 0xCA)?;
+                    self.read_sof(body, m == 0xC2 || m == 0xCA, m == 0xC3)?;
                 }
-                0xC3 | 0xC5..=0xC7 | 0xCB | 0xCD..=0xCF => {
-                    return Err(Error::unsupported("JPEG process (lossless or hierarchical)"));
+                0xC5..=0xC7 | 0xCB | 0xCD..=0xCF => {
+                    return Err(Error::unsupported("JPEG process (hierarchical or lossless arithmetic)"));
                 }
                 0xCC => self.read_dac(body)?,
                 0xDD => {
@@ -656,14 +699,16 @@ impl Decoder<'_> {
         Ok(())
     }
 
-    fn read_sof(&mut self, b: &[u8], progressive: bool) -> Result<()> {
+    fn read_sof(&mut self, b: &[u8], progressive: bool, lossless: bool) -> Result<()> {
         if b.len() < 6 {
             return Err(Error::invalid("bad SOF"));
         }
-        if b[0] != 8 && b[0] != 12 {
+        let precisions = if lossless { 2..=16 } else { 8..=12 };
+        if !precisions.contains(&b[0]) || (!lossless && b[0] != 8 && b[0] != 12) {
             return Err(Error::unsupported(format!("{}-bit JPEG", b[0])));
         }
         self.precision = b[0];
+        self.lossless = lossless;
         let (h, w, nc) = (be16(b, 1)?, be16(b, 3)?, b[5] as usize);
         if w == 0 || h == 0 {
             return Err(Error::invalid("zero JPEG dimension (DNL not supported)"));
@@ -696,8 +741,10 @@ impl Decoder<'_> {
         }
         self.hmax = raw.iter().map(|c| c.1).max().unwrap();
         self.vmax = raw.iter().map(|c| c.2).max().unwrap();
-        self.mcus_x = w.div_ceil(8 * self.hmax);
-        self.mcus_y = h.div_ceil(8 * self.vmax);
+        // The data unit is an 8x8 block for DCT frames and a single sample for lossless ones.
+        let unit = if lossless { 1 } else { 8 };
+        self.mcus_x = w.div_ceil(unit * self.hmax);
+        self.mcus_y = h.div_ceil(unit * self.vmax);
         for (id, hs, vs, tq) in raw {
             let blocks_w = self.mcus_x * hs;
             let blocks_h = self.mcus_y * vs;
@@ -710,9 +757,10 @@ impl Decoder<'_> {
                 tq,
                 blocks_w,
                 blocks_h,
-                real_bw: cw.div_ceil(8),
-                real_bh: ch.div_ceil(8),
-                coefs: vec![0i16; blocks_w * blocks_h * 64],
+                real_bw: cw.div_ceil(unit),
+                real_bh: ch.div_ceil(unit),
+                coefs: if lossless { Vec::new() } else { vec![0i16; blocks_w * blocks_h * 64] },
+                samples: if lossless { vec![0u16; blocks_w * blocks_h] } else { Vec::new() },
             });
         }
         Ok(())
@@ -740,7 +788,21 @@ impl Decoder<'_> {
             sc.push(ScanComp { idx, dc: (t >> 4) as usize & 3, ac: (t & 15) as usize & 3 });
         }
         let t = &b[1 + 2 * ns..];
-        let p = if self.progressive {
+        let p = if self.lossless {
+            // Ss selects the predictor, Se is 0, Ah is 0 and Al is the point transform.
+            let sp =
+                ScanParams { ss: t[0] as usize, se: t[1] as usize, ah: (t[2] >> 4) as u32, al: (t[2] & 15) as u32 };
+            if !(1..=7).contains(&sp.ss) || sp.se != 0 || sp.ah != 0 || sp.al >= self.precision as u32 {
+                return Err(Error::invalid("bad lossless scan parameters"));
+            }
+            let used = (sp.ss as u8, sp.al);
+            match self.ll_params {
+                None => self.ll_params = Some(used),
+                Some(first) if first != used => self.ll_uniform = false,
+                Some(_) => {}
+            }
+            sp
+        } else if self.progressive {
             let sp =
                 ScanParams { ss: t[0] as usize, se: t[1] as usize, ah: (t[2] >> 4) as u32, al: (t[2] & 15) as u32 };
             if sp.ss > sp.se || sp.se > 63 || sp.al > 13 || (sp.ss == 0 && sp.se != 0) || (sp.ss > 0 && ns != 1) {
@@ -799,7 +861,61 @@ impl Decoder<'_> {
         Ok(dec.rd.pos)
     }
 
+    /// One lossless scan (T.81 Annex H): every sample is predicted from its left, upper and upper-left neighbours
+    /// and the difference to the prediction is Huffman coded.
+    fn decode_scan_lossless(&mut self, sc: &[ScanComp], p: ScanParams) -> Result<usize> {
+        let predictor = p.ss as u8;
+        let precision = self.precision as u32;
+        let mut tabs = Vec::new();
+        for s in sc {
+            tabs.push(self.dc_tabs[s.dc].clone().ok_or_else(|| Error::invalid("scan uses undefined huffman table"))?);
+        }
+        let mut br = BitReader::new(self.data, self.pos);
+        let interleaved = sc.len() > 1;
+        let (mcus_x, mcus_y) = if interleaved {
+            (self.mcus_x, self.mcus_y)
+        } else {
+            (self.comps[sc[0].idx].real_bw, self.comps[sc[0].idx].real_bh)
+        };
+        let total = mcus_x * mcus_y;
+        let ri = self.restart_interval;
+        // First sample row of the current restart interval, per component: that row is predicted from the left only.
+        let mut first_row = vec![0usize; sc.len()];
+        let start = 1i32 << (precision - p.al - 1);
+        for mcu in 0..total {
+            let (mx, my) = (mcu % mcus_x, mcu / mcus_x);
+            if ri > 0 && mcu > 0 && mcu % ri == 0 {
+                br.restart();
+                for (si, s) in sc.iter().enumerate() {
+                    first_row[si] = if interleaved { my * self.comps[s.idx].v } else { my };
+                }
+            }
+            for (si, s) in sc.iter().enumerate() {
+                let c = &mut self.comps[s.idx];
+                let (bh, bv) = if interleaved { (c.h, c.v) } else { (1, 1) };
+                for by in 0..bv {
+                    for bx in 0..bh {
+                        let (x, y) = (mx * bh + bx, my * bv + by);
+                        let stride = c.blocks_w;
+                        let pred = predict_sample(&c.samples, stride, x, y, first_row[si], predictor, start);
+                        let t = tabs[si].decode(&mut br)? as u32;
+                        let diff = match t {
+                            0..=15 => extend(br.bits(t), t),
+                            16 => 32768,
+                            _ => return Err(Error::invalid("bad lossless difference category")),
+                        };
+                        c.samples[y * stride + x] = ((pred + diff) & 0xFFFF) as u16;
+                    }
+                }
+            }
+        }
+        Ok(br.pos)
+    }
+
     fn decode_scan(&mut self, sc: &[ScanComp], p: ScanParams) -> Result<usize> {
+        if self.lossless {
+            return self.decode_scan_lossless(sc, p);
+        }
         if self.arith {
             return self.decode_scan_arith(sc, p);
         }
@@ -906,18 +1022,11 @@ impl Decoder<'_> {
         Ok(planes)
     }
 
-    /// 12-bit files: the same pipeline on 16-bit planes, delivered as a 16-bit image with the samples scaled to the
-    /// full 16-bit range (the top 4 bits are repeated into the bottom ones, so white stays white).
-    fn finish_wide(self) -> Result<Image> {
+    /// Bring every plane to full resolution.
+    fn upsample_planes<T: Sample>(&self, planes: &[(Vec<T>, usize)]) -> Result<Vec<Vec<T>>> {
         let (w, h) = (self.width, self.height);
-        if self.comps.len() == 4 {
-            return Err(Error::unsupported("12-bit CMYK JPEG"));
-        }
-        let bits = self.precision as u32;
-        let (center, max) = (1i32 << (bits - 1), (1i32 << bits) - 1);
-        let planes = self.idct_planes::<u16>(center, max)?;
-        let mut full: Vec<Vec<u16>> = Vec::new();
-        for (c, (plane, stride)) in self.comps.iter().zip(&planes) {
+        let mut full = Vec::new();
+        for (c, (plane, stride)) in self.comps.iter().zip(planes) {
             let cw = (w * c.h).div_ceil(self.hmax);
             let ch = (h * c.v).div_ceil(self.vmax);
             if !self.hmax.is_multiple_of(c.h) || !self.vmax.is_multiple_of(c.v) {
@@ -925,36 +1034,37 @@ impl Decoder<'_> {
             }
             full.push(upsample(plane, *stride, cw, ch, self.hmax / c.h, self.vmax / c.v, w, h));
         }
+        Ok(full)
+    }
+
+    /// 12-bit files: the same pipeline on 16-bit planes, delivered as a 16-bit image with the samples scaled to the
+    /// full 16-bit range (the top bits are repeated into the bottom ones, so white stays white).
+    fn finish_wide(self) -> Result<Image> {
+        let bits = self.precision as u32;
+        let (center, max) = (1i32 << (bits - 1), (1i32 << bits) - 1);
+        let planes = self.idct_planes::<u16>(center, max)?;
+        let full = self.upsample_planes(&planes)?;
+        let (w, h, adobe) = (self.width, self.height, self.adobe_transform);
+        let ids: Vec<u8> = self.comps.iter().map(|c| c.id).collect();
         let meta = build_meta(self.icc_parts, self.extras);
-        let widen = |v: i32| -> [u8; 2] { (((v << (16 - bits)) | (v >> (2 * bits - 16))) as u16).to_be_bytes() };
-        if full.len() == 1 {
-            let data = full[0].iter().flat_map(|&v| widen(v as i32)).collect();
-            let mut img = Image::new(w as u32, h as u32, ColorType::Gray, 16, data)?;
-            img.meta = meta;
-            return Ok(img);
-        }
-        let ids = [self.comps[0].id, self.comps[1].id, self.comps[2].id];
-        let rgb_direct = self.adobe_transform == Some(0) || (self.adobe_transform.is_none() && ids == *b"RGB");
-        let mut data = Vec::with_capacity(w * h * 6);
-        for i in 0..w * h {
-            let (a, b, c) = (full[0][i] as i32, full[1][i] as i32, full[2][i] as i32);
-            let px = if rgb_direct {
-                [a, b, c]
-            } else {
-                let (cb, cr) = (b - center, c - center);
-                [
-                    (a + ((91881 * cr + 32768) >> 16)).clamp(0, max),
-                    (a - ((22554 * cb + 46802 * cr + 32768) >> 16)).clamp(0, max),
-                    (a + ((116130 * cb + 32768) >> 16)).clamp(0, max),
-                ]
-            };
-            for v in px {
-                data.extend_from_slice(&widen(v));
-            }
-        }
-        let mut img = Image::new(w as u32, h as u32, ColorType::Rgb, 16, data)?;
-        img.meta = meta;
-        Ok(img)
+        samples_to_image(full, w, h, bits, adobe, &ids, meta)
+    }
+
+    /// Lossless files: the samples are already pixels (times 2^Pt); upsample and convert like any other.
+    fn finish_lossless(self) -> Result<Image> {
+        let bits = self.precision as u32;
+        let pt = self.ll_params.map_or(0, |p| p.1);
+        let max = (1u32 << bits) - 1;
+        let planes: Vec<(Vec<u16>, usize)> = self
+            .comps
+            .iter()
+            .map(|c| (c.samples.iter().map(|&v| ((v as u32) << pt).min(max) as u16).collect(), c.blocks_w))
+            .collect();
+        let full = self.upsample_planes(&planes)?;
+        let (w, h, adobe) = (self.width, self.height, self.adobe_transform);
+        let ids: Vec<u8> = self.comps.iter().map(|c| c.id).collect();
+        let meta = build_meta(self.icc_parts, self.extras);
+        samples_to_image(full, w, h, bits, adobe, &ids, meta)
     }
 
     fn finish(self) -> Result<Image> {
@@ -962,6 +1072,9 @@ impl Decoder<'_> {
             return Err(Error::invalid("JPEG contains no image data"));
         }
         let (w, h) = (self.width, self.height);
+        if self.lossless {
+            return self.finish_lossless();
+        }
         if self.precision != 8 {
             return self.finish_wide();
         }
@@ -1163,6 +1276,126 @@ fn decode_ac_refine(br: &mut BitReader, ac: &HuffDec, blk: &mut [i16], eobrun: &
         *eobrun -= 1;
     }
     Ok(())
+}
+
+// ---------------------------------------------------------------- lossless
+
+/// The prediction of sample (`x`, `y`) of a lossless component (Table H.1). The first row of a scan or restart
+/// interval is predicted from the left (the very first sample from `start`), the first sample of every other row from
+/// the one above, and the rest by the selected predictor. Nothing is clamped.
+pub(super) fn predict_sample(
+    s: &[u16],
+    stride: usize,
+    x: usize,
+    y: usize,
+    first_row: usize,
+    predictor: u8,
+    start: i32,
+) -> i32 {
+    let at = |xx: usize, yy: usize| s[yy * stride + xx] as i32;
+    if y == first_row {
+        return if x == 0 { start } else { at(x - 1, y) };
+    }
+    if x == 0 {
+        return at(0, y - 1);
+    }
+    let (a, b, c) = (at(x - 1, y), at(x, y - 1), at(x - 1, y - 1));
+    match predictor {
+        1 => a,
+        2 => b,
+        3 => c,
+        4 => a + b - c,
+        5 => a + ((b - c) >> 1),
+        6 => b + ((a - c) >> 1),
+        _ => (a + b) >> 1,
+    }
+}
+
+/// Scale a `bits`-bit sample to `out` bits so that the maximum stays the maximum.
+fn widen_sample(v: i32, bits: u32, out: u32) -> u32 {
+    let v = v as u32;
+    if bits == out {
+        v
+    } else if 2 * bits >= out {
+        (v << (out - bits)) | (v >> (2 * bits - out))
+    } else {
+        (v as u64 * ((1u64 << out) - 1) / ((1u64 << bits) - 1)) as u32
+    }
+}
+
+/// Turn full-resolution component planes of `bits`-bit samples into an image: 8-bit for up to 8 bits of precision,
+/// otherwise 16-bit, with the samples widened to the full range of the output depth.
+fn samples_to_image(
+    full: Vec<Vec<u16>>,
+    w: usize,
+    h: usize,
+    bits: u32,
+    adobe: Option<u8>,
+    ids: &[u8],
+    meta: Metadata,
+) -> Result<Image> {
+    let out = if bits <= 8 { 8 } else { 16 };
+    let (center, max) = (1i32 << (bits - 1), (1i32 << bits) - 1);
+    let mut data: Vec<u8> = Vec::with_capacity(w * h * 3 * (out as usize / 8));
+    let mut put = |v: i32| {
+        let v = widen_sample(v, bits, out);
+        if out == 8 {
+            data.push(v as u8);
+        } else {
+            data.extend_from_slice(&(v as u16).to_be_bytes());
+        }
+    };
+    let color = match full.len() {
+        1 => {
+            full[0].iter().for_each(|&v| put(v as i32));
+            ColorType::Gray
+        }
+        3 => {
+            let rgb_direct = adobe == Some(0) || (adobe.is_none() && ids == b"RGB");
+            for i in 0..w * h {
+                let (a, b, c) = (full[0][i] as i32, full[1][i] as i32, full[2][i] as i32);
+                if rgb_direct {
+                    [a, b, c].into_iter().for_each(&mut put);
+                } else {
+                    let (cb, cr) = (b - center, c - center);
+                    [
+                        (a + ((91881 * cr + 32768) >> 16)).clamp(0, max),
+                        (a - ((22554 * cb + 46802 * cr + 32768) >> 16)).clamp(0, max),
+                        (a + ((116130 * cb + 32768) >> 16)).clamp(0, max),
+                    ]
+                    .into_iter()
+                    .for_each(&mut put);
+                }
+            }
+            ColorType::Rgb
+        }
+        4 => {
+            // An Adobe marker means the values are the light each ink lets through (max = no ink), transform 2 that
+            // the first three planes are YCC-coded; without a marker they are ink amounts.
+            let inverted = adobe.is_some();
+            let ycck = adobe == Some(2);
+            for i in 0..w * h {
+                let (mut c, mut m, mut y) = (full[0][i] as i32, full[1][i] as i32, full[2][i] as i32);
+                let k = full[3][i] as i32;
+                if ycck {
+                    let (yy, cb, cr) = (c, m - center, y - center);
+                    let r = (yy + ((91881 * cr + 32768) >> 16)).clamp(0, max);
+                    let g = (yy - ((22554 * cb + 46802 * cr + 32768) >> 16)).clamp(0, max);
+                    let b = (yy + ((116130 * cb + 32768) >> 16)).clamp(0, max);
+                    (c, m, y) = (max - r, max - g, max - b);
+                }
+                for v in [c, m, y] {
+                    let (light_v, light_k) = if inverted { (v, k) } else { (max - v, max - k) };
+                    put(((light_v as i64 * light_k as i64 + max as i64 / 2) / max as i64) as i32);
+                }
+            }
+            ColorType::Rgb
+        }
+        n => return Err(Error::unsupported(format!("{n}-component JPEG"))),
+    };
+    let mut img = Image::new(w as u32, h as u32, color, out as u8, data)?;
+    img.meta = meta;
+    Ok(img)
 }
 
 // ---------------------------------------------------------------- upsampling

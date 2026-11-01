@@ -148,7 +148,10 @@ fn diff12(name: &str) -> (f64, f64) {
 
 #[test]
 fn twelve_bit_files_decode_like_libjpeg_turbo() {
-    for name in ["jpeg12_gray", "jpeg12_444", "jpeg12_420", "jpeg12_422"] {
+    // Gray, three components in three samplings, and the four CMYK/YCCK variants (plain, Adobe, Adobe YCC-coded).
+    for name in
+        ["jpeg12_gray", "jpeg12_444", "jpeg12_420", "jpeg12_422", "jpeg12_cmyk", "jpeg12_cmyk_adobe", "jpeg12_ycck"]
+    {
         let (max, mean) = diff12(name);
         eprintln!("{name}: max {max} levels, mean {mean:.3} levels (of 4095)");
         // Float versus integer IDCT, and chroma upsampling rounding: a few levels in 4096 at most.

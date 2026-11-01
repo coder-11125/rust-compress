@@ -45,10 +45,17 @@ const JPEGS: &[&str] = &[
     "arith_cond.jpg",
     "arith_gray.jpg",
     "arith_cmyk.jpg",
-    // 12-bit.
+    // 12-bit, including CMYK.
     "jpeg12_gray.jpg",
     "jpeg12_444.jpg",
     "jpeg12_420.jpg",
+    "jpeg12_cmyk.jpg",
+    "jpeg12_ycck.jpg",
+    // Lossless.
+    "lossless_gray_p8_pred1.jpg",
+    "lossless_gray_p16_pred7.jpg",
+    "lossless_rgb_p12_pred6.jpg",
+    "lossless_cmyk_p8_pred2.jpg",
 ];
 
 /// Small deterministic generator so failures are reproducible from the printed seed.

@@ -581,6 +581,40 @@ pub fn write_jpeg(ci: &CoefImage) -> Vec<u8> {
     out
 }
 
+/// EXIF, XMP, other kept segments and the ICC profile, as application segments. A segment holds at most 65533
+/// bytes; anything larger (an EXIF block with a big thumbnail, say) cannot be carried.
+pub(super) fn write_metadata(out: &mut Vec<u8>, meta: &Metadata) {
+    // Descriptive metadata (only present when the caller asked to keep it). A segment holds at most
+    // 65533 bytes; anything larger (an EXIF block with a big thumbnail, say) cannot be carried.
+    let fits = |body: &[u8]| body.len() <= 65533;
+    if let Some(exif) = &meta.exif {
+        let body = [&b"Exif\0\0"[..], exif].concat();
+        if fits(&body) {
+            segment(out, 0xE1, &body);
+        }
+    }
+    if let Some(xmp) = &meta.xmp {
+        let body = [&b"http://ns.adobe.com/xap/1.0/\0"[..], xmp].concat();
+        if fits(&body) {
+            segment(out, 0xE1, &body);
+        }
+    }
+    for (marker, body) in &meta.jpeg_extra {
+        if fits(body) {
+            segment(out, *marker, body);
+        }
+    }
+    if let Some(icc) = &meta.icc {
+        let chunks: Vec<&[u8]> = icc.chunks(65519).collect();
+        for (i, c) in chunks.iter().enumerate() {
+            let mut body = b"ICC_PROFILE\0".to_vec();
+            body.extend_from_slice(&[(i + 1) as u8, chunks.len() as u8]);
+            body.extend_from_slice(c);
+            segment(out, 0xE2, &body);
+        }
+    }
+}
+
 /// SOI, JFIF, ICC, DQT and SOF segments. `sof` is 0xC0 (baseline) or 0xC2 (progressive).
 pub(super) fn write_headers(ci: &CoefImage, sof_marker: u8, capacity: usize) -> Vec<u8> {
     let comps = &ci.comps;
@@ -592,35 +626,7 @@ pub(super) fn write_headers(ci: &CoefImage, sof_marker: u8, capacity: usize) -> 
         // "Adobe", version 100, two flag words, colour transform.
         segment(&mut out, 0xEE, &[b'A', b'd', b'o', b'b', b'e', 0, 100, 0, 0, 0, 0, t]);
     }
-    // Descriptive metadata (only present when the caller asked to keep it). A segment holds at most
-    // 65533 bytes; anything larger (an EXIF block with a big thumbnail, say) cannot be carried.
-    let fits = |body: &[u8]| body.len() <= 65533;
-    if let Some(exif) = &ci.meta.exif {
-        let body = [&b"Exif\0\0"[..], exif].concat();
-        if fits(&body) {
-            segment(&mut out, 0xE1, &body);
-        }
-    }
-    if let Some(xmp) = &ci.meta.xmp {
-        let body = [&b"http://ns.adobe.com/xap/1.0/\0"[..], xmp].concat();
-        if fits(&body) {
-            segment(&mut out, 0xE1, &body);
-        }
-    }
-    for (marker, body) in &ci.meta.jpeg_extra {
-        if fits(body) {
-            segment(&mut out, *marker, body);
-        }
-    }
-    if let Some(icc) = &ci.meta.icc {
-        let chunks: Vec<&[u8]> = icc.chunks(65519).collect();
-        for (i, c) in chunks.iter().enumerate() {
-            let mut body = b"ICC_PROFILE\0".to_vec();
-            body.extend_from_slice(&[(i + 1) as u8, chunks.len() as u8]);
-            body.extend_from_slice(c);
-            segment(&mut out, 0xE2, &body);
-        }
-    }
+    write_metadata(&mut out, &ci.meta);
     let mut dqt = Vec::new();
     for (slot, q) in ci.qtables.iter().enumerate() {
         if let Some(q) = q {

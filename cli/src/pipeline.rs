@@ -183,8 +183,29 @@ fn jpeg_to_jpeg(data: &[u8], cli: &Cli) -> Result<Encoded> {
             SubsamplingArg::S420 => !is420,
             SubsamplingArg::S444 => !is444,
         };
+    // A lossless JPEG stays lossless: the same samples, recoded with the cheapest predictor and optimized tables.
+    // Changing the pixels (resizing, an orientation to bake in) or asking for `--lossy` leaves that route.
+    if info.lossless && !cli.lossy && !resizing && orientation == 1 {
+        let recoded = parsed.lossless_frame().and_then(|mut frame| {
+            apply_metadata_policy(&mut frame.meta, cli);
+            frame.write(&jpeg::lossless::LosslessOptions::default())
+        });
+        return Ok(match recoded {
+            Ok(r) => Encoded {
+                bytes: r.bytes,
+                note: Some(format!("lossless JPEG, predictor {}", r.predictor)),
+                forced: false,
+            },
+            // A structure that cannot be recoded here (arithmetic coding, mixed predictors) is kept as it is.
+            Err(_) => Encoded {
+                bytes: data.to_vec(),
+                note: Some("lossless JPEG left unchanged (use --lossy to re-encode)".into()),
+                forced: false,
+            },
+        });
+    }
     // 12-bit files have no DCT-domain path: they are decoded to 16-bit pixels and written as 8-bit JPEG.
-    if orientation == 1 && !resample && !info.coded_rgb && !resizing && info.precision == 8 {
+    if orientation == 1 && !resample && !info.coded_rgb && !resizing && info.precision == 8 && !info.lossless {
         let mut ci = parsed.into_coefs()?;
         apply_metadata_policy(&mut ci.meta, cli);
         if let Some(target) = cli.target_ssim {
@@ -222,7 +243,9 @@ fn jpeg_to_jpeg(data: &[u8], cli: &Cli) -> Result<Encoded> {
     apply_metadata_policy(&mut img.meta, cli);
     let (img, resized) = resize_image(img, cli);
     let mut encoded = encode_jpeg_pixels(&img, cli, effective_q, arithmetic)?;
-    if info.precision == 12 {
+    if info.lossless {
+        add_note(&mut encoded, "lossless JPEG re-encoded as lossy");
+    } else if info.precision == 12 {
         add_note(&mut encoded, "12-bit reduced to 8-bit");
     }
     encoded.forced |= arithmetic != info.arithmetic;

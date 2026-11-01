@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Lossless JPEG (SOF3, Huffman): decoded exactly at 2 to 16 bits (gray, colour, CMYK; predictors 1-7; point transform;
+  restart intervals; subsampled components) and recoded without changing a sample, trying all seven predictors and
+  optimizing the Huffman tables: 4.2% smaller on nine photo-based files (0% to 15.4%). A lossless JPEG stays lossless
+  unless `--lossy` or `--resize` is given; `-f png` keeps the precision. Verified against libjpeg-turbo's lossless
+  encoder and decoder (12 reference files; 119 recoded files decode to the original samples).
+- 12-bit CMYK and YCCK JPEG decoding (plain, Adobe, Adobe YCC-coded); matches libjpeg-turbo within 1-2 levels of 4095.
 - JPEG arithmetic coding: SOF9 (sequential) and SOF10 (progressive) files are decoded and written, including restart
   intervals and non-default `DAC` conditioning. `--arithmetic auto|on|off` picks the output coding: `auto` (default)
   keeps an arithmetic-coded source arithmetic-coded and writes Huffman otherwise, `on` converts any JPEG losslessly,

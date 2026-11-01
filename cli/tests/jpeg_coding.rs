@@ -132,3 +132,61 @@ fn damaged_arithmetic_and_twelve_bit_files_fail_cleanly_through_the_cli() {
         }
     }
 }
+
+#[test]
+fn twelve_bit_cmyk_converts_to_16_bit_png() {
+    for name in ["jpeg12_cmyk", "jpeg12_cmyk_adobe", "jpeg12_ycck"] {
+        let d = tempdir().unwrap();
+        let input = d.path().join(format!("{name}.jpg"));
+        fs::write(&input, fixture(&format!("{name}.jpg"))).unwrap();
+        let out = d.path().join("o.png");
+        cmd().arg(&input).args(["-f", "png", "-o"]).arg(&out).assert().success();
+        let (w, h, got) = reference_rgba16(&fs::read(&out).unwrap());
+        let (ew, eh, want) = reference_rgba16(&fixture(&format!("{name}.expected.png")));
+        assert_eq!((w, h), (ew, eh), "{name}");
+        let worst = got.iter().zip(&want).map(|(&a, &b)| ((a >> 4) as i32 - (b >> 4) as i32).abs()).max().unwrap();
+        assert!(worst <= 3, "{name}: worst difference {worst} levels of 4095");
+    }
+}
+
+#[test]
+fn lossless_jpeg_stays_lossless_and_gets_smaller() {
+    for name in
+        ["lossless_gray_p8_pred1", "lossless_gray_p16_pred7", "lossless_rgb_p12_pred6", "lossless_cmyk_p8_pred2"]
+    {
+        let src = fixture(&format!("{name}.jpg"));
+        let (out, log) = run(&format!("{name}.jpg"), &[]);
+        assert!(log.contains("lossless JPEG"), "{name}: {log}");
+        assert!(out.len() <= src.len(), "{name}: {} > {}", out.len(), src.len());
+        let info = jpeg::decode::parse(&out).unwrap().info();
+        assert!(info.lossless, "{name}: output must still be a lossless JPEG");
+        // Same samples, bit for bit.
+        assert_eq!(jpeg::decode::decode(&out).unwrap(), jpeg::decode::decode(&src).unwrap(), "{name}");
+    }
+}
+
+#[test]
+fn lossless_jpeg_converts_to_png_without_losing_a_bit() {
+    for name in ["lossless_gray_p16_pred7", "lossless_rgb_p12_pred6", "lossless_gray_p2_pred2"] {
+        let d = tempdir().unwrap();
+        let input = d.path().join(format!("{name}.jpg"));
+        fs::write(&input, fixture(&format!("{name}.jpg"))).unwrap();
+        let out = d.path().join("o.png");
+        cmd().arg(&input).args(["-f", "png", "-o"]).arg(&out).assert().success();
+        let (_, _, got) = reference_rgba16(&fs::read(&out).unwrap());
+        let (_, _, want) = reference_rgba16(&fixture(&format!("{name}.expected.png")));
+        assert!(got == want, "{name}: PNG differs from the lossless samples");
+    }
+}
+
+#[test]
+fn lossless_jpeg_can_be_made_lossy_on_request() {
+    let src = fixture("lossless_rgb_p8_pred4.jpg");
+    let (out, log) = run("lossless_rgb_p8_pred4.jpg", &["--lossy", "-q", "60"]);
+    assert!(log.contains("lossless JPEG re-encoded as lossy"), "{log}");
+    assert!(!jpeg::decode::parse(&out).unwrap().info().lossless);
+    assert!(out.len() < src.len());
+    // Resizing also leaves the lossless route, since the samples have to change.
+    let (resized, _) = run("lossless_rgb_p8_pred4.jpg", &["--resize", "50%"]);
+    assert!(!jpeg::decode::parse(&resized).unwrap().info().lossless);
+}
