@@ -33,3 +33,14 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --workspace --locked --lib --tests
+
+  # The fuzz crate is outside the workspace, so make sure its harnesses keep compiling.
+  fuzz-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: fuzz
+      - run: cargo check --manifest-path fuzz/Cargo.toml --bins --locked

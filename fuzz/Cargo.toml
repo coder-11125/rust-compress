@@ -1,0 +1,83 @@
+[package]
+name = "rust-compress-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+rc-core = { path = "../core" }
+rc-deflate = { path = "../deflate" }
+rc-png = { path = "../png" }
+rc-jpeg = { path = "../jpeg" }
+rc-webp = { path = "../webp" }
+rc-gif = { path = "../gif" }
+rc-avif = { path = "../avif" }
+
+# Kept out of the main workspace so `cargo build --workspace --locked` never needs libfuzzer-sys.
+[workspace]
+
+[profile.release]
+debug = 1
+# libFuzzer needs the arithmetic-overflow and bounds checks the codecs rely on to be live.
+overflow-checks = true
+debug-assertions = true
+
+[[bin]]
+name = "inflate"
+path = "fuzz_targets/inflate.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "png"
+path = "fuzz_targets/png.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "jpeg_decode"
+path = "fuzz_targets/jpeg_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "jpeg_coefs"
+path = "fuzz_targets/jpeg_coefs.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "webp"
+path = "fuzz_targets/webp.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "gif"
+path = "fuzz_targets/gif.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "avif"
+path = "fuzz_targets/avif.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "av1_obu"
+path = "fuzz_targets/av1_obu.rs"
+test = false
+doc = false
+bench = false

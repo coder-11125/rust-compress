@@ -1,0 +1,13 @@
+# Copy this directory to projects/rust-compress/ in https://github.com/google/oss-fuzz.
+homepage: "https://github.com/coder-11125/rust-compress"
+language: rust
+# TODO before submitting: an address that can receive crash reports. OSS-Fuzz emails it, and
+# for Google accounts it also grants access to the private bug reports.
+primary_contact: "CHANGE_ME@example.com"
+main_repo: "https://github.com/coder-11125/rust-compress"
+sanitizers:
+  - address
+fuzzing_engines:
+  - libfuzzer
+architectures:
+  - x86_64
