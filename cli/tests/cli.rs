@@ -147,3 +147,16 @@ fn target_ssim_picks_a_quality_and_reports_it() {
     cmd().arg(&input).args(["--target-ssim", "1.5"]).assert().failure();
     cmd().arg(&input).args(["--target-ssim", "0"]).assert().failure();
 }
+
+#[test]
+fn running_without_arguments_shows_the_full_usage_including_update() {
+    let out = cmd().assert().failure().code(2).get_output().clone();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("required arguments were not provided"), "{err}");
+    assert!(err.contains("rc [OPTIONS] <INPUT>..."), "{err}");
+    assert!(err.contains("rc update [OPTIONS]"), "{err}");
+    // --help and the error agree about how the tool is used.
+    let help = cmd().arg("--help").assert().success().get_output().clone();
+    let help = String::from_utf8_lossy(&help.stdout);
+    assert!(help.contains("rc [OPTIONS] <INPUT>...") && help.contains("rc update [OPTIONS]"), "{help}");
+}

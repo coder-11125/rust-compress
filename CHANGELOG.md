@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- Running `rc` with no arguments now prints the full usage (`rc [OPTIONS] <INPUT>...` and `rc update [OPTIONS]`), the
+  same as `--help`. The error used to show only `rc <INPUT>...`, which hid both the options and the `update` command.
+
 ## 0.2.0 - 02-11-2026
 
 - Hierarchical JPEG decoding is now cross-checked against the JPEG committee's reference libjpeg (Richter's, via

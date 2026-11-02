@@ -51,7 +51,16 @@ pub enum Command {
 
 /// Fast, high-quality image compression (PNG and JPEG) with a from-scratch engine.
 #[derive(Parser, Debug)]
-#[command(name = "rc", version, about, args_conflicts_with_subcommands = true, subcommand_negates_reqs = true)]
+#[command(
+    name = "rc",
+    version,
+    about,
+    args_conflicts_with_subcommands = true,
+    subcommand_negates_reqs = true,
+    // Stated outright: clap's error messages otherwise list only the required arguments, which hides the options and
+    // the `update` subcommand from anyone who just typed `rc`.
+    override_usage = "rc [OPTIONS] <INPUT>...\n       rc update [OPTIONS]"
+)]
 pub struct Cli {
     #[command(subcommand)]
     pub command: Option<Command>,
