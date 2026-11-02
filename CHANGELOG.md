@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.2.0 - 02-11-2026
 
 - Hierarchical JPEG decoding is now cross-checked against the JPEG committee's reference libjpeg (Richter's, via
   `pylibjpeg-libjpeg`) on a matrix of more than a hundred streams, which found and fixed three defects: the
