@@ -20,3 +20,6 @@ Run one locally (needs nightly and `cargo install cargo-fuzz`):
 with a seed directory such as `fixtures/`. A crash reproduces with `cargo +nightly fuzz run <target> <crash-file>`.
 
 `oss-fuzz/` holds the project files for continuous fuzzing on Google's OSS-Fuzz.
+
+`.clusterfuzzlite/` and the `cflite_*.yml` workflows run the same targets in GitHub Actions: ten minutes on pull
+requests that touch a codec, a long batch run twice a day, and a weekly corpus prune.
