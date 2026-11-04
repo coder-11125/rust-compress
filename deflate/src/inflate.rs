@@ -236,9 +236,15 @@ pub fn stream_stats(data: &[u8]) -> Result<StreamStats> {
                 break;
             }
             let li = sym - 257;
+            if li >= 29 {
+                return Err(Error::invalid("bad length symbol"));
+            }
             let len = LEN_BASE[li] as usize + r.take(LEN_EXTRA[li] as u32) as usize;
             r.refill();
             let ds = dist.decode(&mut r)? as usize;
+            if ds >= 30 {
+                return Err(Error::invalid("bad distance symbol"));
+            }
             let d = DIST_BASE[ds] as usize + r.take(DIST_EXTRA[ds] as u32) as usize;
             st.matches += 1;
             st.match_bytes += len as u64;
@@ -266,4 +272,26 @@ pub fn stream_stats(data: &[u8]) -> Result<StreamStats> {
     }
     let _ = out_len;
     Ok(st)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Found by fuzzing: fixed-Huffman blocks can decode the reserved length symbols 286 and 287 and
+    // the reserved distance symbols 30 and 31. Every reader must reject them, not index past the tables.
+    const RESERVED_LENGTH_SYMBOL: &[u8] =
+        &[0x8b, 0x5c, 0x50, 0xb2, 0x60, 0xce, 0x38, 0x00, 0xfd, 0x64, 0xb8, 0xb0, 0x63, 0x00];
+    const RESERVED_LENGTH_SYMBOL_2: &[u8] = &[
+        0x8b, 0xb0, 0x4d, 0x02, 0x9f, 0x9f, 0xca, 0xa6, 0x47, 0xa5, 0xa5, 0xa5, 0xa5, 0xa5, 0xa5, 0xa5, 0xa5, 0xa5,
+        0xa5, 0xa5, 0xa5, 0xa5, 0xa5, 0xa5, 0xa5, 0xa1, 0xa5, 0x63,
+    ];
+
+    #[test]
+    fn stream_stats_rejects_reserved_symbols_instead_of_panicking() {
+        for input in [RESERVED_LENGTH_SYMBOL, RESERVED_LENGTH_SYMBOL_2] {
+            assert!(stream_stats(input).is_err());
+            assert!(inflate(input, 0, 1 << 20).is_err());
+        }
+    }
 }
