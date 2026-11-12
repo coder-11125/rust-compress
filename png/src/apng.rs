@@ -2,6 +2,7 @@
 //! rebuilt single-frame file, then composited with the frame's dispose and blend operations.
 
 use super::SIGNATURE;
+use super::encode::{EncodeOptions, idat_for_rows};
 use rc_core::animation::{AnimFrame, Animation, MAX_ANIMATION_PIXELS, normalize_delay};
 use rc_core::error::{Error, Result};
 use rc_core::image::{ColorType, Image, MAX_PIXELS};
@@ -209,4 +210,156 @@ fn finish(rgba: Vec<u8>, w: usize, h: usize, opaque_ok: bool) -> Result<Image> {
     } else {
         Image::new(w as u32, h as u32, ColorType::Rgba, 8, rgba)
     }
+}
+
+/// APNG stores the delay as `delay_num / delay_den` seconds with both fields 16-bit. Millisecond delays up to
+/// 65535 fit directly; longer ones (GIF can name 655.35 s) need a smaller denominator. The search below picks a
+/// denominator whose numerator still fits and whose integer-millisecond decode is exact when one exists.
+fn delay_ratio(ms: u32) -> (u16, u16) {
+    const MAX_MS: u64 = (u16::MAX as u64) * 1000;
+    let ms = u64::from(ms).min(MAX_MS);
+    if ms <= u64::from(u16::MAX) {
+        return (ms as u16, 1000);
+    }
+    for den in (1..=999u16).rev() {
+        let den = u64::from(den);
+        let num = (ms * den).div_ceil(1000);
+        if num > u64::from(u16::MAX) {
+            continue;
+        }
+        if num * 1000 / den == ms {
+            return (num as u16, den as u16);
+        }
+    }
+    let den = ((u64::from(u16::MAX) * 1000) / ms).max(1) as u16;
+    let num = ((ms * u64::from(den) + 500) / 1000).min(u64::from(u16::MAX)) as u16;
+    (num, den)
+}
+
+fn frame_ctl(seq: u32, w: u32, h: u32, delay_ms: u32) -> Vec<u8> {
+    let mut b = Vec::with_capacity(26);
+    b.extend_from_slice(&seq.to_be_bytes());
+    b.extend_from_slice(&w.to_be_bytes());
+    b.extend_from_slice(&h.to_be_bytes());
+    b.extend_from_slice(&0u32.to_be_bytes());
+    b.extend_from_slice(&0u32.to_be_bytes());
+    let (num, den) = delay_ratio(delay_ms);
+    b.extend_from_slice(&num.to_be_bytes());
+    b.extend_from_slice(&den.to_be_bytes());
+    b.push(0); // APNG_DISPOSE_OP_NONE: the next frame covers the whole canvas anyway.
+    b.push(0); // APNG_BLEND_OP_SOURCE: every frame is a complete canvas.
+    b
+}
+
+/// Normalize a frame to 8-bit RGB or RGBA, whichever the animation uses for every frame.
+fn normalize(img: &Image, alpha: bool) -> Image {
+    let src = img.to_depth8();
+    let ch = src.color.channels();
+    let mut data = Vec::with_capacity(src.data.len() / ch * if alpha { 4 } else { 3 });
+    for p in src.data.chunks_exact(ch) {
+        let (r, g, b, a) = match src.color {
+            ColorType::Gray => (p[0], p[0], p[0], 255),
+            ColorType::GrayAlpha => (p[0], p[0], p[0], p[1]),
+            ColorType::Rgb => (p[0], p[1], p[2], 255),
+            ColorType::Rgba => (p[0], p[1], p[2], p[3]),
+        };
+        if alpha {
+            data.extend_from_slice(&[r, g, b, a]);
+        } else {
+            data.extend_from_slice(&[r, g, b]);
+        }
+    }
+    let color = if alpha { ColorType::Rgba } else { ColorType::Rgb };
+    Image::new(src.width, src.height, color, 8, data).expect("normalized frame has the right size")
+}
+
+/// Rewrite the colour of fully transparent pixels so they compress well (the decoder composites them away).
+fn clean_transparent(img: &mut Image) {
+    let (w, h) = (img.width as usize, img.height as usize);
+    for y in 0..h {
+        for x in 0..w {
+            let i = (y * w + x) * 4;
+            if img.data[i + 3] != 0 {
+                continue;
+            }
+            let src = if x > 0 {
+                Some(i - 4)
+            } else if y > 0 {
+                Some(i - w * 4)
+            } else {
+                None
+            };
+            for c in 0..3 {
+                img.data[i + c] = src.map_or(0, |s| img.data[s + c]);
+            }
+        }
+    }
+}
+
+/// Encode an animation as an APNG. Every frame is stored as a complete canvas (no dirty rectangles yet), so
+/// blend is always SOURCE; `clean_alpha` rewrites the invisible colour of fully transparent pixels.
+pub fn encode_animation(anim: &Animation, opts: &EncodeOptions) -> Result<Vec<u8>> {
+    let (w, h) = (anim.width, anim.height);
+    if anim.frames.is_empty() {
+        return Err(Error::invalid("animation without frames"));
+    }
+    if w == 0 || h == 0 || w > i32::MAX as u32 || h > i32::MAX as u32 {
+        return Err(Error::unsupported("APNG dimensions are limited to 2147483647 pixels per side"));
+    }
+    if (anim.frames.len() as u64) * (w as u64) * (h as u64) > MAX_ANIMATION_PIXELS {
+        return Err(Error::unsupported("APNG animation too large"));
+    }
+    for f in &anim.frames {
+        if (f.image.width, f.image.height) != (w, h) {
+            return Err(Error::invalid("animation frames differ in size"));
+        }
+    }
+    let alpha = anim.frames.iter().any(|f| f.image.color.has_alpha());
+    let color_type = if alpha { 6 } else { 2 };
+    let ch = if alpha { 4 } else { 3 };
+    let row_bytes = w as usize * ch;
+
+    let mut idats = Vec::with_capacity(anim.frames.len());
+    for f in &anim.frames {
+        let mut img = normalize(&f.image, alpha);
+        if alpha && opts.clean_alpha {
+            clean_transparent(&mut img);
+        }
+        idats.push(idat_for_rows(&img.data, row_bytes, ch, 8, color_type, opts.level));
+    }
+
+    let mut out = SIGNATURE.to_vec();
+    let mut ihdr = Vec::with_capacity(13);
+    ihdr.extend_from_slice(&w.to_be_bytes());
+    ihdr.extend_from_slice(&h.to_be_bytes());
+    ihdr.extend_from_slice(&[8, color_type, 0, 0, 0]);
+    push_chunk(&mut out, b"IHDR", &ihdr);
+
+    let mut actl = Vec::with_capacity(8);
+    actl.extend_from_slice(&(anim.frames.len() as u32).to_be_bytes());
+    actl.extend_from_slice(&(if anim.loop_forever { 0u32 } else { 1u32 }).to_be_bytes());
+    push_chunk(&mut out, b"acTL", &actl);
+
+    // APNG sequence numbers count fcTL and fdAT chunks, not frames: every chunk after acTL
+    // takes the next number, while IDAT has no sequence number.
+    let mut seq = 0u32;
+    for (i, (f, idat)) in anim.frames.iter().zip(idats).enumerate() {
+        push_chunk(&mut out, b"fcTL", &frame_ctl(seq, w, h, normalize_delay(f.duration_ms)));
+        seq += 1;
+        if i == 0 {
+            for chunk in idat.chunks(1 << 20) {
+                push_chunk(&mut out, b"IDAT", chunk);
+            }
+        } else {
+            for chunk in idat.chunks(1 << 20) {
+                let mut body = Vec::with_capacity(4 + chunk.len());
+                body.extend_from_slice(&seq.to_be_bytes());
+                body.extend_from_slice(chunk);
+                push_chunk(&mut out, b"fdAT", &body);
+                seq += 1;
+            }
+        }
+    }
+    push_chunk(&mut out, b"IEND", &[]);
+    Ok(out)
 }

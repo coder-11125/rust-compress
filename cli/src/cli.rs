@@ -5,6 +5,7 @@ use std::path::PathBuf;
 pub enum FormatArg {
     /// Keep each file's own format.
     Keep,
+    /// PNG stills; animated inputs are written as APNG.
     Png,
     Jpeg,
     /// Lossless WebP.

@@ -414,7 +414,7 @@ fn run(job: &Job, cli: &Cli, data: &[u8]) -> Result<(Status, u64, Option<String>
         }
         return Ok((Status::NoGain, data.len() as u64, Some(note.into())));
     }
-    let animation = if matches!(out_fmt, Format::Avif | Format::Gif | Format::Webp) {
+    let animation = if matches!(out_fmt, Format::Avif | Format::Gif | Format::Webp | Format::Png) {
         decode_animation(data, in_fmt)?
     } else {
         None
@@ -508,6 +508,15 @@ fn animation_to(mut anim: Animation, in_fmt: Format, out_fmt: Format, cli: &Cli)
             };
             webp::encode_animation(&anim, &opts)?.into()
         }
+        Format::Png => {
+            if cli.lossy {
+                for f in &mut anim.frames {
+                    f.image = png::quant::quantize(&f.image, cli.colors as usize, 0.0);
+                }
+            }
+            let opts = png::encode::EncodeOptions { level: cli.level as u32, clean_alpha: !cli.keep_hidden_pixels };
+            png::apng::encode_animation(&anim, &opts)?.into()
+        }
         Format::Gif => {
             let opts = gif_options(cli);
             if in_fmt == Format::Gif && !cli.lossy && resized.is_none() && !gif::palette_is_exact(&anim, opts.colors) {
@@ -515,8 +524,8 @@ fn animation_to(mut anim: Animation, in_fmt: Format, out_fmt: Format, cli: &Cli)
             }
             gif::encode_animation(&anim, &opts)?.into()
         }
-        Format::Png | Format::Jpeg => {
-            return Err(Error::unsupported("animations can be written as AVIF, WebP or GIF"));
+        Format::Jpeg => {
+            return Err(Error::unsupported("animations can be written as AVIF, WebP, GIF or PNG"));
         }
     };
     encoded.note = Some(format!("{n} frames"));

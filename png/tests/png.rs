@@ -179,3 +179,86 @@ fn animated_png_is_refused_instead_of_flattened() {
     let err = decode(&png).unwrap_err().to_string();
     assert!(err.contains("APNG"), "{err}");
 }
+
+fn anim_frame(w: u32, h: u32, color: rc_core::image::ColorType, t: u32) -> rc_core::image::Image {
+    let ch = color.channels();
+    let mut data = Vec::new();
+    for y in 0..h {
+        for x in 0..w {
+            for c in 0..ch {
+                let v = (x * 5 + y * 11 + t * 17 + c as u32 * 29) % 256;
+                data.push(if color.has_alpha() && c == ch - 1 {
+                    [255, 128, 0][(x + y + t) as usize % 3]
+                } else {
+                    v as u8
+                });
+            }
+        }
+    }
+    rc_core::image::Image::new(w, h, color, 8, data).unwrap()
+}
+
+#[test]
+fn apng_encode_round_trips_frames_timing_and_looping() {
+    use rc_core::animation::{AnimFrame, Animation};
+    use rc_core::image::ColorType;
+    for (color, looping) in [(ColorType::Rgb, true), (ColorType::Rgba, false)] {
+        let frames =
+            (0..4).map(|t| AnimFrame { image: anim_frame(9, 7, color, t), duration_ms: 30 + 20 * t }).collect();
+        let anim = Animation { width: 9, height: 7, frames, loop_forever: looping };
+        let bytes = rc_png::apng::encode_animation(&anim, &EncodeOptions { level: 7, clean_alpha: false }).unwrap();
+        assert!(rc_png::is_animated(&bytes));
+        let back = rc_png::apng::decode_animation(&bytes).unwrap();
+        assert_eq!((back.width, back.height), (anim.width, anim.height), "{color:?}");
+        assert_eq!(back.frames.len(), anim.frames.len(), "{color:?}");
+        assert_eq!(back.loop_forever, looping, "{color:?}");
+        for (i, (a, b)) in anim.frames.iter().zip(&back.frames).enumerate() {
+            assert_eq!(a.duration_ms, b.duration_ms, "{color:?} frame {i}");
+            assert_eq!(to_rgba16(&a.image), to_rgba16(&b.image), "{color:?} frame {i}");
+        }
+    }
+}
+
+#[test]
+fn apng_long_delays_survive() {
+    use rc_core::animation::{AnimFrame, Animation};
+    use rc_core::image::ColorType;
+    let durations = [655_350, 120_000, 20];
+    let frames = durations
+        .iter()
+        .enumerate()
+        .map(|(t, &ms)| AnimFrame { image: anim_frame(4, 3, ColorType::Rgb, t as u32), duration_ms: ms })
+        .collect();
+    let anim = Animation { width: 4, height: 3, frames, loop_forever: false };
+    let bytes = rc_png::apng::encode_animation(&anim, &EncodeOptions::default()).unwrap();
+    let back = rc_png::apng::decode_animation(&bytes).unwrap();
+    assert_eq!(back.frames.iter().map(|f| f.duration_ms).collect::<Vec<_>>(), durations);
+}
+
+#[test]
+fn apng_sequence_numbers_count_fctl_and_fdat_chunks() {
+    use rc_core::animation::{AnimFrame, Animation};
+    use rc_core::image::ColorType;
+    let frames = (0..3).map(|t| AnimFrame { image: anim_frame(5, 4, ColorType::Rgb, t), duration_ms: 100 }).collect();
+    let anim = Animation { width: 5, height: 4, frames, loop_forever: true };
+    let bytes = rc_png::apng::encode_animation(&anim, &EncodeOptions::default()).unwrap();
+    let mut pos = 8;
+    let mut seq = 0u32;
+    let mut fdat = 0;
+    while pos + 12 <= bytes.len() {
+        let len = u32::from_be_bytes([bytes[pos], bytes[pos + 1], bytes[pos + 2], bytes[pos + 3]]) as usize;
+        let kind = &bytes[pos + 4..pos + 8];
+        let body = &bytes[pos + 8..pos + 8 + len];
+        if matches!(kind, b"fcTL" | b"fdAT") {
+            let got = u32::from_be_bytes([body[0], body[1], body[2], body[3]]);
+            assert_eq!(got, seq, "{kind:?} sequence number");
+            seq += 1;
+            fdat += usize::from(kind == b"fdAT");
+        }
+        pos += 12 + len;
+        if kind == b"IEND" {
+            break;
+        }
+    }
+    assert_eq!((fdat, seq), (2, 5));
+}

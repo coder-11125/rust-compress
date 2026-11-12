@@ -352,12 +352,19 @@ fn reduce(img: &Image, level: u32) -> Reduced {
 const BRUTE_MAX_BYTES: usize = 48 << 20;
 
 /// Pick the filter strategy by trial-compressing a sample of the image, then filter everything.
-fn filter_with_best_strategy(r: &Reduced, level: u32) -> Vec<u8> {
+fn filter_with_best_strategy(
+    rows: &[u8],
+    row_bytes: usize,
+    bpp: usize,
+    depth: u8,
+    color_type: u8,
+    level: u32,
+) -> Vec<u8> {
     // Brute compresses every candidate row ~5 times; skip it for huge images.
-    let brute = level >= 9 && r.rows.len() <= BRUTE_MAX_BYTES;
+    let brute = level >= 9 && rows.len() <= BRUTE_MAX_BYTES;
     let mut candidates: Vec<Strategy> = if level < 2 {
-        vec![if r.depth < 8 || r.color_type == 3 { Strategy::Fixed(0) } else { Strategy::MinSum }]
-    } else if r.depth < 8 || r.color_type == 3 {
+        vec![if depth < 8 || color_type == 3 { Strategy::Fixed(0) } else { Strategy::MinSum }]
+    } else if depth < 8 || color_type == 3 {
         vec![Strategy::Fixed(0), Strategy::MinSum, Strategy::Entropy, Strategy::Bigrams]
     } else {
         vec![
@@ -375,35 +382,48 @@ fn filter_with_best_strategy(r: &Reduced, level: u32) -> Vec<u8> {
         candidates.push(Strategy::Brute);
     }
     if candidates.len() == 1 {
-        return filter_image(&r.rows, r.row_bytes, r.bpp, candidates[0]);
+        return filter_image(rows, row_bytes, bpp, candidates[0]);
     }
     // Representative sample: whole image if small, otherwise a few evenly spaced bands of rows.
     let budget: usize = if level >= 9 { 8 << 20 } else { 1 << 20 };
     let trial_level = if level >= 7 { 6 } else { 2 };
-    let sample: std::borrow::Cow<[u8]> = if r.rows.len() <= budget {
-        std::borrow::Cow::Borrowed(&r.rows)
+    let sample: std::borrow::Cow<[u8]> = if rows.len() <= budget {
+        std::borrow::Cow::Borrowed(rows)
     } else {
         let bands = 4;
-        let band_rows = (budget / bands / r.row_bytes).max(1);
-        let total_rows = r.rows.len() / r.row_bytes;
-        let mut v = Vec::with_capacity(budget + r.row_bytes * bands);
+        let band_rows = (budget / bands / row_bytes).max(1);
+        let total_rows = rows.len() / row_bytes;
+        let mut v = Vec::with_capacity(budget + row_bytes * bands);
         for b in 0..bands {
             let start = (total_rows - band_rows.min(total_rows)) * b / (bands - 1);
-            let rows = &r.rows[start * r.row_bytes..(start + band_rows.min(total_rows)) * r.row_bytes];
-            v.extend_from_slice(rows);
+            let band = &rows[start * row_bytes..(start + band_rows.min(total_rows)) * row_bytes];
+            v.extend_from_slice(band);
         }
         std::borrow::Cow::Owned(v)
     };
     let best = candidates
         .par_iter()
         .map(|&s| {
-            let f = filter_image(&sample, r.row_bytes, r.bpp, s);
+            let f = filter_image(&sample, row_bytes, bpp, s);
             (zlib_compress(&f, trial_level).len(), s)
         })
         .min_by_key(|t| t.0)
         .map(|t| t.1)
         .unwrap();
-    filter_image(&r.rows, r.row_bytes, r.bpp, best)
+    filter_image(rows, row_bytes, bpp, best)
+}
+
+/// Filter `rows` with the best strategy and compress them as a PNG `IDAT` payload.
+pub(super) fn idat_for_rows(
+    rows: &[u8],
+    row_bytes: usize,
+    bpp: usize,
+    depth: u8,
+    color_type: u8,
+    level: u32,
+) -> Vec<u8> {
+    let filtered = filter_with_best_strategy(rows, row_bytes, bpp, depth, color_type, level);
+    zlib_compress(&filtered, level)
 }
 
 fn write_chunk(out: &mut Vec<u8>, ty: &[u8; 4], body: &[u8]) {
@@ -440,7 +460,7 @@ fn encode_one(img: &Image, opts: &EncodeOptions) -> Vec<u8> {
     let level = opts.level.min(9);
     let r = reduce(img, level);
 
-    let filtered = filter_with_best_strategy(&r, level);
+    let filtered = filter_with_best_strategy(&r.rows, r.row_bytes, r.bpp, r.depth, r.color_type, level);
     let idat = zlib_compress(&filtered, level);
 
     let mut out = Vec::with_capacity(idat.len() + 1024);

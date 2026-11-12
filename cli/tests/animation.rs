@@ -492,3 +492,39 @@ fn animated_webp_is_left_alone_unless_lossy() {
     assert!(bytes.len() < original.len(), "{} vs {}", bytes.len(), original.len());
     assert_eq!(webp::decode_animation(&bytes).unwrap().frames.len(), 5);
 }
+
+#[test]
+fn animated_gif_converts_to_apng() {
+    let gif_bytes = fixture("gif_anim.gif");
+    let anim = gif::decode_animation(&gif_bytes).unwrap();
+    assert!(anim.frames.len() > 1);
+    let d = tempdir().unwrap();
+    let input = d.path().join("a.gif");
+    fs::write(&input, &gif_bytes).unwrap();
+    let out = d.path().join("a.png");
+    cmd().arg(&input).args(["-f", "png", "-o"]).arg(&out).assert().success();
+    let bytes = fs::read(&out).unwrap();
+    assert!(rc_png::is_animated(&bytes));
+    let back = rc_png::apng::decode_animation(&bytes).unwrap();
+    assert_eq!((back.width, back.height), (anim.width, anim.height));
+    assert_eq!(back.frames.len(), anim.frames.len());
+    assert_eq!(back.loop_forever, anim.loop_forever);
+    assert_eq!(
+        back.frames.iter().map(|f| f.duration_ms).collect::<Vec<_>>(),
+        anim.frames.iter().map(|f| f.duration_ms).collect::<Vec<_>>()
+    );
+    same_pictures(&anim, &back);
+}
+
+#[test]
+fn still_png_to_png_stays_a_still() {
+    let d = tempdir().unwrap();
+    let input = d.path().join("p.png");
+    fs::write(&input, fixture("rgb8.png")).unwrap();
+    let out = d.path().join("p.png.min.png");
+    cmd().arg(&input).args(["-f", "png", "-o"]).arg(&out).assert().success();
+    let bytes = fs::read(&out).unwrap();
+    assert!(!rc_png::is_animated(&bytes));
+    let img = rc_png::decode::decode(&bytes).unwrap();
+    assert_eq!((img.width, img.height), (67, 45));
+}

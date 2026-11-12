@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- APNG output: animated GIF, APNG, animated WebP and animated AVIF inputs now convert to an animated PNG with
+  `-f png`. Frames are stored as complete RGB/RGBA canvases (lossless; `--lossy` quantizes them) with per-frame
+  durations and looping; the first frame uses `IDAT` and later frames `fdAT`, with APNG sequence numbers on every
+  `fcTL`/`fdAT` chunk. Verified with Pillow and this crate's own APNG decoder.
 - Running `rc` with no arguments now prints the full usage (`rc [OPTIONS] <INPUT>...` and `rc update [OPTIONS]`), the
   same as `--help`. The error used to show only `rc <INPUT>...`, which hid both the options and the `update` command.
 
