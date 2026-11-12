@@ -74,27 +74,35 @@ pub fn partition_subsize(partition: u8, bsize: u8) -> u8 {
     }
 }
 
-/// `Subsampled_Size[bsize][sub_x][sub_y]`: the block covering the chroma samples of a luma block.
+// `Subsampled_Size[bsize][sub_x][sub_y]`: the block covering the chroma samples of a luma block.
+const SUBSAMPLED_SIZE: [[[u8; 2]; 2]; BLOCK_SIZES] = [
+    [[BLOCK_4X4, BLOCK_4X4], [BLOCK_4X4, BLOCK_4X4]],
+    [[BLOCK_4X8, BLOCK_4X4], [BLOCK_INVALID, BLOCK_4X4]],
+    [[BLOCK_8X4, BLOCK_INVALID], [BLOCK_4X4, BLOCK_4X4]],
+    [[BLOCK_8X8, BLOCK_8X4], [BLOCK_4X8, BLOCK_4X4]],
+    [[BLOCK_8X16, BLOCK_8X8], [BLOCK_INVALID, BLOCK_4X8]],
+    [[BLOCK_16X8, BLOCK_INVALID], [BLOCK_8X8, BLOCK_8X4]],
+    [[BLOCK_16X16, BLOCK_16X8], [BLOCK_8X16, BLOCK_8X8]],
+    [[BLOCK_16X32, BLOCK_16X16], [BLOCK_INVALID, BLOCK_8X16]],
+    [[BLOCK_32X16, BLOCK_INVALID], [BLOCK_16X16, BLOCK_16X8]],
+    [[BLOCK_32X32, BLOCK_32X16], [BLOCK_16X32, BLOCK_16X16]],
+    [[BLOCK_32X64, BLOCK_32X32], [BLOCK_INVALID, BLOCK_16X32]],
+    [[BLOCK_64X32, BLOCK_INVALID], [BLOCK_32X32, BLOCK_32X16]],
+    [[BLOCK_64X64, BLOCK_64X32], [BLOCK_32X64, BLOCK_32X32]],
+    [[BLOCK_64X128, BLOCK_64X64], [BLOCK_INVALID, BLOCK_32X64]],
+    [[BLOCK_128X64, BLOCK_INVALID], [BLOCK_64X64, BLOCK_64X32]],
+    [[BLOCK_128X128, BLOCK_128X64], [BLOCK_64X128, BLOCK_64X64]],
+    [[BLOCK_4X16, BLOCK_4X8], [BLOCK_INVALID, BLOCK_4X8]],
+    [[BLOCK_16X4, BLOCK_INVALID], [BLOCK_8X4, BLOCK_8X4]],
+    [[BLOCK_8X32, BLOCK_8X16], [BLOCK_INVALID, BLOCK_4X16]],
+    [[BLOCK_32X8, BLOCK_INVALID], [BLOCK_16X8, BLOCK_16X4]],
+    [[BLOCK_16X64, BLOCK_16X32], [BLOCK_INVALID, BLOCK_8X32]],
+    [[BLOCK_64X16, BLOCK_INVALID], [BLOCK_32X16, BLOCK_32X8]],
+];
+
+/// `Subsampled_Size[bsize][sub_x][sub_y]`, or `BLOCK_INVALID` for non-conforming combinations.
 pub fn subsampled_size(bsize: u8, sub_x: u8, sub_y: u8) -> u8 {
-    let w4 = (NUM_4X4_WIDE[bsize as usize] as usize >> sub_x).max(1);
-    let h4 = (NUM_4X4_HIGH[bsize as usize] as usize >> sub_y).max(1);
-    let b = block_size_from(w4, h4);
-    if b != BLOCK_INVALID {
-        return b;
-    }
-    // 4:2:2 can leave shapes such as 2x16 samples; the specification maps these to the nearest valid block.
-    let (mut w4, mut h4) = (w4, h4);
-    while block_size_from(w4, h4) == BLOCK_INVALID && (w4 > 1 || h4 > 1) {
-        if w4 * 4 < h4 {
-            w4 *= 2;
-        } else {
-            h4 *= 2;
-        }
-        if w4 > 32 || h4 > 32 {
-            break;
-        }
-    }
-    block_size_from(w4, h4)
+    SUBSAMPLED_SIZE[bsize as usize][sub_x as usize][sub_y as usize]
 }
 
 pub const TX_4X4: u8 = 0;

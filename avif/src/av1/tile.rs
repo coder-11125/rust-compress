@@ -877,6 +877,9 @@ impl<'a, C: Coder> TileCoder<'a, C> {
         b.mi_col = c;
         b.bsize = bsize;
         self.set_block_geometry(&mut b);
+        if b.has_chroma && subsampled_size(b.bsize, self.f.sub_x as u8, self.f.sub_y as u8) == BLOCK_INVALID {
+            return Err(Error::invalid("invalid chroma block size"));
+        }
         let bw4 = NUM_4X4_WIDE[bsize as usize] as usize;
         let bh4 = NUM_4X4_HIGH[bsize as usize] as usize;
         if self.f.hdr.is_intra() {
