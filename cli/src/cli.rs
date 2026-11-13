@@ -122,10 +122,24 @@ pub struct Cli {
     #[arg(short, long, default_value_t = 7, value_parser = clap::value_parser!(u8).range(0..=9))]
     pub level: u8,
 
-    /// JPEG: pick the lowest quality whose result still scores at least this SSIM (0-1, e.g. 0.97)
-    /// against the original, instead of a fixed -q. Typical: 0.95 small, 0.97 good, 0.99 near-lossless.
-    #[arg(long, value_name = "SSIM", value_parser = parse_ssim)]
+    /// Pick the lowest quality whose result still scores at least this SSIM (0-1, e.g. 0.97)
+    /// against the original, instead of a fixed -q. Works for JPEG, and for lossy WebP, AVIF and
+    /// `--lossy` PNG. Typical: 0.95 small, 0.97 good, 0.99 near-lossless.
+    #[arg(long, value_name = "SSIM", value_parser = parse_ssim, conflicts_with_all = ["target_psnr", "target_ms_ssim", "target_size"])]
     pub target_ssim: Option<f64>,
+
+    /// Like --target-ssim, but target a PSNR in dB (higher is better) for lossy WebP, AVIF and `--lossy` PNG.
+    #[arg(long, value_name = "DB", value_parser = parse_psnr, conflicts_with_all = ["target_ssim", "target_ms_ssim", "target_size"])]
+    pub target_psnr: Option<f64>,
+
+    /// Like --target-ssim, but target multi-scale SSIM for lossy WebP, AVIF and `--lossy` PNG.
+    #[arg(long, value_name = "SSIM", value_parser = parse_ssim, conflicts_with_all = ["target_ssim", "target_psnr", "target_size"])]
+    pub target_ms_ssim: Option<f64>,
+
+    /// Largest output size in bytes for lossy WebP, AVIF and `--lossy` PNG: picks the highest quality
+    /// whose file still fits (or the smallest quality when even that is too big).
+    #[arg(long, value_name = "BYTES", value_parser = clap::value_parser!(u64).range(1..), conflicts_with_all = ["target_ssim", "target_psnr", "target_ms_ssim"])]
+    pub target_size: Option<u64>,
 
     /// JPEG: disable trellis (rate-distortion) quantization; faster, but ~5-10% larger at equal quality.
     #[arg(long)]
@@ -189,4 +203,9 @@ fn parse_hex_color(s: &str) -> Result<[u8; 3], String> {
 fn parse_ssim(s: &str) -> Result<f64, String> {
     let v: f64 = s.parse().map_err(|_| "expected a number between 0 and 1".to_string())?;
     if v > 0.0 && v <= 1.0 { Ok(v) } else { Err("SSIM target must be in (0, 1]".into()) }
+}
+
+fn parse_psnr(s: &str) -> Result<f64, String> {
+    let v: f64 = s.parse().map_err(|_| "expected a number in dB".to_string())?;
+    if v > 0.0 && v <= 99.0 { Ok(v) } else { Err("PSNR target must be in (0, 99]".into()) }
 }

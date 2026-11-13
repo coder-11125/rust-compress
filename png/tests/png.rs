@@ -262,3 +262,47 @@ fn apng_sequence_numbers_count_fctl_and_fdat_chunks() {
     }
     assert_eq!((fdat, seq), (2, 5));
 }
+
+fn chunk_kinds(bytes: &[u8]) -> Vec<[u8; 4]> {
+    let mut pos = 8;
+    let mut out = Vec::new();
+    while pos + 12 <= bytes.len() {
+        let len = u32::from_be_bytes([bytes[pos], bytes[pos + 1], bytes[pos + 2], bytes[pos + 3]]) as usize;
+        out.push([bytes[pos + 4], bytes[pos + 5], bytes[pos + 6], bytes[pos + 7]]);
+        pos += 12 + len;
+        if out.last() == Some(b"IEND") {
+            break;
+        }
+    }
+    out
+}
+
+#[test]
+fn binary_transparency_becomes_a_trns_key() {
+    use rc_core::image::{ColorType, Image};
+    let (w, h) = (64u32, 64u32);
+    let mut data = Vec::new();
+    let mut s = 1u32;
+    for y in 0..h {
+        for x in 0..w {
+            s = s.wrapping_mul(1664525).wrapping_add(1013904223);
+            if (x + y) % 7 == 0 {
+                data.extend_from_slice(&[(s >> 24) as u8, (s >> 16) as u8, (s >> 8) as u8, 0]);
+            } else {
+                data.extend_from_slice(&[(s >> 24) as u8, (s >> 16) as u8, (s >> 8) as u8, 255]);
+            }
+        }
+    }
+    let img = Image::new(w, h, ColorType::Rgba, 8, data).unwrap();
+    let keyed = encode(&img, &EncodeOptions { level: 7, clean_alpha: true });
+    assert_eq!(keyed[25], 2, "RGB with tRNS, not RGBA");
+    assert!(chunk_kinds(&keyed).contains(b"tRNS"));
+    let back = decode(&keyed).unwrap();
+    assert_eq!(visible(to_rgba16(&back)), visible(to_rgba16(&img)));
+    let (_, _, theirs) = reference_rgba16(&keyed);
+    assert_eq!(visible(theirs), visible(to_rgba16(&img)));
+
+    let kept = encode(&img, &EncodeOptions { level: 7, clean_alpha: false });
+    assert_eq!(kept[25], 6, "keep-hidden-pixels must preserve the alpha channel");
+    assert!(!chunk_kinds(&kept).contains(b"tRNS"));
+}

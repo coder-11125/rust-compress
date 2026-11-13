@@ -6,6 +6,12 @@
   `-f png`. Frames are stored as complete RGB/RGBA canvases (lossless; `--lossy` quantizes them) with per-frame
   durations and looping; the first frame uses `IDAT` and later frames `fdAT`, with APNG sequence numbers on every
   `fcTL`/`fdAT` chunk. Verified with Pillow and this crate's own APNG decoder.
+- PNG binary transparency: gray/RGBA images whose alpha is only fully transparent or opaque can drop the alpha
+  channel and store the transparent pixels as a `tRNS` colour key instead (when hidden colours may be rewritten),
+  instead of always keeping GA/RGBA.
+- Quality targets beyond JPEG SSIM: `--target-ssim` now also applies to lossy WebP, AVIF and `--lossy` PNG, and the
+  new `--target-psnr`, `--target-ms-ssim` and `--target-size` options do the same (PSNR and multi-scale SSIM metrics
+  were added to `rc-core`). The search bisects quality, or palette size for PNG, and the report note shows the choice.
 - Running `rc` with no arguments now prints the full usage (`rc [OPTIONS] <INPUT>...` and `rc update [OPTIONS]`), the
   same as `--help`. The error used to show only `rc <INPUT>...`, which hid both the options and the `update` command.
 

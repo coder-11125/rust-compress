@@ -149,6 +149,54 @@ fn target_ssim_picks_a_quality_and_reports_it() {
 }
 
 #[test]
+fn lossy_webp_honors_target_size() {
+    let d = tempdir().unwrap();
+    let input = put(d.path(), "photo.png", "rgb8.png");
+    let limit = fs::metadata(&input).unwrap().len();
+    let out = cmd()
+        .arg(&input)
+        .args(["-f", "webp", "--lossy", "--target-size", &limit.to_string(), "-o"])
+        .arg(d.path().join("t.webp"))
+        .assert()
+        .success();
+    let stdout = String::from_utf8_lossy(&out.get_output().stdout).to_string();
+    assert!(stdout.contains("size target"), "{stdout}");
+    assert!(fs::metadata(d.path().join("t.webp")).unwrap().len() <= limit);
+}
+
+#[test]
+fn lossy_formats_accept_psnr_and_ms_ssim_targets() {
+    let d = tempdir().unwrap();
+    let png = put(d.path(), "photo.png", "rgb8.png");
+    let webp = cmd()
+        .arg(&png)
+        .args(["-f", "webp", "--lossy", "--target-psnr", "35", "-o"])
+        .arg(d.path().join("t.webp"))
+        .assert()
+        .success();
+    let stdout = String::from_utf8_lossy(&webp.get_output().stdout).to_string();
+    assert!(stdout.contains("psnr"), "{stdout}");
+
+    let png = cmd()
+        .arg(&png)
+        .args(["--lossy", "--colors", "64", "--target-ms-ssim", "0.9", "-o"])
+        .arg(d.path().join("t.png"))
+        .assert()
+        .success();
+    let stdout = String::from_utf8_lossy(&png.get_output().stdout).to_string();
+    assert!(stdout.contains("ms-ssim"), "{stdout}");
+}
+
+#[test]
+fn jpeg_rejects_non_ssim_quality_targets() {
+    let d = tempdir().unwrap();
+    let input = put(d.path(), "photo.jpg", "rgb8.jpg");
+    let out = cmd().arg(&input).args(["--target-size", "1000"]).assert().failure();
+    let stderr = String::from_utf8_lossy(&out.get_output().stderr).to_string();
+    assert!(stderr.contains("target-size"), "{stderr}");
+}
+
+#[test]
 fn running_without_arguments_shows_the_full_usage_including_update() {
     let out = cmd().assert().failure().code(2).get_output().clone();
     let err = String::from_utf8_lossy(&out.stderr);

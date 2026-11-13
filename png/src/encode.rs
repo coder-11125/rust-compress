@@ -32,6 +32,8 @@ struct Reduced {
     /// Filter byte distance.
     bpp: usize,
     palette: Vec<[u8; 4]>,
+    /// `tRNS` body for colour types 0 and 2 (binary transparency without an alpha channel).
+    trns: Option<Vec<u8>>,
 }
 
 struct Analysis {
@@ -180,6 +182,70 @@ fn clean_transparent(img: &Image, mode: Clean) -> Image {
     out
 }
 
+/// Binary transparency (alpha only 0/255) can be stored as a `tRNS` colour key instead of an alpha channel.
+/// The key is an opaque-unused gray/RGB value; transparent pixels are rewritten to it, which is why callers only
+/// allow this when hidden colours may be changed (`clean_alpha`).
+fn keyed_reduced(img: &Image, gray: bool) -> Option<Reduced> {
+    let (w, h) = (img.width, img.height);
+    if img.depth != 8 || !matches!(img.color, ColorType::GrayAlpha | ColorType::Rgba) {
+        return None;
+    }
+    let ch = img.color.channels();
+    let mut used_gray = [false; 256];
+    // 2^24 opaque RGB colors as a bitset (2 MiB), so a photo cannot make this quadratic or huge.
+    let mut used_rgb = vec![0u64; 1 << 18];
+    let rgb_used = |used: &[u64], i: usize| used[i >> 6] & (1u64 << (i & 63)) != 0;
+    let mut transparent = false;
+    for p in img.data.chunks_exact(ch) {
+        match p[ch - 1] {
+            0 => transparent = true,
+            255 if gray => used_gray[p[0] as usize] = true,
+            255 => {
+                let i = ((p[0] as usize) << 16) | ((p[1] as usize) << 8) | p[2] as usize;
+                used_rgb[i >> 6] |= 1u64 << (i & 63);
+            }
+            _ => return None,
+        }
+    }
+    if !transparent {
+        return None;
+    }
+    if gray {
+        let key = (0..256).find(|&g| !used_gray[g])? as u8;
+        let rows: Vec<u8> = img.data.chunks_exact(ch).map(|p| if p[ch - 1] == 0 { key } else { p[0] }).collect();
+        return Some(Reduced {
+            width: w,
+            height: h,
+            color_type: 0,
+            depth: 8,
+            rows,
+            row_bytes: w as usize,
+            bpp: 1,
+            palette: vec![],
+            trns: Some(vec![0, key]),
+        });
+    }
+    let key = (0..=0xFF_FFFFusize).find(|&i| !rgb_used(&used_rgb, i))?;
+    let key = [(key >> 16) as u8, (key >> 8) as u8, key as u8];
+    let rows: Vec<u8> =
+        img.data.chunks_exact(ch).flat_map(|p| if p[ch - 1] == 0 { key.to_vec() } else { p[..3].to_vec() }).collect();
+    let mut trns = Vec::with_capacity(6);
+    for v in key {
+        trns.extend_from_slice(&(v as u16).to_be_bytes());
+    }
+    Some(Reduced {
+        width: w,
+        height: h,
+        color_type: 2,
+        depth: 8,
+        rows,
+        row_bytes: w as usize * 3,
+        bpp: 3,
+        palette: vec![],
+        trns: Some(trns),
+    })
+}
+
 /// Smallest gray bit depth (1, 2, 4, 8) that represents all samples exactly.
 fn gray_depth(samples: impl Iterator<Item = u8> + Clone) -> u8 {
     for (depth, scale) in [(1u8, 255u8), (2, 85), (4, 17)] {
@@ -205,7 +271,7 @@ fn pack_bits(indices: &[u8], width: usize, depth: u8, scale: impl Fn(u8) -> u8) 
     (out, row_bytes)
 }
 
-fn reduce(img: &Image, level: u32) -> Reduced {
+fn reduce(img: &Image, level: u32, keyed: bool) -> Reduced {
     let (w, h) = (img.width, img.height);
     // 16-bit images: only reducible if every sample's two bytes are equal.
     let img8;
@@ -229,6 +295,7 @@ fn reduce(img: &Image, level: u32) -> Reduced {
                 row_bytes: img.stride(),
                 bpp,
                 palette: Vec::new(),
+                trns: None,
             };
         }
     } else {
@@ -278,8 +345,22 @@ fn reduce(img: &Image, level: u32) -> Reduced {
             let indices: Vec<u8> = app.iter().map(|&a| perm[a as usize]).collect();
             let (rows, row_bytes) =
                 if pal_depth == 8 { (indices, w as usize) } else { pack_bits(&indices, w as usize, pal_depth, |v| v) };
-            return Reduced { width: w, height: h, color_type: 3, depth: pal_depth, rows, row_bytes, bpp: 1, palette };
+            return Reduced {
+                width: w,
+                height: h,
+                color_type: 3,
+                depth: pal_depth,
+                rows,
+                row_bytes,
+                bpp: 1,
+                palette,
+                trns: None,
+            };
         }
+    }
+
+    if keyed && let Some(r) = keyed_reduced(img, an.gray) {
+        return r;
     }
 
     match (an.gray, an.opaque) {
@@ -297,11 +378,22 @@ fn reduce(img: &Image, level: u32) -> Reduced {
                     row_bytes: w as usize,
                     bpp: 1,
                     palette: vec![],
+                    trns: None,
                 }
             } else {
                 let scale = 255 / ((1u16 << depth) - 1) as u8;
                 let (rows, row_bytes) = pack_bits(&gray, w as usize, depth, |v| v / scale);
-                Reduced { width: w, height: h, color_type: 0, depth, rows, row_bytes, bpp: 1, palette: vec![] }
+                Reduced {
+                    width: w,
+                    height: h,
+                    color_type: 0,
+                    depth,
+                    rows,
+                    row_bytes,
+                    bpp: 1,
+                    palette: vec![],
+                    trns: None,
+                }
             }
         }
         (true, false) => {
@@ -316,6 +408,7 @@ fn reduce(img: &Image, level: u32) -> Reduced {
                 row_bytes: w as usize * 2,
                 bpp: 2,
                 palette: vec![],
+                trns: None,
             }
         }
         (false, true) => {
@@ -333,6 +426,7 @@ fn reduce(img: &Image, level: u32) -> Reduced {
                 row_bytes: w as usize * 3,
                 bpp: 3,
                 palette: vec![],
+                trns: None,
             }
         }
         (false, false) => Reduced {
@@ -344,6 +438,7 @@ fn reduce(img: &Image, level: u32) -> Reduced {
             row_bytes: w as usize * 4,
             bpp: 4,
             palette: vec![],
+            trns: None,
         },
     }
 }
@@ -458,7 +553,7 @@ pub fn encode(img: &Image, opts: &EncodeOptions) -> Vec<u8> {
 
 fn encode_one(img: &Image, opts: &EncodeOptions) -> Vec<u8> {
     let level = opts.level.min(9);
-    let r = reduce(img, level);
+    let r = reduce(img, level, opts.clean_alpha);
 
     let filtered = filter_with_best_strategy(&r.rows, r.row_bytes, r.bpp, r.depth, r.color_type, level);
     let idat = zlib_compress(&filtered, level);
@@ -485,6 +580,8 @@ fn encode_one(img: &Image, opts: &EncodeOptions) -> Vec<u8> {
             let trns: Vec<u8> = r.palette[..=last].iter().map(|c| c[3]).collect();
             write_chunk(&mut out, b"tRNS", &trns);
         }
+    } else if let Some(trns) = &r.trns {
+        write_chunk(&mut out, b"tRNS", trns);
     }
     // Descriptive metadata (only present when the caller asked to keep it).
     let meta = &img.meta;

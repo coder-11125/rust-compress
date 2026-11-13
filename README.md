@@ -56,6 +56,7 @@ cat in.png | rc - > out.png  # stdin to stdout
 **PNG** — lossless by default, bit-exact pixels:
 - Reduces the representation: drops unused alpha, RGB → gray, ≤256 colors → palette, 1/2/4-bit depths, 16 → 8-bit when lossless.
 - Fully transparent pixels get their invisible color rewritten to whatever compresses best (zeroed for palettes, copied from the left/above neighbor for filters); `--keep-hidden-pixels` preserves the exact bytes. Palette order is chosen among four orderings by trial compression.
+- Alpha that is only fully transparent or opaque can drop the alpha channel entirely: gray/RGB pixels plus a `tRNS` colour key for the transparent value (the hidden colours are still rewritten, so `--keep-hidden-pixels` keeps the alpha channel).
 - Chooses the scanline filter strategy by trial-compressing a sample of the image with a real LZ77 level (the usual sum-of-abs heuristic is often wrong for screenshots/graphics). Candidates: the five fixed filters, per-row min-sum, entropy and *distinct-bigram* heuristics, and at `-l 9` a **brute-force search** that picks each row's filter by actually compressing it together with the preceding rows (skipped above 48 MB).
 - Own DEFLATE: hash-chain LZ77 with lazy matching (levels 1-6, compressed in parallel segments) and Zopfli-style optimal parsing (levels 7-9). The optimal parser finds matches with a **binary-tree match finder** (every match length at its nearest distance, no chain-length cliff), then runs a shortest path over them with an iteratively refined cost model, and adaptive block splitting. The refinement is started from two seeds — the longest-match parse and a parse priced from the data's own byte histogram (which avoids a slow drift on noisy data, where a greedy seed is full of coincidental short matches) — and the cheaper result wins.
 - `--lossy` quantizes to a ≤256-color palette: exact color histogram, median cut, k-means refinement, and edge-aware Floyd-Steinberg dithering (`--colors N`, `--dither 0..1`).
@@ -75,6 +76,8 @@ cat in.png | rc - > out.png  # stdin to stdout
 - Encoder tries a palette transform (bundling up to 8 pixels per symbol) or subtract-green + per-tile predictor + cross-color decorrelation, ranks the pipelines with a cheap estimate and fully encodes the best ones.
 - LZ77 with the format's 2-D distance codes, an optimal (cost-model driven) parse, a colour cache sized by trial, and **entropy-clustered prefix-code groups**: image tiles with similar statistics share one set of codes.
 - 8-bit only: 16-bit inputs are reduced to 8-bit (the report note says so). Images are limited to 16384×16384 by the format. Lossy WebP (VP8) is decoded for conversions or an explicit `--lossy` re-encode; when the format is kept it is left untouched, since recompressing it would only add generation loss. Animated WebP is treated the same way: left untouched unless `--lossy` asks for a re-encode.
+
+**Quality targets** — `--target-ssim`, `--target-psnr`, `--target-ms-ssim` and `--target-size` are no longer JPEG-only: for lossy WebP, AVIF and `--lossy` PNG they bisect the cheapest quality (or palette size for PNG) that still meets the goal, and the report note shows what was chosen. JPEG still takes `--target-ssim` only.
 
 **Other formats**
 - **GIF** reads and writes still and animated files (palettes, interlacing, transparency, disposal). A GIF kept as a GIF is re-coded without changing a pixel: one shared palette, each frame stored as the rectangle that changed with the unchanged pixels transparent, and a fresh LZW pass; the original is kept when that is not smaller. A GIF whose frames need more than one 256-color palette between them would have to be re-quantized, so it is left unchanged unless `--lossy` (or `--resize`) is given. Converting *to* GIF (`-f gif`, from any format) quantizes to `--colors` entries (default 256) with one palette for the whole animation, no dithering for animations (the noise would change from frame to frame) and `--dither` for stills; GIF transparency is on/off, so pixels below 50% alpha become transparent.
@@ -108,7 +111,10 @@ rc [OPTIONS] <INPUT>...
       --dither <0.0-1.0>  with --lossy (default 0.5)
   -l, --level <0-9>       PNG / WebP effort (default 7; PNG: 1-6 fast, 7-9 optimal parsing, 9 slowest)
       --no-trellis        JPEG: skip rate-distortion quantization (faster, larger)
-      --target-ssim <S>   JPEG: smallest quality with SSIM >= S (0-1; 0.95 small, 0.97 good, 0.99 near-lossless)
+      --target-ssim <S>   smallest quality with SSIM >= S (0-1; 0.95 small, 0.97 good, 0.99 near-lossless)
+      --target-psnr <DB>  lossy WebP/AVIF and --lossy PNG: smallest quality with PSNR >= DB
+      --target-ms-ssim <S>  lossy WebP/AVIF and --lossy PNG: smallest quality with MS-SSIM >= S
+      --target-size <B>   lossy WebP/AVIF and --lossy PNG: highest quality whose output fits B bytes
       --keep-hidden-pixels  PNG: keep exact color of fully transparent pixels
       --strip-icc         drop ICC profiles / PNG color chunks
       --keep-metadata     keep EXIF, XMP, comments, PNG text/time/density
@@ -162,7 +168,7 @@ Requires a stable Rust toolchain (edition 2024); `rust-toolchain.toml` pins `sta
 ## Layout
 
 ```
-core/       shared types and utilities (rc-core): image and animation types, errors, bit I/O, CRC-32 / Adler-32, canonical Huffman, EXIF editing, Lanczos-3 downscaling, SSIM, color quantizer
+core/       shared types and utilities (rc-core): image and animation types, errors, bit I/O, CRC-32 / Adler-32, canonical Huffman, EXIF editing, Lanczos-3 downscaling, SSIM/PSNR/MS-SSIM, color quantizer
 deflate/    inflate, LZ77 matchers (hash chains; binary tree for levels 7-9), block encoder, optimal parser (levels 7-9)
 png/        decoder (all color types/depths, Adam7, APNG), filters, encoder (reduction + strategy search, APNG writer)
 jpeg/       decoder (baseline, progressive, arithmetic, lossless, hierarchical; 2-16 bit), DCT, baseline/progressive/arithmetic/lossless encoders, a hierarchical pyramid writer, trellis quantization, quality search

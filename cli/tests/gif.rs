@@ -84,9 +84,10 @@ fn gifs_keep_their_format_and_directories_include_them() {
 }
 
 #[test]
-fn animated_gif_through_the_cli_fails_cleanly() {
+fn animated_gif_through_the_cli_writes_apng() {
     let out =
-        cmd().args(["-", "-f", "png"]).write_stdin(fixture("gif_anim.gif")).assert().failure().get_output().clone();
-    assert!(out.stdout.is_empty());
-    assert!(String::from_utf8_lossy(&out.stderr).contains("animated GIF"));
+        cmd().args(["-", "-f", "png"]).write_stdin(fixture("gif_anim.gif")).assert().success().get_output().clone();
+    assert!(out.stdout.starts_with(b"\x89PNG\r\n\x1a\n"));
+    assert!(out.stdout.windows(4).any(|w| w == b"acTL"));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("2 frames"));
 }

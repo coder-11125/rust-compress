@@ -60,6 +60,72 @@ fn window_ssim(a: &Image, b: &Image, x0: usize, y0: usize, ww: usize, wh: usize,
     total / ch as f64
 }
 
+/// Peak signal-to-noise ratio in dB over every sample of two same-sized 8-bit images.
+/// Identical images return infinity.
+pub fn psnr(a: &Image, b: &Image) -> f64 {
+    assert_eq!((a.width, a.height, a.color, a.depth), (b.width, b.height, b.color, b.depth));
+    assert_eq!(a.depth, 8);
+    let se: f64 = a.data.iter().zip(&b.data).map(|(&p, &q)| (p as f64 - q as f64).powi(2)).sum();
+    let mse = se / a.data.len().max(1) as f64;
+    if mse == 0.0 { f64::INFINITY } else { 10.0 * (255.0 * 255.0 / mse).log10() }
+}
+
+/// Luminance-only 8-bit gray view used by [`ms_ssim`]. Alpha is ignored.
+fn luma(img: &Image) -> Image {
+    let src = img.to_depth8();
+    let ch = src.color.channels();
+    let data = match src.color {
+        crate::image::ColorType::Gray => src.data,
+        crate::image::ColorType::GrayAlpha => src.data.iter().step_by(2).copied().collect(),
+        crate::image::ColorType::Rgb | crate::image::ColorType::Rgba => src
+            .data
+            .chunks_exact(ch)
+            .map(|p| ((299 * p[0] as u32 + 587 * p[1] as u32 + 114 * p[2] as u32 + 500) / 1000) as u8)
+            .collect(),
+    };
+    Image::new(src.width, src.height, crate::image::ColorType::Gray, 8, data).expect("luma keeps dimensions")
+}
+
+fn downsample2(img: &Image) -> Image {
+    let (w, h) = (img.width as usize / 2, img.height as usize / 2);
+    if w == 0 || h == 0 {
+        return img.clone();
+    }
+    let mut data = Vec::with_capacity(w * h);
+    for y in 0..h {
+        for x in 0..w {
+            let mut sum = 0u32;
+            for dy in 0..2 {
+                for dx in 0..2 {
+                    sum += img.data[(2 * y + dy) * img.width as usize + 2 * x + dx] as u32;
+                }
+            }
+            data.push((sum / 4) as u8);
+        }
+    }
+    Image::new(w as u32, h as u32, crate::image::ColorType::Gray, 8, data).expect("downsample keeps dimensions")
+}
+
+/// Multi-scale SSIM approximation: luminance SSIM at five dyadic scales, combined with the usual
+/// weights. Like [`ssim`] it is 1.0 for identical images and falls back to global statistics on
+/// tiny inputs.
+pub fn ms_ssim(a: &Image, b: &Image) -> f64 {
+    assert_eq!((a.width, a.height, a.depth), (b.width, b.height, b.depth));
+    assert_eq!(a.depth, 8);
+    const W: [f64; 5] = [0.0448, 0.2856, 0.3001, 0.2363, 0.1333];
+    let (mut x, mut y) = (luma(a), luma(b));
+    let mut out = 1.0;
+    for (i, w) in W.iter().enumerate() {
+        let s = ssim(&x, &y).max(1e-9);
+        out *= s.powf(*w);
+        if i + 1 < W.len() {
+            x = downsample2(&x);
+            y = downsample2(&y);
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -89,5 +155,22 @@ mod tests {
     fn tiny_images_do_not_panic() {
         let a = img(3, 2, |x, y| (x + y) as u8);
         assert!(ssim(&a, &a) > 0.99);
+    }
+
+    #[test]
+    fn psnr_is_infinite_for_identical_and_finite_for_noise() {
+        let a = img(32, 32, |x, y| ((x * 3 + y * 5) % 256) as u8);
+        assert_eq!(psnr(&a, &a), f64::INFINITY);
+        let b = img(32, 32, |x, y| (((x * 3 + y * 5) % 256) as u8).wrapping_add(8));
+        let p = psnr(&a, &b);
+        assert!(p.is_finite() && p > 20.0 && p < 40.0, "{p}");
+    }
+
+    #[test]
+    fn ms_ssim_scores_identical_highest() {
+        let a = img(64, 64, |x, y| ((x * 7 + y * 11) % 256) as u8);
+        let slight = img(64, 64, |x, y| (((x * 7 + y * 11) % 256) as u8) / 16 * 16);
+        let (same, s) = (ms_ssim(&a, &a), ms_ssim(&a, &slight));
+        assert!(same > 0.99 && s < same, "{same} {s}");
     }
 }

@@ -8,6 +8,7 @@ use rc_core::animation::{AnimFrame, Animation};
 use rc_core::error::{Error, Result};
 use rc_core::exif;
 use rc_core::image::{ColorType, Image, Metadata};
+use rc_core::metrics;
 use rc_core::resize;
 use rc_gif as gif;
 use rc_jpeg as jpeg;
@@ -84,6 +85,106 @@ fn add_note(e: &mut Encoded, extra: &str) {
         Some(n) => format!("{n}, {extra}"),
         None => extra.to_string(),
     });
+}
+
+#[derive(Clone, Copy)]
+enum Target {
+    Ssim(f64),
+    Psnr(f64),
+    MsSsim(f64),
+    Size(u64),
+}
+
+fn target(cli: &Cli) -> Option<Target> {
+    if let Some(v) = cli.target_ssim {
+        Some(Target::Ssim(v))
+    } else if let Some(v) = cli.target_psnr {
+        Some(Target::Psnr(v))
+    } else if let Some(v) = cli.target_ms_ssim {
+        Some(Target::MsSsim(v))
+    } else {
+        cli.target_size.map(Target::Size)
+    }
+}
+
+fn metric_name(t: Target) -> &'static str {
+    match t {
+        Target::Ssim(_) => "ssim",
+        Target::Psnr(_) => "psnr",
+        Target::MsSsim(_) => "ms-ssim",
+        Target::Size(_) => "size",
+    }
+}
+
+fn target_value(t: Target) -> f64 {
+    match t {
+        Target::Ssim(v) | Target::Psnr(v) | Target::MsSsim(v) => v,
+        Target::Size(_) => 0.0,
+    }
+}
+
+fn score(reference: &Image, candidate: &Image, t: Target) -> f64 {
+    match t {
+        Target::Ssim(_) => metrics::ssim(reference, candidate),
+        Target::Psnr(_) => metrics::psnr(reference, candidate),
+        Target::MsSsim(_) => metrics::ms_ssim(reference, candidate),
+        Target::Size(_) => 0.0,
+    }
+}
+
+/// Canonical 8-bit RGBA view for metric comparisons.
+fn rgba8(img: &Image) -> Image {
+    let src = img.to_depth8();
+    let ch = src.color.channels();
+    let mut data = Vec::with_capacity(src.data.len() / ch * 4);
+    for p in src.data.chunks_exact(ch) {
+        match src.color {
+            ColorType::Gray => data.extend_from_slice(&[p[0], p[0], p[0], 255]),
+            ColorType::GrayAlpha => data.extend_from_slice(&[p[0], p[0], p[0], p[1]]),
+            ColorType::Rgb => data.extend_from_slice(&[p[0], p[1], p[2], 255]),
+            ColorType::Rgba => data.extend_from_slice(&p[..4]),
+        }
+    }
+    Image::new(src.width, src.height, ColorType::Rgba, 8, data).expect("rgba8 keeps dimensions")
+}
+
+/// Smallest parameter whose score still meets `target` (score is assumed to grow with the parameter).
+fn bisect_score(min: u16, max: u16, target: f64, mut score: impl FnMut(u16) -> Result<f64>) -> Result<(u16, f64)> {
+    let top = score(max)?;
+    if top < target {
+        return Ok((max, top));
+    }
+    let (mut lo, mut hi) = (min, max);
+    let mut best = (hi, top);
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        let s = score(mid)?;
+        if s >= target {
+            hi = mid;
+            best = (mid, s);
+        } else {
+            lo = mid + 1;
+        }
+    }
+    Ok(best)
+}
+
+/// Largest parameter whose encoded length fits `limit`; falls back to `min` when even that is too big.
+fn bisect_size(min: u16, max: u16, limit: u64, mut len: impl FnMut(u16) -> Result<u64>) -> Result<u16> {
+    if len(max)? <= limit {
+        return Ok(max);
+    }
+    let (mut lo, mut hi, mut best) = (min, max - 1, min);
+    while lo <= hi {
+        let mid = lo + (hi - lo) / 2;
+        if len(mid)? <= limit {
+            best = mid;
+            lo = mid + 1;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    Ok(best)
 }
 
 /// Encode pixels as JPEG, honoring `--target-ssim` when given.
@@ -276,26 +377,91 @@ fn jpeg_to_jpeg(data: &[u8], cli: &Cli) -> Result<Encoded> {
     Ok(encoded.resized(resized))
 }
 
+fn png_opts(cli: &Cli) -> png::encode::EncodeOptions {
+    png::encode::EncodeOptions { level: cli.level as u32, clean_alpha: !cli.keep_hidden_pixels }
+}
+
+fn avif_opts(cli: &Cli, quality: u8, depth: u8) -> avif::encode::EncodeOptions {
+    let full_chroma = match cli.subsampling {
+        SubsamplingArg::Auto => quality >= 90,
+        SubsamplingArg::S444 => true,
+        SubsamplingArg::S420 => false,
+    };
+    let bit_depth = match cli.bit_depth {
+        BitDepthArg::Auto if depth == 16 => 10,
+        BitDepthArg::Auto | BitDepthArg::B8 => 8,
+        BitDepthArg::B10 => 10,
+    };
+    avif::encode::EncodeOptions { quality, full_chroma, effort: cli.level, bit_depth }
+}
+
 fn encode(img: &Image, fmt: Format, cli: &Cli) -> Result<Encoded> {
     match fmt {
         Format::Png => {
-            let quantized;
-            let img = if cli.lossy {
-                quantized = png::quant::quantize(img, cli.colors as usize, cli.dither);
-                &quantized
-            } else {
-                img
-            };
-            Ok(png::encode::encode(
-                img,
-                &png::encode::EncodeOptions { level: cli.level as u32, clean_alpha: !cli.keep_hidden_pixels },
-            )
-            .into())
+            let opts = png_opts(cli);
+            if cli.lossy {
+                if let Some(t) = target(cli) {
+                    let max_colors = cli.colors.clamp(2, 256);
+                    if let Target::Size(limit) = t {
+                        let colors = bisect_size(2, max_colors, limit, |c| {
+                            let q = png::quant::quantize(img, c as usize, cli.dither);
+                            Ok(png::encode::encode(&q, &opts).len() as u64)
+                        })?;
+                        let q = png::quant::quantize(img, colors as usize, cli.dither);
+                        let mut encoded: Encoded = png::encode::encode(&q, &opts).into();
+                        encoded.note = Some(format!("{colors} colors, size target"));
+                        return Ok(encoded);
+                    }
+                    let reference = rgba8(img);
+                    let tv = target_value(t);
+                    let (colors, s) = bisect_score(2, max_colors, tv, |c| {
+                        let q = png::quant::quantize(img, c as usize, cli.dither);
+                        Ok(score(&reference, &rgba8(&q), t))
+                    })?;
+                    let q = png::quant::quantize(img, colors as usize, cli.dither);
+                    let mut encoded: Encoded = png::encode::encode(&q, &opts).into();
+                    encoded.note = Some(format!("{colors} colors, {} {:.4}", metric_name(t), s));
+                    return Ok(encoded);
+                }
+                let quantized = png::quant::quantize(img, cli.colors as usize, cli.dither);
+                return Ok(png::encode::encode(&quantized, &opts).into());
+            }
+            Ok(png::encode::encode(img, &opts).into())
         }
-        Format::Jpeg => encode_jpeg_pixels(img, cli, cli.quality, use_arithmetic(cli, false)),
+        Format::Jpeg => {
+            if target(cli).is_some_and(|t| !matches!(t, Target::Ssim(_))) {
+                return Err(Error::unsupported(
+                    "--target-psnr/--target-ms-ssim/--target-size need lossy WebP, AVIF or --lossy PNG",
+                ));
+            }
+            encode_jpeg_pixels(img, cli, cli.quality, use_arithmetic(cli, false))
+        }
         Format::Webp => {
             if cli.lossy {
-                let bytes = webp::encode_lossy(img, cli.quality, cli.level as u32, !cli.keep_hidden_pixels)?;
+                let level = cli.level as u32;
+                let clean = !cli.keep_hidden_pixels;
+                if let Some(t) = target(cli) {
+                    if let Target::Size(limit) = t {
+                        let q = bisect_size(1, 100, limit, |q| {
+                            Ok(webp::encode_lossy(img, q as u8, level, clean)?.len() as u64)
+                        })?;
+                        let bytes = webp::encode_lossy(img, q as u8, level, clean)?;
+                        let mut encoded: Encoded = bytes.into();
+                        encoded.note = Some(format!("q{q}, size target"));
+                        return Ok(encoded);
+                    }
+                    let reference = rgba8(img);
+                    let tv = target_value(t);
+                    let (q, s) = bisect_score(1, 100, tv, |q| {
+                        let bytes = webp::encode_lossy(img, q as u8, level, clean)?;
+                        Ok(score(&reference, &rgba8(&webp::decode(&bytes)?), t))
+                    })?;
+                    let bytes = webp::encode_lossy(img, q as u8, level, clean)?;
+                    let mut encoded: Encoded = bytes.into();
+                    encoded.note = Some(format!("q{q}, {} {:.4}", metric_name(t), s));
+                    return Ok(encoded);
+                }
+                let bytes = webp::encode_lossy(img, cli.quality, level, clean)?;
                 let mut encoded: Encoded = bytes.into();
                 encoded.forced = false;
                 if img.depth == 16 {
@@ -317,19 +483,28 @@ fn encode(img: &Image, fmt: Format, cli: &Cli) -> Result<Encoded> {
             Ok(encoded)
         }
         Format::Avif => {
-            let full_chroma = match cli.subsampling {
-                SubsamplingArg::Auto => cli.quality >= 90,
-                SubsamplingArg::S444 => true,
-                SubsamplingArg::S420 => false,
-            };
-            let bit_depth = match cli.bit_depth {
-                BitDepthArg::Auto if img.depth == 16 => 10,
-                BitDepthArg::Auto | BitDepthArg::B8 => 8,
-                BitDepthArg::B10 => 10,
-            };
-            let opts = avif::encode::EncodeOptions { quality: cli.quality, full_chroma, effort: cli.level, bit_depth };
+            if let Some(t) = target(cli) {
+                if let Target::Size(limit) = t {
+                    let q = bisect_size(1, 100, limit, |q| {
+                        Ok(avif::encode::encode(img, &avif_opts(cli, q as u8, img.depth))?.len() as u64)
+                    })?;
+                    let mut encoded: Encoded = avif::encode::encode(img, &avif_opts(cli, q as u8, img.depth))?.into();
+                    encoded.note = Some(format!("q{q}, size target"));
+                    return Ok(encoded);
+                }
+                let reference = rgba8(img);
+                let tv = target_value(t);
+                let (q, s) = bisect_score(1, 100, tv, |q| {
+                    let bytes = avif::encode::encode(img, &avif_opts(cli, q as u8, img.depth))?;
+                    Ok(score(&reference, &rgba8(&avif::decode(&bytes)?), t))
+                })?;
+                let mut encoded: Encoded = avif::encode::encode(img, &avif_opts(cli, q as u8, img.depth))?.into();
+                encoded.note = Some(format!("q{q}, {} {:.4}", metric_name(t), s));
+                return Ok(encoded);
+            }
+            let opts = avif_opts(cli, cli.quality, img.depth);
             let mut encoded: Encoded = avif::encode::encode(img, &opts)?.into();
-            if img.depth == 16 && bit_depth == 8 {
+            if img.depth == 16 && opts.bit_depth == 8 {
                 encoded.note = Some("16-bit reduced to 8-bit".into());
             }
             Ok(encoded)
@@ -382,6 +557,11 @@ fn run(job: &Job, cli: &Cli, data: &[u8]) -> Result<(Status, u64, Option<String>
         .or_else(|| Format::from_extension(&job.input))
         .ok_or_else(|| Error::unsupported("unrecognized image format (supported: PNG, JPEG, WebP, AVIF, GIF)"))?;
     let out_fmt = target_format(cli, in_fmt);
+    if out_fmt == Format::Jpeg && target(cli).is_some_and(|t| !matches!(t, Target::Ssim(_))) {
+        return Err(Error::unsupported(
+            "--target-psnr/--target-ms-ssim/--target-size need lossy WebP, AVIF or --lossy PNG",
+        ));
+    }
     if cli.in_place && out_fmt != in_fmt {
         return Err(Error::unsupported("--in-place cannot be combined with a format change"));
     }
