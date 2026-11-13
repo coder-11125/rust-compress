@@ -74,8 +74,22 @@ pub struct Cli {
     #[arg(short, long)]
     pub recursive: bool,
 
+    /// With directory inputs: only process files whose name or path relative to that directory matches GLOB
+    /// (`*` and `?` stay within a path component, `**` crosses directories). Repeatable.
+    #[arg(long, value_name = "GLOB")]
+    pub include: Vec<String>,
+
+    /// With directory inputs: skip files matching GLOB (same syntax as --include). Repeatable.
+    #[arg(long, value_name = "GLOB")]
+    pub exclude: Vec<String>,
+
+    /// Suffix for default outputs: `<name>.<suffix>.<ext>` (default `min`). Files already ending in
+    /// `.<suffix>.` are skipped during directory walks.
+    #[arg(long, default_value = "min", value_parser = parse_suffix)]
+    pub min_suffix: String,
+
     /// Output file (single input file) or output directory; `-` writes the image to standard output.
-    /// Default: write `<name>.min.<ext>` next to each input (standard input defaults to standard output).
+    /// Default: write `<name>.<suffix>.<ext>` next to each input (standard input defaults to standard output).
     #[arg(short, long, value_name = "PATH")]
     pub output: Option<PathBuf>,
 
@@ -208,4 +222,11 @@ fn parse_ssim(s: &str) -> Result<f64, String> {
 fn parse_psnr(s: &str) -> Result<f64, String> {
     let v: f64 = s.parse().map_err(|_| "expected a number in dB".to_string())?;
     if v > 0.0 && v <= 99.0 { Ok(v) } else { Err("PSNR target must be in (0, 99]".into()) }
+}
+
+fn parse_suffix(s: &str) -> Result<String, String> {
+    if s.is_empty() || s == "." || s == ".." || s.contains(['/', '\\']) {
+        return Err("suffix must be a non-empty file-name component".into());
+    }
+    Ok(s.to_string())
 }

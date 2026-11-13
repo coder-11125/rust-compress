@@ -541,6 +541,21 @@ fn write_atomic(path: &Path, data: &[u8]) -> Result<()> {
     result.map_err(Error::from)
 }
 
+fn write_output_preserving(path: &Path, data: &[u8], preserve: bool) -> Result<()> {
+    if !preserve {
+        return write_output(path, data);
+    }
+    let meta = std::fs::metadata(path).ok();
+    write_output(path, data)?;
+    if let Some(m) = meta {
+        let _ = std::fs::set_permissions(path, m.permissions());
+        if let (Ok(t), Ok(f)) = (m.modified(), std::fs::File::options().write(true).open(path)) {
+            let _ = f.set_modified(t);
+        }
+    }
+    Ok(())
+}
+
 /// Write the result to its destination: standard output for `-`, otherwise an atomically replaced file.
 fn write_output(path: &Path, data: &[u8]) -> Result<()> {
     if is_stdio(path) {
@@ -631,7 +646,7 @@ fn run(job: &Job, cli: &Cli, data: &[u8]) -> Result<(Status, u64, Option<String>
         return Ok((Status::NoGain, data.len() as u64, note));
     }
     if !cli.dry_run {
-        write_output(&job.output, &encoded)?;
+        write_output_preserving(&job.output, &encoded, cli.in_place)?;
     }
     Ok((Status::Compressed, encoded.len() as u64, note))
 }

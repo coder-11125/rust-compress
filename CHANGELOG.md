@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- GIF multi-palette lossless recode: an animated GIF whose frames each fit a palette but whose union does not is
+  now re-encoded exactly instead of being left for `--lossy`. Frames that share one palette still use a single
+  global color table; when they differ, every image gets a local color table (index 0 reserved for
+  transparency/unchanged pixels) while keeping the changed-rectangle coding, disposal handling, delays and loop
+  count. `palette_is_exact` now accepts either one shared palette or one local palette per frame.
+- CLI batch ergonomics: directory walks can be filtered with repeatable `--include`/`--exclude` globs (`*` and `?`
+  stay within a path component, `**` crosses directories; patterns match the file name or the path relative to the
+  input directory), default outputs use a configurable `--min-suffix` (still `<name>.<suffix>.<ext>`, and files
+  already ending in `.<suffix>.` are skipped), and `--in-place` now preserves the original permissions and
+  modification time after the atomic replace.
 - APNG output: animated GIF, APNG, animated WebP and animated AVIF inputs now convert to an animated PNG with
   `-f png`. Frames are stored as complete RGB/RGBA canvases (lossless; `--lossy` quantizes them) with per-frame
   durations and looping; the first frame uses `IDAT` and later frames `fdAT`, with APNG sequence numbers on every

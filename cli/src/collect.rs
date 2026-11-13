@@ -108,12 +108,60 @@ fn output_path(cli: &Cli, input: &Path, rel: &Path, dir_mode: bool) -> PathBuf {
         Some(out) => out.clone(),
         None => {
             let stem = input.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
-            input.with_file_name(format!("{stem}.min.{ext}"))
+            input.with_file_name(format!("{stem}.{}.{ext}", cli.min_suffix))
         }
     }
 }
 
-fn walk(dir: &Path, recursive: bool, out: &mut Vec<PathBuf>) -> std::io::Result<()> {
+fn is_default_output(p: &Path, suffix: &str) -> bool {
+    p.file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .is_some_and(|stem| stem.strip_suffix(suffix).is_some_and(|s| s.ends_with('.')))
+}
+
+fn glob_match(pattern: &str, text: &str) -> bool {
+    let pattern = pattern.replace('\\', "/");
+    let text = text.replace('\\', "/");
+    glob_match_bytes(pattern.as_bytes(), text.as_bytes())
+}
+
+fn glob_match_bytes(p: &[u8], t: &[u8]) -> bool {
+    if p.is_empty() {
+        return t.is_empty();
+    }
+    match p[0] {
+        b'*' if p.get(1) == Some(&b'*') => {
+            let rest = &p[2..];
+            // `**/` also matches zero directories, so try the pattern after the slash first.
+            if rest.first() == Some(&b'/') && glob_match_bytes(&rest[1..], t) {
+                return true;
+            }
+            (0..=t.len()).any(|i| glob_match_bytes(rest, &t[i..]))
+        }
+        b'*' => {
+            for i in 0..=t.len() {
+                if t[..i].contains(&b'/') {
+                    break;
+                }
+                if glob_match_bytes(&p[1..], &t[i..]) {
+                    return true;
+                }
+            }
+            false
+        }
+        b'?' => !t.is_empty() && t[0] != b'/' && glob_match_bytes(&p[1..], &t[1..]),
+        c => !t.is_empty() && t[0] == c && glob_match_bytes(&p[1..], &t[1..]),
+    }
+}
+
+fn wanted(cli: &Cli, rel: &Path, name: &str) -> bool {
+    let rel = rel.to_string_lossy().replace('\\', "/");
+    let name = name.replace('\\', "/");
+    let hits = |pats: &[String]| pats.iter().any(|p| glob_match(p, &rel) || glob_match(p, &name));
+    (cli.include.is_empty() || hits(&cli.include)) && !hits(&cli.exclude)
+}
+
+fn walk(dir: &Path, recursive: bool, suffix: &str, out: &mut Vec<PathBuf>) -> std::io::Result<()> {
     let mut entries: Vec<_> = std::fs::read_dir(dir)?.collect::<Result<_, _>>()?;
     entries.sort_by_key(|e| e.file_name());
     for e in entries {
@@ -121,14 +169,10 @@ fn walk(dir: &Path, recursive: bool, out: &mut Vec<PathBuf>) -> std::io::Result<
         let ty = e.file_type()?;
         if ty.is_dir() {
             if recursive {
-                walk(&p, recursive, out)?;
+                walk(&p, recursive, suffix, out)?;
             }
-        } else if ty.is_file() && Format::from_extension(&p).is_some() {
-            // Skip our own default outputs so reruns do not recompress them.
-            let stem = p.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
-            if !stem.ends_with(".min") {
-                out.push(p);
-            }
+        } else if ty.is_file() && Format::from_extension(&p).is_some() && !is_default_output(&p, suffix) {
+            out.push(p);
         }
     }
     Ok(())
@@ -170,12 +214,16 @@ pub fn collect(cli: &Cli) -> (Vec<Job>, Vec<String>) {
     for input in &cli.inputs {
         if input.is_dir() {
             let mut files = Vec::new();
-            if let Err(e) = walk(input, cli.recursive, &mut files) {
+            if let Err(e) = walk(input, cli.recursive, &cli.min_suffix, &mut files) {
                 problems.push(format!("{}: {e}", input.display()));
                 continue;
             }
             for f in files {
                 let rel = f.strip_prefix(input).unwrap_or(&f).to_path_buf();
+                let name = f.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+                if !wanted(cli, &rel, &name) {
+                    continue;
+                }
                 let output = output_path(cli, &f, &rel, dir_mode);
                 jobs.push(Job { input: f, output });
             }

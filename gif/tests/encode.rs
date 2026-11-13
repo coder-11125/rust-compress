@@ -181,6 +181,71 @@ fn a_many_color_animation_is_quantized_to_one_palette() {
     assert!(all.len() <= 32, "{} colors", all.len());
 }
 
+fn local_table_count(bytes: &[u8]) -> usize {
+    let mut pos = 6usize; // signature + logical screen descriptor
+    let packed = bytes[10];
+    pos += 7 + if packed & 0x80 != 0 { 3 * (2usize << (packed & 7)) } else { 0 };
+    let mut count = 0;
+    while pos < bytes.len() && bytes[pos] != 0x3B {
+        match bytes[pos] {
+            0x21 => {
+                pos += 2;
+                loop {
+                    let size = bytes[pos] as usize;
+                    pos += 1;
+                    if size == 0 {
+                        break;
+                    }
+                    pos += size;
+                }
+            }
+            0x2C => {
+                let packed = bytes[pos + 9];
+                count += usize::from(packed & 0x80 != 0);
+                pos += 10;
+                if packed & 0x80 != 0 {
+                    pos += 3 * (2usize << (packed & 7));
+                }
+                pos += 1; // LZW minimum code size
+                while bytes[pos] != 0 {
+                    pos += 1 + bytes[pos] as usize;
+                }
+                pos += 1;
+            }
+            _ => panic!("unexpected GIF block {:#x} at {pos}", bytes[pos]),
+        }
+    }
+    count
+}
+
+/// Two frames whose 200-color palettes are disjoint: no single 256-entry palette can hold both, but each frame can.
+fn disjoint_palette_frames() -> Vec<(Vec<[u8; 4]>, u32)> {
+    let frame = |shift: usize| {
+        (0..W * H)
+            .map(|p| {
+                let v = (p / 7 + shift) % 200;
+                if shift == 0 { [v as u8, 0, 0, 255] } else { [0, v as u8, 0, 255] }
+            })
+            .collect()
+    };
+    vec![(frame(0), 70), (frame(1), 80)]
+}
+
+#[test]
+fn frames_with_disjoint_palettes_round_trip_exactly() {
+    let a = anim(disjoint_palette_frames(), ColorType::Rgb, true);
+    assert!(palette_is_exact(&a, 256));
+    let bytes = encode_animation(&a, &EncodeOptions::default()).unwrap();
+    assert_eq!(local_table_count(&bytes), 2, "each frame should carry a local colour table");
+    assert_eq!(bytes[10] & 0x80, 0, "the animation should not need a global colour table");
+    let back = decode_animation(&bytes).unwrap();
+    assert_eq!(back.frames.len(), 2);
+    for (got, want) in back.frames.iter().zip(&a.frames) {
+        same_picture(&got.image, &want.image);
+        assert_eq!(got.duration_ms, want.duration_ms);
+    }
+}
+
 #[test]
 fn palette_exactness_accounts_for_the_reserved_entry() {
     let a = anim(opaque_frames(3), ColorType::Rgb, true); // 3 colors, several frames: needs 3 + 1 entries

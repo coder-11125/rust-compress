@@ -404,7 +404,7 @@ fn gif_to_gif_never_grows_and_keeps_every_pixel() {
     same_pictures(&gif::decode_animation(&original).unwrap(), &gif::decode_animation(&bytes).unwrap());
 }
 
-/// A GIF whose frames each have their own 256-color palette, so no single palette holds both.
+/// A GIF whose frames each use 255 colors from their own palette, so no single palette holds both.
 fn two_palette_gif() -> Vec<u8> {
     let (w, h) = (16usize, 16usize);
     let mut g = b"GIF89a".to_vec();
@@ -418,7 +418,7 @@ fn two_palette_gif() -> Vec<u8> {
         }
         g.push(8);
         // Literal codes only (9 bits each) with a clear code every 250 entries, so the width never changes.
-        let indices: Vec<u32> = (0..w * h).map(|i| i as u32).collect();
+        let indices: Vec<u32> = (0..w * h).map(|i| (i % 255) as u32).collect();
         let (mut acc, mut n, mut data) = (0u64, 0u32, Vec::new());
         let mut put = |code: u32| {
             acc |= (code as u64) << n;
@@ -448,31 +448,23 @@ fn two_palette_gif() -> Vec<u8> {
 }
 
 #[test]
-fn a_gif_that_needs_a_palette_per_frame_is_left_alone_unless_lossy() {
+fn a_gif_that_needs_a_palette_per_frame_is_not_left_alone() {
     let original = two_palette_gif();
     let anim = gif::decode_animation(&original).unwrap();
     assert_eq!(anim.frames.len(), 2);
-    assert!(!gif::palette_is_exact(&anim, 256));
+    assert!(gif::palette_is_exact(&anim, 256));
     let d = tempdir().unwrap();
     let input = d.path().join("m.gif");
     fs::write(&input, &original).unwrap();
     let out = d.path().join("kept.gif");
     let res = cmd().arg(&input).arg("-o").arg(&out).assert().success().get_output().clone();
-    assert!(
-        String::from_utf8_lossy(&res.stdout).contains("left unchanged"),
-        "{}",
-        String::from_utf8_lossy(&res.stdout)
-    );
-    assert_eq!(fs::read(&out).unwrap(), original);
-    let lossy = d.path().join("lossy.gif");
-    cmd().arg(&input).args(["--lossy", "-o"]).arg(&lossy).assert().success();
-    let back = gif::decode_animation(&fs::read(&lossy).unwrap()).unwrap();
-    assert_eq!(back.frames.len(), 2);
-    let mut all = std::collections::HashSet::new();
-    for f in &back.frames {
-        all.extend(rgba_of(&f.image));
+    let stdout = String::from_utf8_lossy(&res.stdout);
+    assert!(!stdout.contains("left unchanged"), "{stdout}");
+    let back = gif::decode_animation(&fs::read(&out).unwrap()).unwrap();
+    same_pictures(&anim, &back);
+    for (got, want) in back.frames.iter().zip(&anim.frames) {
+        assert_eq!(got.duration_ms, want.duration_ms);
     }
-    assert!(all.len() <= 256, "{} colors", all.len());
 }
 
 #[test]

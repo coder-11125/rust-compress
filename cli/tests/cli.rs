@@ -65,6 +65,66 @@ fn non_recursive_directory_only_takes_top_level() {
 }
 
 #[test]
+fn include_and_exclude_globs_filter_directory_walks() {
+    let d = tempdir().unwrap();
+    put(d.path(), "in/a.png", "rgb8.png");
+    put(d.path(), "in/b.jpg", "rgb8.jpg");
+    put(d.path(), "in/sub/c.png", "pal5.png");
+    fs::write(d.path().join("in/notes.txt"), "ignore me").unwrap();
+    let out = d.path().join("out");
+    cmd()
+        .arg(d.path().join("in"))
+        .arg("-r")
+        .arg("-o")
+        .arg(&out)
+        .args(["--include", "**/*.png", "--exclude", "sub/*"])
+        .assert()
+        .success();
+    assert!(out.join("a.png").exists());
+    assert!(!out.join("sub/c.png").exists(), "excluded by sub/*");
+    assert!(!out.join("b.jpg").exists(), "not matched by --include");
+    assert!(!out.join("notes.txt").exists());
+}
+
+#[test]
+fn include_can_match_paths_relative_to_each_input_directory() {
+    let d = tempdir().unwrap();
+    put(d.path(), "in/a.png", "rgb8.png");
+    put(d.path(), "in/sub/c.png", "pal5.png");
+    let out = d.path().join("out");
+    cmd().arg(d.path().join("in")).arg("-r").arg("-o").arg(&out).args(["--include", "sub/*.png"]).assert().success();
+    assert!(!out.join("a.png").exists());
+    assert!(out.join("sub/c.png").exists());
+}
+
+#[test]
+fn min_suffix_names_default_outputs_and_marks_them_for_walks() {
+    let d = tempdir().unwrap();
+    let input = put(d.path(), "photo.jpg", "rgb8_444.jpg");
+    cmd().arg(&input).args(["--min-suffix", "optimized"]).assert().success();
+    assert!(d.path().join("photo.optimized.jpg").exists());
+
+    let dir = tempdir().unwrap();
+    put(dir.path(), "in/a.jpg", "rgb8.jpg");
+    put(dir.path(), "in/a.optimized.jpg", "rgb8.jpg"); // already an output name: skipped
+    let out = dir.path().join("out");
+    cmd().arg(dir.path().join("in")).arg("-o").arg(&out).args(["--min-suffix", "optimized"]).assert().success();
+    assert!(out.join("a.jpg").exists());
+    assert!(!out.join("a.optimized.jpg").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn in_place_preserves_permissions() {
+    use std::os::unix::fs::PermissionsExt;
+    let d = tempdir().unwrap();
+    let input = put(d.path(), "p.jpg", "rgb8.jpg");
+    fs::set_permissions(&input, fs::Permissions::from_mode(0o640)).unwrap();
+    cmd().arg(&input).arg("--in-place").assert().success();
+    assert_eq!(fs::metadata(&input).unwrap().permissions().mode() & 0o777, 0o640);
+}
+
+#[test]
 fn format_conversion_both_ways() {
     let d = tempdir().unwrap();
     let png = put(d.path(), "x.png", "rgba8.png");

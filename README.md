@@ -80,7 +80,7 @@ cat in.png | rc - > out.png  # stdin to stdout
 **Quality targets** — `--target-ssim`, `--target-psnr`, `--target-ms-ssim` and `--target-size` are no longer JPEG-only: for lossy WebP, AVIF and `--lossy` PNG they bisect the cheapest quality (or palette size for PNG) that still meets the goal, and the report note shows what was chosen. JPEG still takes `--target-ssim` only.
 
 **Other formats**
-- **GIF** reads and writes still and animated files (palettes, interlacing, transparency, disposal). A GIF kept as a GIF is re-coded without changing a pixel: one shared palette, each frame stored as the rectangle that changed with the unchanged pixels transparent, and a fresh LZW pass; the original is kept when that is not smaller. A GIF whose frames need more than one 256-color palette between them would have to be re-quantized, so it is left unchanged unless `--lossy` (or `--resize`) is given. Converting *to* GIF (`-f gif`, from any format) quantizes to `--colors` entries (default 256) with one palette for the whole animation, no dithering for animations (the noise would change from frame to frame) and `--dither` for stills; GIF transparency is on/off, so pixels below 50% alpha become transparent.
+- **GIF** reads and writes still and animated files (palettes, interlacing, transparency, disposal). A GIF kept as a GIF is re-coded without changing a pixel when every frame fits a palette: frames that share one palette use a single global table, while frames whose palettes differ get a local color table each, still with each frame stored as the rectangle that changed and unchanged pixels transparent; the original is kept when that is not smaller. A GIF whose frames need more colors than 255 in a single frame (leaving room for the transparency/unchanged entry) would have to be re-quantized, so it is left unchanged unless `--lossy` (or `--resize`) is given. Converting *to* GIF (`-f gif`, from any format) quantizes to `--colors` entries (default 256) with one palette for the whole animation, no dithering for animations (the noise would change from frame to frame) and `--dither` for stills; GIF transparency is on/off, so pixels below 50% alpha become transparent.
 - CMYK and YCCK JPEGs stay four-channel and are re-quantized in the DCT domain like any other JPEG (never to a finer table than the source had, so a source at or below `-q` is transcoded losslessly with identical coefficients; the Adobe colour flag is kept). All four channels of plain CMYK use the luma table, since each is an ink amount; in YCCK, Y and K use it and the two colour-difference channels use the chroma table. Converting or resizing them goes through RGB.
 - Animated PNGs kept as PNG are passed through unchanged instead of failing the batch; other animated inputs become an animated PNG with `-f png` (APNG: lossless RGB/RGBA full-canvas frames, `--lossy` quantizes them, `--keep-hidden-pixels` preserves invisible colours).
 - **Animations** — animated GIF, APNG, animated WebP and animated AVIF inputs convert to an animated **PNG/APNG**, **AVIF**, **WebP** or **GIF** (`-f png|avif|webp|gif`; `--lossy` re-encodes an animated WebP or AVIF input). Frames keep the files' disposal and blend rules, per-frame durations and looping (a finite repeat count is played forever). **PNG/APNG**: every frame is stored as a complete canvas, so there are no dirty rectangles yet. **AVIF**: alpha as a second track, the first frame a key frame and the others inter frames predicted from the previous output (a key frame instead where that is smaller, e.g. at scene changes); on camera-pan style content 6–8 times smaller than key frames at the same PSNR; decodes in libavif and dav1d. **WebP**: lossless by default, lossy VP8 frames with `--lossy`; after the first frame only the changed rectangle is stored, and each lossless frame is tried both replacing the canvas and blended over it with the unchanged pixels transparent, keeping the smaller (lossy frames are measured against the canvas as a decoder reconstructs it, so errors do not build up). Decodes in libwebp (Pillow), pixel for pixel in the lossless case. **GIF**: see above.
@@ -99,14 +99,17 @@ cat in.png | rc - > out.png  # stdin to stdout
 rc [OPTIONS] <INPUT>...
 
   -r, --recursive         descend into subdirectories
+      --include <GLOB>    only process directory-walk files matching GLOB (repeatable)
+      --exclude <GLOB>    skip directory-walk files matching GLOB (repeatable)
+      --min-suffix <S>    default output suffix `<name>.<S>.<ext>` (default min)
   -o, --output <PATH>     output file (one input file) or directory (mirrors the input tree)
-      --in-place          replace originals, only when the result is smaller
+      --in-place          replace originals, only when the result is smaller (keeps permissions/mtime)
   -q, --quality <1-100>   JPEG quality ceiling (default 80)
-  -f, --format <FMT>      keep | png | jpeg | webp | avif (default keep)
+  -f, --format <FMT>      keep | png | jpeg | webp | avif | gif (default keep)
       --subsampling <S>   auto | 444 | 420
       --arithmetic <A>    JPEG output coding: auto (keep the source's) | on | off
       --bit-depth <D>     AVIF output: auto | 8 | 10 (auto: 10 for 16-bit sources)
-      --lossy             PNG palette quantization, lossy WebP with -f webp (animations too), re-encode an AVIF or animated WebP input, a lossless JPEG as lossy JPEG, or re-quantize a GIF that needs more than one palette (-q = quality)
+      --lossy             PNG palette quantization, lossy WebP with -f webp (animations too), re-encode an AVIF or animated WebP input, a lossless JPEG as lossy JPEG, or re-quantize a GIF that cannot be represented exactly (-q = quality)
       --colors <2-256>    with --lossy (default 256)
       --dither <0.0-1.0>  with --lossy (default 0.5)
   -l, --level <0-9>       PNG / WebP effort (default 7; PNG: 1-6 fast, 7-9 optimal parsing, 9 slowest)
@@ -127,7 +130,7 @@ rc [OPTIONS] <INPUT>...
       --quiet             only errors and the summary line
 ```
 
-`<INPUT>` may be `-` (standard input) and `-o -` writes standard output. Without `-o`/`--in-place`, `photo.jpg` becomes `photo.min.jpg`; files already named `*.min.*` are skipped when walking directories. The exit status is non-zero if any file failed; the rest of the batch still runs.
+`<INPUT>` may be `-` (standard input) and `-o -` writes standard output. Without `-o`/`--in-place`, `photo.jpg` becomes `photo.min.jpg` (`--min-suffix` changes `min`); files already ending in `.<suffix>.` are skipped when walking directories, and `--include`/`--exclude` filter directory walks by file name or path relative to each input directory (`*`/`?` stay within a component, `**` crosses directories). The exit status is non-zero if any file failed; the rest of the batch still runs.
 
 ## Head-to-head with established tools
 
