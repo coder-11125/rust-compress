@@ -7,6 +7,9 @@
   global color table; when they differ, every image gets a local color table (index 0 reserved for
   transparency/unchanged pixels) while keeping the changed-rectangle coding, disposal handling, delays and loop
   count. `palette_is_exact` now accepts either one shared palette or one local palette per frame.
+- Batch output templates and JSON reports: `--name-template` replaces the default output path pattern when `-o` and
+  `--in-place` are not used (`{root}`, `{dir}`, `{rel}`, `{rel_stem}`, `{stem}`, `{name}`, `{ext}`, `{suffix}`), and
+  `--json` prints per-file results, the summary and input-level problems as one JSON object instead of text lines.
 - CLI batch ergonomics: directory walks can be filtered with repeatable `--include`/`--exclude` globs (`*` and `?`
   stay within a path component, `**` crosses directories; patterns match the file name or the path relative to the
   input directory), default outputs use a configurable `--min-suffix` (still `<name>.<suffix>.<ext>`, and files

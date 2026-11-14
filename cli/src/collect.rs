@@ -82,7 +82,7 @@ fn is_dir_output(cli: &Cli, n_file_inputs: usize, any_dir: bool) -> bool {
     }
 }
 
-fn output_path(cli: &Cli, input: &Path, rel: &Path, dir_mode: bool) -> PathBuf {
+fn output_path(cli: &Cli, input: &Path, rel: &Path, root: &Path, dir_mode: bool) -> PathBuf {
     let fmt_in = Format::from_extension(input);
     let ext_in = input.extension().map(|e| e.to_string_lossy().into_owned());
     // Keep the original extension spelling when the format is unchanged.
@@ -107,10 +107,59 @@ fn output_path(cli: &Cli, input: &Path, rel: &Path, dir_mode: bool) -> PathBuf {
         Some(out) if dir_mode => out.join(rel).with_extension(&ext),
         Some(out) => out.clone(),
         None => {
+            if let Some(template) = &cli.name_template {
+                return PathBuf::from(render_name_template(template, cli, input, rel, root, &ext));
+            }
             let stem = input.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
             input.with_file_name(format!("{stem}.{}.{ext}", cli.min_suffix))
         }
     }
+}
+
+const TEMPLATE_VARS: &[&str] = &["root", "dir", "rel", "rel_stem", "stem", "name", "ext", "suffix"];
+
+fn validate_name_template(template: &str) -> Result<(), String> {
+    let b = template.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            b'{' => {
+                let Some(end) = template[i + 1..].find('}').map(|j| i + 1 + j) else {
+                    return Err("--name-template has an unclosed '{'".into());
+                };
+                let var = &template[i + 1..end];
+                if !TEMPLATE_VARS.contains(&var) {
+                    return Err(format!("--name-template has unknown placeholder {{{var}}}"));
+                }
+                i = end + 1;
+            }
+            b'}' => return Err("--name-template has a '}' without '{'".into()),
+            _ => i += 1,
+        }
+    }
+    Ok(())
+}
+
+fn path_text(p: &Path) -> String {
+    p.to_string_lossy().replace('\\', "/")
+}
+
+fn render_name_template(template: &str, cli: &Cli, input: &Path, rel: &Path, root: &Path, ext: &str) -> String {
+    let dir = input.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
+    let rel_stem = rel.with_extension("");
+    template
+        .replace("{root}", &path_text(root))
+        .replace("{dir}", &path_text(dir))
+        .replace("{rel_stem}", &path_text(&rel_stem))
+        .replace("{rel}", &path_text(rel))
+        .replace("{stem}", &input.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default())
+        .replace("{name}", &input.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default())
+        .replace("{ext}", ext)
+        .replace("{suffix}", &cli.min_suffix)
+}
+
+fn file_root(input: &Path) -> PathBuf {
+    input.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new(".")).to_path_buf()
 }
 
 fn is_default_output(p: &Path, suffix: &str) -> bool {
@@ -181,6 +230,12 @@ fn walk(dir: &Path, recursive: bool, suffix: &str, out: &mut Vec<PathBuf>) -> st
 /// Returns jobs plus human-readable problems with individual inputs.
 pub fn collect(cli: &Cli) -> (Vec<Job>, Vec<String>) {
     let mut problems = Vec::new();
+    if let Some(template) = &cli.name_template
+        && let Err(e) = validate_name_template(template)
+    {
+        problems.push(e);
+        return (Vec::new(), problems);
+    }
     let to_stdout = cli.output.as_deref().is_some_and(is_stdio);
     let from_stdin = cli.inputs.iter().filter(|p| is_stdio(p)).count();
     if from_stdin > 0 || to_stdout {
@@ -203,7 +258,7 @@ pub fn collect(cli: &Cli) -> (Vec<Job>, Vec<String>) {
             PathBuf::from(STDIO)
         } else {
             let rel = PathBuf::from(input.file_name().unwrap_or_default());
-            output_path(cli, &input, &rel, false)
+            output_path(cli, &input, &rel, &file_root(&input), false)
         };
         return (vec![Job { input, output }], problems);
     }
@@ -224,12 +279,12 @@ pub fn collect(cli: &Cli) -> (Vec<Job>, Vec<String>) {
                 if !wanted(cli, &rel, &name) {
                     continue;
                 }
-                let output = output_path(cli, &f, &rel, dir_mode);
+                let output = output_path(cli, &f, &rel, input, dir_mode);
                 jobs.push(Job { input: f, output });
             }
         } else if input.is_file() {
             let rel = PathBuf::from(input.file_name().unwrap_or_default());
-            let output = output_path(cli, input, &rel, dir_mode);
+            let output = output_path(cli, input, &rel, &file_root(input), dir_mode);
             jobs.push(Job { input: input.clone(), output });
         } else {
             problems.push(format!("{}: no such file or directory", input.display()));

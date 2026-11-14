@@ -88,6 +88,13 @@ pub struct Cli {
     #[arg(long, default_value = "min", value_parser = parse_suffix)]
     pub min_suffix: String,
 
+    /// Output path template when no -o/--in-place is given. Placeholders: {root} (the directory input for
+    /// walked files, else the input's parent), {dir} (the input file's parent), {rel} / {rel_stem} (path
+    /// relative to {root}, without extension for the latter), {stem}, {name}, {ext} and {suffix}.
+    /// Relative results are relative to the current directory; the default is `{root}/{rel_stem}.{suffix}.{ext}`.
+    #[arg(long, value_name = "TEMPLATE", conflicts_with_all = ["output", "in_place"])]
+    pub name_template: Option<String>,
+
     /// Output file (single input file) or output directory; `-` writes the image to standard output.
     /// Default: write `<name>.<suffix>.<ext>` next to each input (standard input defaults to standard output).
     #[arg(short, long, value_name = "PATH")]
@@ -203,6 +210,11 @@ pub struct Cli {
     /// Only print errors and the final summary line.
     #[arg(long)]
     pub quiet: bool,
+
+    /// Print the batch report as one JSON object instead of text lines (goes to stderr when the image itself
+    /// is written to stdout).
+    #[arg(long)]
+    pub json: bool,
 }
 
 fn parse_hex_color(s: &str) -> Result<[u8; 3], String> {

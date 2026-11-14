@@ -728,7 +728,14 @@ fn animation_to(mut anim: Animation, in_fmt: Format, out_fmt: Format, cli: &Cli)
 }
 
 pub fn process(job: &Job, cli: &Cli) -> Report {
-    let mut report = Report { input: job.input.clone(), in_size: 0, out_size: 0, status: Status::NoGain, note: None };
+    let mut report = Report {
+        input: job.input.clone(),
+        output: job.output.clone(),
+        in_size: 0,
+        out_size: 0,
+        status: Status::NoGain,
+        note: None,
+    };
     let read = if is_stdio(&job.input) {
         let mut buf = Vec::new();
         std::io::stdin().lock().read_to_end(&mut buf).map(|_| buf)

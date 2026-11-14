@@ -12,6 +12,7 @@ pub enum Status {
 #[derive(Debug)]
 pub struct Report {
     pub input: PathBuf,
+    pub output: PathBuf,
     pub in_size: u64,
     pub out_size: u64,
     pub status: Status,
@@ -101,4 +102,88 @@ impl Summary {
             secs
         )
     }
+}
+
+fn json_escape(out: &mut String, s: &str) {
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if c < ' ' => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+}
+
+fn json_str(out: &mut String, key: &str, value: &str) {
+    out.push_str(&format!("\"{key}\":"));
+    json_escape(out, value);
+}
+
+fn change_percent(from: u64, to: u64) -> String {
+    if from == 0 { "null".into() } else { format!("{:.1}", (to as f64 - from as f64) * 100.0 / from as f64) }
+}
+
+fn status_name(status: &Status) -> &'static str {
+    match status {
+        Status::Compressed => "compressed",
+        Status::NoGain => "no_gain",
+        Status::Failed(_) => "failed",
+    }
+}
+
+/// One JSON object describing the whole batch: per-file results, the summary and input-level problems.
+pub fn json(files: &[Report], summary: &Summary, errors: &[String], secs: f64, dry_run: bool) -> String {
+    let mut out = String::new();
+    out.push('{');
+    out.push_str(&format!("\"dry_run\":{dry_run},\"files\":["));
+    for (i, r) in files.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        out.push('{');
+        json_str(&mut out, "input", &r.input.to_string_lossy());
+        out.push(',');
+        json_str(&mut out, "output", &r.output.to_string_lossy());
+        out.push(',');
+        json_str(&mut out, "status", status_name(&r.status));
+        out.push(',');
+        out.push_str(&format!("\"bytes_in\":{},\"bytes_out\":{}", r.in_size, r.out_size));
+        out.push(',');
+        out.push_str(&format!("\"change_percent\":{}", change_percent(r.in_size, r.out_size)));
+        if let Some(note) = &r.note {
+            out.push(',');
+            json_str(&mut out, "note", note);
+        }
+        if let Status::Failed(e) = &r.status {
+            out.push(',');
+            json_str(&mut out, "error", e);
+        }
+        out.push('}');
+    }
+    out.push_str("],\"summary\":{");
+    out.push_str(&format!(
+        "\"files\":{},\"compressed\":{},\"no_gain\":{},\"failed\":{},\"bytes_in\":{},\"bytes_out\":{},\"change_percent\":{},\"seconds\":{secs:.2}",
+        summary.files,
+        summary.compressed,
+        summary.no_gain,
+        summary.failed,
+        summary.bytes_in,
+        summary.bytes_out,
+        change_percent(summary.bytes_in, summary.bytes_out),
+    ));
+    out.push_str("},\"errors\":[");
+    for (i, e) in errors.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        json_escape(&mut out, e);
+    }
+    out.push_str("]}");
+    out
 }

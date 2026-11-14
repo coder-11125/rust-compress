@@ -113,6 +113,53 @@ fn min_suffix_names_default_outputs_and_marks_them_for_walks() {
     assert!(!out.join("a.optimized.jpg").exists());
 }
 
+#[test]
+fn name_template_controls_default_output_paths() {
+    let d = tempdir().unwrap();
+    put(d.path(), "in/a.png", "rgb8.png");
+    put(d.path(), "in/sub/b.jpg", "rgb8.jpg");
+    cmd()
+        .arg(d.path().join("in"))
+        .arg("-r")
+        .args(["--name-template", "{root}/tpl/{rel_stem}.{suffix}.{ext}"])
+        .assert()
+        .success();
+    assert!(d.path().join("in/tpl/a.min.png").exists());
+    assert!(d.path().join("in/tpl/sub/b.min.jpg").exists());
+    assert!(!d.path().join("in/a.min.png").exists());
+    assert!(!d.path().join("in/sub/b.min.jpg").exists());
+}
+
+#[test]
+fn name_template_rejects_unknown_placeholders() {
+    let d = tempdir().unwrap();
+    let input = put(d.path(), "a.png", "rgb8.png");
+    let res = cmd().arg(&input).args(["--name-template", "{bogus}"]).assert().failure();
+    let stderr = String::from_utf8_lossy(&res.get_output().stderr);
+    assert!(stderr.contains("unknown placeholder"), "{stderr}");
+}
+
+#[test]
+fn json_report_replaces_text_output() {
+    let d = tempdir().unwrap();
+    let good = put(d.path(), "good.png", "rgb8.png");
+    let res = cmd().arg(&good).arg("--json").assert().success();
+    let stdout = String::from_utf8_lossy(&res.get_output().stdout);
+    assert!(stdout.trim_start().starts_with('{'), "{stdout}");
+    assert!(stdout.contains("\"files\":["), "{stdout}");
+    assert!(stdout.contains("good.png"), "{stdout}");
+    assert!(stdout.contains("\"status\":"), "{stdout}");
+    assert!(stdout.contains("\"summary\":{"), "{stdout}");
+    assert!(!stdout.contains("file(s):"), "{stdout}");
+
+    let bad = d.path().join("bad.png");
+    fs::write(&bad, b"not a png").unwrap();
+    let res = cmd().arg(&bad).arg("--json").assert().failure();
+    let stdout = String::from_utf8_lossy(&res.get_output().stdout);
+    assert!(stdout.contains("\"status\":\"failed\""), "{stdout}");
+    assert!(stdout.contains("\"failed\":1"), "{stdout}");
+}
+
 #[cfg(unix)]
 #[test]
 fn in_place_preserves_permissions() {

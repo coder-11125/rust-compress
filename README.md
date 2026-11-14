@@ -102,6 +102,7 @@ rc [OPTIONS] <INPUT>...
       --include <GLOB>    only process directory-walk files matching GLOB (repeatable)
       --exclude <GLOB>    skip directory-walk files matching GLOB (repeatable)
       --min-suffix <S>    default output suffix `<name>.<S>.<ext>` (default min)
+      --name-template <T> output path template when no -o/--in-place ({root},{dir},{rel},{rel_stem},{stem},{name},{ext},{suffix})
   -o, --output <PATH>     output file (one input file) or directory (mirrors the input tree)
       --in-place          replace originals, only when the result is smaller (keeps permissions/mtime)
   -q, --quality <1-100>   JPEG quality ceiling (default 80)
@@ -128,9 +129,10 @@ rc [OPTIONS] <INPUT>...
       --dry-run           report savings without writing
       --force             overwrite existing outputs
       --quiet             only errors and the summary line
+      --json              print the batch report as one JSON object
 ```
 
-`<INPUT>` may be `-` (standard input) and `-o -` writes standard output. Without `-o`/`--in-place`, `photo.jpg` becomes `photo.min.jpg` (`--min-suffix` changes `min`); files already ending in `.<suffix>.` are skipped when walking directories, and `--include`/`--exclude` filter directory walks by file name or path relative to each input directory (`*`/`?` stay within a component, `**` crosses directories). The exit status is non-zero if any file failed; the rest of the batch still runs.
+`<INPUT>` may be `-` (standard input) and `-o -` writes standard output. Without `-o`/`--in-place`, `photo.jpg` becomes `photo.min.jpg` (`--min-suffix` changes `min`, `--name-template` replaces the whole path pattern); files already ending in `.<suffix>.` are skipped when walking directories, and `--include`/`--exclude` filter directory walks by file name or path relative to each input directory (`*`/`?` stay within a component, `**` crosses directories). `--json` prints per-file results plus the summary as JSON (to stderr when the image itself goes to stdout). The exit status is non-zero if any file failed; the rest of the batch still runs.
 
 ## Head-to-head with established tools
 

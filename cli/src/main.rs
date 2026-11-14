@@ -30,11 +30,16 @@ fn main() -> ExitCode {
     }
     let start = Instant::now();
     let (jobs, problems) = collect(&cli);
-    for p in &problems {
-        eprintln!("error: {p}");
+    if !cli.json {
+        for p in &problems {
+            eprintln!("error: {p}");
+        }
     }
     if jobs.is_empty() {
-        if problems.is_empty() {
+        if cli.json {
+            let summary = Summary { failed: problems.len(), ..Summary::default() };
+            println!("{}", report::json(&[], &summary, &problems, start.elapsed().as_secs_f64(), cli.dry_run));
+        } else if problems.is_empty() {
             eprintln!("error: no PNG or JPEG files found (use -r to descend into subdirectories)");
         }
         return ExitCode::from(1);
@@ -45,14 +50,16 @@ fn main() -> ExitCode {
         .par_iter()
         .map(|job| {
             let r = process(job, &cli);
-            let failed = matches!(r.status, Status::Failed(_));
-            if failed {
-                eprintln!("{}", r.line(cli.dry_run));
-            } else if !cli.quiet {
-                if data_on_stdout {
+            if !cli.json {
+                let failed = matches!(r.status, Status::Failed(_));
+                if failed {
                     eprintln!("{}", r.line(cli.dry_run));
-                } else {
-                    println!("{}", r.line(cli.dry_run));
+                } else if !cli.quiet {
+                    if data_on_stdout {
+                        eprintln!("{}", r.line(cli.dry_run));
+                    } else {
+                        println!("{}", r.line(cli.dry_run));
+                    }
                 }
             }
             r
@@ -63,11 +70,20 @@ fn main() -> ExitCode {
         summary.add(r);
     }
     summary.failed += problems.len();
-    let line = summary.line(start.elapsed().as_secs_f64());
-    if data_on_stdout {
-        eprintln!("{line}");
+    if cli.json {
+        let json = report::json(&reports, &summary, &problems, start.elapsed().as_secs_f64(), cli.dry_run);
+        if data_on_stdout {
+            eprintln!("{json}");
+        } else {
+            println!("{json}");
+        }
     } else {
-        println!("{line}");
+        let line = summary.line(start.elapsed().as_secs_f64());
+        if data_on_stdout {
+            eprintln!("{line}");
+        } else {
+            println!("{line}");
+        }
     }
     if summary.failed > 0 { ExitCode::from(1) } else { ExitCode::SUCCESS }
 }
