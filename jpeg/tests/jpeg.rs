@@ -137,7 +137,8 @@ fn s422_layout_and_fidelity() {
         }
     }
     let img = Image::new(w, h, ColorType::Rgb, 8, data).unwrap();
-    let jpg = encode(&img, &EncodeOptions { quality: 92, subsampling: Subsampling::S422, ..Default::default() }).unwrap();
+    let jpg =
+        encode(&img, &EncodeOptions { quality: 92, subsampling: Subsampling::S422, ..Default::default() }).unwrap();
     // SOF0/SOF2 component 1 sampling factors must be 2x1 and chroma 1x1.
     let sof = jpg.windows(2).position(|w| w == [0xFF, 0xC0] || w == [0xFF, 0xC2]).unwrap();
     assert_eq!(&jpg[sof + 10..sof + 19], &[1, 0x21, 0, 2, 0x11, 1, 3, 0x11, 1]);

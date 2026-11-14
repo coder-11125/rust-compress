@@ -23,12 +23,7 @@ pub fn inflate_with_end(data: &[u8], size_hint: usize, max_out: usize) -> Result
 
 /// Like [`inflate_with_end`], with `dict` as the history preceding the stream (a preset dictionary).
 /// The dictionary is not part of the returned output.
-pub fn inflate_with_end_dict(
-    data: &[u8],
-    dict: &[u8],
-    size_hint: usize,
-    max_out: usize,
-) -> Result<(Vec<u8>, usize)> {
+pub fn inflate_with_end_dict(data: &[u8], dict: &[u8], size_hint: usize, max_out: usize) -> Result<(Vec<u8>, usize)> {
     let dict = &dict[dict.len().saturating_sub(super::lz77::WINDOW)..];
     let max_out = max_out.saturating_add(dict.len());
     let mut r = LsbReader::new(data);
