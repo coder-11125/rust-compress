@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- APNG dirty rectangles and blend modes: after the first frame, each frame is stored as only the rectangle that
+  changed from the previous canvas (`fcTL` offsets), using `APNG_BLEND_OP_OVER` when that is exact and smaller
+  (unchanged pixels inside the rectangle become transparent; only possible when every changed pixel is opaque) and
+  `SOURCE` otherwise. A frame identical to its predecessor becomes a 1x1 no-op, so frame counts and delays are
+  unchanged. Frames are compressed in parallel. Dispose operations are not used yet.
 - gzip and zlib preset dictionaries (`rc-deflate`): `gzip_compress`/`gzip_decompress` (RFC 1952; the decoder reads
   concatenated members and the optional extra/name/comment/header-CRC fields, and checks CRC-32 and size), and
   `zlib_compress_dict`/`zlib_decompress_dict` plus `deflate_compress_dict`/`inflate_with_end_dict` for streams that

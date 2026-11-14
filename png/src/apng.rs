@@ -3,6 +3,7 @@
 
 use super::SIGNATURE;
 use super::encode::{EncodeOptions, idat_for_rows};
+use rayon::prelude::*;
 use rc_core::animation::{AnimFrame, Animation, MAX_ANIMATION_PIXELS, normalize_delay};
 use rc_core::error::{Error, Result};
 use rc_core::image::{ColorType, Image, MAX_PIXELS};
@@ -236,18 +237,29 @@ fn delay_ratio(ms: u32) -> (u16, u16) {
     (num, den)
 }
 
-fn frame_ctl(seq: u32, w: u32, h: u32, delay_ms: u32) -> Vec<u8> {
+/// Where a frame's pixels go on the canvas and how they combine with what is already there.
+#[derive(Clone, Copy)]
+struct Region {
+    x: usize,
+    y: usize,
+    w: usize,
+    h: usize,
+    /// APNG_BLEND_OP_OVER (true) or APNG_BLEND_OP_SOURCE (false).
+    over: bool,
+}
+
+fn frame_ctl(seq: u32, r: Region, delay_ms: u32) -> Vec<u8> {
     let mut b = Vec::with_capacity(26);
     b.extend_from_slice(&seq.to_be_bytes());
-    b.extend_from_slice(&w.to_be_bytes());
-    b.extend_from_slice(&h.to_be_bytes());
-    b.extend_from_slice(&0u32.to_be_bytes());
-    b.extend_from_slice(&0u32.to_be_bytes());
+    b.extend_from_slice(&(r.w as u32).to_be_bytes());
+    b.extend_from_slice(&(r.h as u32).to_be_bytes());
+    b.extend_from_slice(&(r.x as u32).to_be_bytes());
+    b.extend_from_slice(&(r.y as u32).to_be_bytes());
     let (num, den) = delay_ratio(delay_ms);
     b.extend_from_slice(&num.to_be_bytes());
     b.extend_from_slice(&den.to_be_bytes());
-    b.push(0); // APNG_DISPOSE_OP_NONE: the next frame covers the whole canvas anyway.
-    b.push(0); // APNG_BLEND_OP_SOURCE: every frame is a complete canvas.
+    b.push(0); // APNG_DISPOSE_OP_NONE: the canvas simply carries over to the next frame.
+    b.push(r.over as u8);
     b
 }
 
@@ -296,8 +308,61 @@ fn clean_transparent(img: &mut Image) {
     }
 }
 
-/// Encode an animation as an APNG. Every frame is stored as a complete canvas (no dirty rectangles yet), so
-/// blend is always SOURCE; `clean_alpha` rewrites the invisible colour of fully transparent pixels.
+/// Smallest rectangle holding every pixel that differs between two canvases (`None` when they are the same).
+/// With `ignore_hidden`, two fully transparent pixels count as equal whatever their colour.
+fn dirty_rect(
+    prev: &[u8],
+    cur: &[u8],
+    w: usize,
+    h: usize,
+    ch: usize,
+    ignore_hidden: bool,
+) -> Option<(usize, usize, usize, usize)> {
+    let differs = |i: usize| {
+        let (a, b) = (&prev[i * ch..(i + 1) * ch], &cur[i * ch..(i + 1) * ch]);
+        a != b && !(ignore_hidden && ch == 4 && a[3] == 0 && b[3] == 0)
+    };
+    let (mut x0, mut y0, mut x1, mut y1) = (w, h, 0, 0);
+    for y in 0..h {
+        for x in 0..w {
+            if differs(y * w + x) {
+                x0 = x0.min(x);
+                x1 = x1.max(x + 1);
+                y0 = y0.min(y);
+                y1 = y + 1;
+            }
+        }
+    }
+    (x1 > x0).then(|| (x0, y0, x1 - x0, y1 - y0))
+}
+
+/// Pixels of `r` cut out of `cur`. For OVER, pixels equal to the previous canvas become fully transparent so they
+/// leave it untouched (and compress to nothing); returns `None` when some changed pixel is not opaque, since OVER
+/// can then not reproduce it exactly.
+fn region_pixels(prev: &[u8], cur: &[u8], w: usize, ch: usize, r: Region, ignore_hidden: bool) -> Option<Vec<u8>> {
+    let mut out = Vec::with_capacity(r.w * r.h * ch);
+    for y in r.y..r.y + r.h {
+        for x in r.x..r.x + r.w {
+            let i = (y * w + x) * ch;
+            let (a, b) = (&prev[i..i + ch], &cur[i..i + ch]);
+            if !r.over {
+                out.extend_from_slice(b);
+            } else if a == b || (ignore_hidden && a[3] == 0 && b[3] == 0) {
+                out.extend_from_slice(&[0, 0, 0, 0]);
+            } else if b[3] == 255 {
+                out.extend_from_slice(b);
+            } else {
+                return None;
+            }
+        }
+    }
+    Some(out)
+}
+
+/// Encode an animation as an APNG. After the first frame (a full canvas), each frame stores only the rectangle that
+/// changed from the previous canvas, using APNG_BLEND_OP_OVER when that is exact and smaller (unchanged pixels inside
+/// the rectangle become transparent) and SOURCE otherwise. A frame identical to the one before it is a 1x1 no-op.
+/// `clean_alpha` rewrites the invisible colour of fully transparent pixels.
 pub fn encode_animation(anim: &Animation, opts: &EncodeOptions) -> Result<Vec<u8>> {
     let (w, h) = (anim.width, anim.height);
     if anim.frames.is_empty() {
@@ -317,16 +382,47 @@ pub fn encode_animation(anim: &Animation, opts: &EncodeOptions) -> Result<Vec<u8
     let alpha = anim.frames.iter().any(|f| f.image.color.has_alpha());
     let color_type = if alpha { 6 } else { 2 };
     let ch = if alpha { 4 } else { 3 };
-    let row_bytes = w as usize * ch;
 
-    let mut idats = Vec::with_capacity(anim.frames.len());
+    let mut canvases = Vec::with_capacity(anim.frames.len());
     for f in &anim.frames {
         let mut img = normalize(&f.image, alpha);
         if alpha && opts.clean_alpha {
             clean_transparent(&mut img);
         }
-        idats.push(idat_for_rows(&img.data, row_bytes, ch, 8, color_type, opts.level));
+        canvases.push(img.data);
     }
+    let (wu, hu) = (w as usize, h as usize);
+    let hidden_equal = alpha && opts.clean_alpha;
+    let level = opts.level;
+    let encode_region = |pix: &[u8], r: Region| idat_for_rows(pix, r.w * ch, ch, 8, color_type, level);
+    let planned: Vec<(Region, Vec<u8>)> = (0..canvases.len())
+        .into_par_iter()
+        .map(|i| {
+            let full = Region { x: 0, y: 0, w: wu, h: hu, over: false };
+            if i == 0 {
+                return (full, encode_region(&canvases[0], full));
+            }
+            let (prev, cur) = (&canvases[i - 1], &canvases[i]);
+            let Some((x, y, rw, rh)) = dirty_rect(prev, cur, wu, hu, ch, hidden_equal) else {
+                // Nothing changed: a single pixel that leaves the canvas as it is.
+                let r = Region { x: 0, y: 0, w: 1, h: 1, over: alpha };
+                let px = if alpha { vec![0, 0, 0, 0] } else { cur[..3].to_vec() };
+                return (r, encode_region(&px, r));
+            };
+            let src = Region { x, y, w: rw, h: rh, over: false };
+            let source = encode_region(&region_pixels(prev, cur, wu, ch, src, hidden_equal).unwrap(), src);
+            if alpha {
+                let over = Region { over: true, ..src };
+                if let Some(px) = region_pixels(prev, cur, wu, ch, over, hidden_equal) {
+                    let o = encode_region(&px, over);
+                    if o.len() < source.len() {
+                        return (over, o);
+                    }
+                }
+            }
+            (src, source)
+        })
+        .collect();
 
     let mut out = SIGNATURE.to_vec();
     let mut ihdr = Vec::with_capacity(13);
@@ -343,8 +439,8 @@ pub fn encode_animation(anim: &Animation, opts: &EncodeOptions) -> Result<Vec<u8
     // APNG sequence numbers count fcTL and fdAT chunks, not frames: every chunk after acTL
     // takes the next number, while IDAT has no sequence number.
     let mut seq = 0u32;
-    for (i, (f, idat)) in anim.frames.iter().zip(idats).enumerate() {
-        push_chunk(&mut out, b"fcTL", &frame_ctl(seq, w, h, normalize_delay(f.duration_ms)));
+    for (i, (f, (region, idat))) in anim.frames.iter().zip(planned).enumerate() {
+        push_chunk(&mut out, b"fcTL", &frame_ctl(seq, region, normalize_delay(f.duration_ms)));
         seq += 1;
         if i == 0 {
             for chunk in idat.chunks(1 << 20) {
