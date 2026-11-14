@@ -2,7 +2,7 @@ use super::lz77::{Matcher, Params, Token, WINDOW};
 use super::{CL_ORDER, DIST_BASE, DIST_EXTRA, LEN_BASE, LEN_EXTRA};
 use rayon::prelude::*;
 use rc_core::util::bitio::LsbWriter;
-use rc_core::util::checksum::adler32;
+use rc_core::util::checksum::{adler32, crc32};
 use rc_core::util::huffman::{build_lengths, lsb_codes};
 
 const BLOCK_TOKENS: usize = 1 << 14;
@@ -344,23 +344,37 @@ fn compress_range(data: &[u8], start: usize, end: usize, level: u32, is_last: bo
 
 /// Compress to a raw DEFLATE stream. Levels: 0 = stored, 1 (fastest) .. 9 (smallest).
 pub fn deflate_compress(data: &[u8], level: u32) -> Vec<u8> {
+    deflate_compress_dict(data, level, &[])
+}
+
+/// Like [`deflate_compress`], with `dict` available as match history (only its last 32 KiB can be
+/// referenced). The decoder must be given the same dictionary.
+pub fn deflate_compress_dict(data: &[u8], level: u32, dict: &[u8]) -> Vec<u8> {
     if level == 0 || data.is_empty() {
         let mut w = LsbWriter::with_capacity(data.len() + 16);
         write_stored(&mut w, data, true);
         return w.finish();
     }
+    let dict = &dict[dict.len().saturating_sub(WINDOW)..];
+    let joined;
+    let (buf, off) = if dict.is_empty() {
+        (data, 0)
+    } else {
+        joined = [dict, data].concat();
+        (&joined[..], dict.len())
+    };
     let nseg = data.len().div_ceil(SEGMENT);
     if nseg == 1 {
-        return compress_range(data, 0, data.len(), level, true);
+        return compress_range(buf, off, buf.len(), level, true);
     }
     let parts: Vec<Vec<u8>> = (0..nseg)
         .into_par_iter()
-        .map(|i| compress_range(data, i * SEGMENT, ((i + 1) * SEGMENT).min(data.len()), level, i + 1 == nseg))
+        .map(|i| compress_range(buf, off + i * SEGMENT, (off + (i + 1) * SEGMENT).min(buf.len()), level, i + 1 == nseg))
         .collect();
     parts.concat()
 }
 
-pub fn zlib_compress(data: &[u8], level: u32) -> Vec<u8> {
+fn zlib_header(level: u32, fdict: bool) -> [u8; 2] {
     let flevel = match level {
         0 | 1 => 0,
         2..=5 => 1,
@@ -368,14 +382,45 @@ pub fn zlib_compress(data: &[u8], level: u32) -> Vec<u8> {
         _ => 3,
     };
     let cmf = 0x78u16;
-    let mut flg = flevel << 6;
+    let mut flg = flevel << 6 | (fdict as u16) << 5;
     flg += 31 - ((cmf << 8) + flg) % 31;
+    [cmf as u8, flg as u8]
+}
+
+pub fn zlib_compress(data: &[u8], level: u32) -> Vec<u8> {
     let body = deflate_compress(data, level);
     let mut out = Vec::with_capacity(body.len() + 6);
-    out.push(cmf as u8);
-    out.push(flg as u8);
+    out.extend_from_slice(&zlib_header(level, false));
     out.extend_from_slice(&body);
     out.extend_from_slice(&adler32(data).to_be_bytes());
+    out
+}
+
+/// zlib stream using a preset dictionary (FDICT set, dictionary Adler-32 in the header).
+pub fn zlib_compress_dict(data: &[u8], level: u32, dict: &[u8]) -> Vec<u8> {
+    let body = deflate_compress_dict(data, level, dict);
+    let mut out = Vec::with_capacity(body.len() + 10);
+    out.extend_from_slice(&zlib_header(level, true));
+    out.extend_from_slice(&adler32(dict).to_be_bytes());
+    out.extend_from_slice(&body);
+    out.extend_from_slice(&adler32(data).to_be_bytes());
+    out
+}
+
+/// gzip (RFC 1952) member: 10-byte header (no name, no mtime, OS unknown), DEFLATE body, CRC-32 and
+/// input size (mod 2^32) trailer.
+pub fn gzip_compress(data: &[u8], level: u32) -> Vec<u8> {
+    let body = deflate_compress(data, level);
+    let xfl = match level {
+        9 => 2,
+        0 | 1 => 4,
+        _ => 0,
+    };
+    let mut out = Vec::with_capacity(body.len() + 18);
+    out.extend_from_slice(&[0x1F, 0x8B, 8, 0, 0, 0, 0, 0, xfl, 255]);
+    out.extend_from_slice(&body);
+    out.extend_from_slice(&crc32(data).to_le_bytes());
+    out.extend_from_slice(&(data.len() as u32).to_le_bytes());
     out
 }
 

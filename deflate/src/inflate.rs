@@ -1,7 +1,7 @@
 use super::{CL_ORDER, DIST_BASE, DIST_EXTRA, LEN_BASE, LEN_EXTRA};
 use rc_core::error::{Error, Result};
 use rc_core::util::bitio::LsbReader;
-use rc_core::util::checksum::adler32;
+use rc_core::util::checksum::{adler32, crc32};
 use rc_core::util::huffman::Decoder;
 
 fn fixed_decoders() -> (Decoder, Decoder) {
@@ -18,8 +18,22 @@ pub fn inflate(data: &[u8], size_hint: usize, max_out: usize) -> Result<Vec<u8>>
 
 /// Like [`inflate`], also returning how many input bytes the stream occupied.
 pub fn inflate_with_end(data: &[u8], size_hint: usize, max_out: usize) -> Result<(Vec<u8>, usize)> {
+    inflate_with_end_dict(data, &[], size_hint, max_out)
+}
+
+/// Like [`inflate_with_end`], with `dict` as the history preceding the stream (a preset dictionary).
+/// The dictionary is not part of the returned output.
+pub fn inflate_with_end_dict(
+    data: &[u8],
+    dict: &[u8],
+    size_hint: usize,
+    max_out: usize,
+) -> Result<(Vec<u8>, usize)> {
+    let dict = &dict[dict.len().saturating_sub(super::lz77::WINDOW)..];
+    let max_out = max_out.saturating_add(dict.len());
     let mut r = LsbReader::new(data);
-    let mut out: Vec<u8> = Vec::with_capacity(size_hint.min(max_out).min(1 << 26));
+    let mut out: Vec<u8> = Vec::with_capacity((size_hint + dict.len()).min(max_out).min(1 << 26));
+    out.extend_from_slice(dict);
     let mut fixed: Option<(Decoder, Decoder)> = None;
     loop {
         r.refill();
@@ -56,6 +70,7 @@ pub fn inflate_with_end(data: &[u8], size_hint: usize, max_out: usize) -> Result
             break;
         }
     }
+    out.drain(..dict.len());
     Ok((out, r.byte_pos()))
 }
 
@@ -149,8 +164,15 @@ fn inflate_block(r: &mut LsbReader, out: &mut Vec<u8>, ll: &Decoder, dist: &Deco
     }
 }
 
-/// Decompress a zlib stream (verifying the Adler-32 trailer).
+/// Decompress a zlib stream (verifying the Adler-32 trailer). Streams that need a preset
+/// dictionary are rejected; use [`zlib_decompress_dict`] for those.
 pub fn zlib_decompress(data: &[u8], size_hint: usize, max_out: usize) -> Result<Vec<u8>> {
+    zlib_decompress_dict(data, &[], size_hint, max_out)
+}
+
+/// Decompress a zlib stream, supplying `dict` if the header asks for a preset dictionary (its
+/// Adler-32 must match the stream's DICTID). `dict` is ignored when the stream does not use one.
+pub fn zlib_decompress_dict(data: &[u8], dict: &[u8], size_hint: usize, max_out: usize) -> Result<Vec<u8>> {
     if data.len() < 6 {
         return Err(Error::invalid("zlib stream too short"));
     }
@@ -158,15 +180,87 @@ pub fn zlib_decompress(data: &[u8], size_hint: usize, max_out: usize) -> Result<
     if cmf & 0x0F != 8 || (cmf >> 4) > 7 || !((cmf as u16) << 8 | flg as u16).is_multiple_of(31) {
         return Err(Error::invalid("bad zlib header"));
     }
+    let mut pos = 2;
+    let mut dict = dict;
     if flg & 0x20 != 0 {
-        return Err(Error::unsupported("zlib preset dictionary"));
+        let id = data.get(2..6).ok_or_else(|| Error::invalid("missing zlib dictionary id"))?;
+        if dict.is_empty() {
+            return Err(Error::unsupported("zlib preset dictionary required"));
+        }
+        if u32::from_be_bytes(id.try_into().unwrap()) != adler32(dict) {
+            return Err(Error::invalid("zlib dictionary does not match"));
+        }
+        pos = 6;
+    } else {
+        dict = &[];
     }
-    let (out, used) = inflate_with_end(&data[2..], size_hint, max_out)?;
-    let tail = data.get(2 + used..2 + used + 4).ok_or_else(|| Error::invalid("missing adler32"))?;
+    let (out, used) = inflate_with_end_dict(&data[pos..], dict, size_hint, max_out)?;
+    pos += used;
+    let tail = data.get(pos..pos + 4).ok_or_else(|| Error::invalid("missing adler32"))?;
     if u32::from_be_bytes(tail.try_into().unwrap()) != adler32(&out) {
         return Err(Error::invalid("adler32 mismatch"));
     }
     Ok(out)
+}
+
+/// Decompress gzip data (RFC 1952): one or more concatenated members, each checked against its
+/// CRC-32 and size trailer. Zero padding after a member is ignored; anything else is an error.
+pub fn gzip_decompress(data: &[u8], size_hint: usize, max_out: usize) -> Result<Vec<u8>> {
+    let mut out: Vec<u8> = Vec::new();
+    let mut rest = data;
+    loop {
+        let (member, used) = gzip_member(rest, size_hint, max_out - out.len())?;
+        out.extend_from_slice(&member);
+        rest = &rest[used..];
+        if rest.is_empty() || rest.iter().all(|&b| b == 0) {
+            return Ok(out);
+        }
+    }
+}
+
+fn gzip_member(data: &[u8], size_hint: usize, max_out: usize) -> Result<(Vec<u8>, usize)> {
+    let trunc = || Error::invalid("truncated gzip header");
+    if data.len() < 10 || data[0] != 0x1F || data[1] != 0x8B {
+        return Err(Error::invalid("not a gzip stream"));
+    }
+    if data[2] != 8 {
+        return Err(Error::unsupported("gzip compression method"));
+    }
+    let flg = data[3];
+    if flg & 0xE0 != 0 {
+        return Err(Error::invalid("reserved gzip flags"));
+    }
+    let mut pos = 10;
+    if flg & 4 != 0 {
+        let n = u16::from_le_bytes(data.get(pos..pos + 2).ok_or_else(trunc)?.try_into().unwrap()) as usize;
+        pos += 2 + n;
+        if pos > data.len() {
+            return Err(trunc());
+        }
+    }
+    for bit in [8, 16] {
+        if flg & bit != 0 {
+            let nul = data.get(pos..).ok_or_else(trunc)?.iter().position(|&b| b == 0).ok_or_else(trunc)?;
+            pos += nul + 1;
+        }
+    }
+    if flg & 2 != 0 {
+        let h = data.get(pos..pos + 2).ok_or_else(trunc)?;
+        if u16::from_le_bytes([h[0], h[1]]) != crc32(&data[..pos]) as u16 {
+            return Err(Error::invalid("gzip header crc mismatch"));
+        }
+        pos += 2;
+    }
+    let (out, used) = inflate_with_end(&data[pos..], size_hint, max_out)?;
+    pos += used;
+    let tail = data.get(pos..pos + 8).ok_or_else(|| Error::invalid("missing gzip trailer"))?;
+    if u32::from_le_bytes(tail[..4].try_into().unwrap()) != crc32(&out) {
+        return Err(Error::invalid("gzip crc32 mismatch"));
+    }
+    if u32::from_le_bytes(tail[4..].try_into().unwrap()) != out.len() as u32 {
+        return Err(Error::invalid("gzip size mismatch"));
+    }
+    Ok((out, pos + 8))
 }
 
 /// Structure of a DEFLATE stream, for tuning the encoder against other implementations.

@@ -14,6 +14,8 @@ pub enum Subsampling {
     /// 4:4:4 for quality >= 90, otherwise 4:2:0.
     Auto,
     S444,
+    /// Chroma halved horizontally only (2x1 luma blocks per MCU).
+    S422,
     S420,
 }
 
@@ -422,13 +424,17 @@ pub fn encode(img: &Image, opts: &EncodeOptions) -> Result<Vec<u8>> {
 pub fn build_coefs(src: &Image, opts: &EncodeOptions) -> CoefImage {
     let (w, h) = (src.width as usize, src.height as usize);
     let gray = src.color == ColorType::Gray;
-    let sub420 = !gray
-        && match opts.subsampling {
-            Subsampling::S420 => true,
-            Subsampling::S444 => false,
-            Subsampling::Auto => opts.quality < 90,
-        };
-    let (hmax, vmax) = if sub420 { (2, 2) } else { (1, 1) };
+    let (hmax, vmax) = if gray {
+        (1, 1)
+    } else {
+        match opts.subsampling {
+            Subsampling::S420 => (2, 2),
+            Subsampling::S422 => (2, 1),
+            Subsampling::S444 => (1, 1),
+            Subsampling::Auto if opts.quality < 90 => (2, 2),
+            Subsampling::Auto => (1, 1),
+        }
+    };
     let (mcu_w, mcu_h) = (8 * hmax, 8 * vmax);
     let mcus_x = w.div_ceil(mcu_w);
     let mcus_y = h.div_ceil(mcu_h);
@@ -467,15 +473,20 @@ pub fn build_coefs(src: &Image, opts: &EncodeOptions) -> CoefImage {
                 }
             },
         );
-        let (cb, cr, cw, ch) = if sub420 {
-            let (cw, ch) = (pw / 2, ph / 2);
+        let (cb, cr, cw, ch) = if hmax * vmax > 1 {
+            let (cw, ch) = (pw / hmax, ph / vmax);
             let down = |p: &[u8]| -> Vec<u8> {
                 let mut o = vec![0u8; cw * ch];
                 o.par_chunks_mut(cw).enumerate().for_each(|(r, row)| {
                     for (x, d) in row.iter_mut().enumerate() {
-                        let i = 2 * r * pw + 2 * x;
-                        let s = p[i] as u32 + p[i + 1] as u32 + p[i + pw] as u32 + p[i + pw + 1] as u32;
-                        *d = ((s + 2) >> 2) as u8;
+                        let mut s = 0u32;
+                        for dy in 0..vmax {
+                            for dx in 0..hmax {
+                                s += p[(vmax * r + dy) * pw + hmax * x + dx] as u32;
+                            }
+                        }
+                        let n = (hmax * vmax) as u32;
+                        *d = ((s + n / 2) / n) as u8;
                     }
                 });
                 o

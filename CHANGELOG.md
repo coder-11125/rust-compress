@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- gzip and zlib preset dictionaries (`rc-deflate`): `gzip_compress`/`gzip_decompress` (RFC 1952; the decoder reads
+  concatenated members and the optional extra/name/comment/header-CRC fields, and checks CRC-32 and size), and
+  `zlib_compress_dict`/`zlib_decompress_dict` plus `deflate_compress_dict`/`inflate_with_end_dict` for streams that
+  start from a preset dictionary (FDICT, DICTID checked against the dictionary's Adler-32; only the last 32 KiB can
+  be referenced). `zlib_decompress` still rejects dictionary streams, now with a clearer message. Verified against
+  Python's zlib/gzip and the `gzip` tool in both directions.
+- JPEG 4:2:2: `--subsampling 422` (and `Subsampling::S422` in `rc-jpeg`) halves chroma horizontally only. JPEG
+  sources already in 4:2:2 are recognized by the DCT-domain route; AVIF output treats 422 like 420.
 - GIF multi-palette lossless recode: an animated GIF whose frames each fit a palette but whose union does not is
   now re-encoded exactly instead of being left for `--lossy`. Frames that share one palette still use a single
   global color table; when they differ, every image gets a local color table (index 0 reserved for

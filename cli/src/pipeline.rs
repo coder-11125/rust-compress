@@ -254,6 +254,7 @@ fn jpeg_options(cli: &Cli, quality: u8) -> jpeg::encode::EncodeOptions {
         subsampling: match cli.subsampling {
             SubsamplingArg::Auto => jpeg::encode::Subsampling::Auto,
             SubsamplingArg::S444 => jpeg::encode::Subsampling::S444,
+            SubsamplingArg::S422 => jpeg::encode::Subsampling::S422,
             SubsamplingArg::S420 => jpeg::encode::Subsampling::S420,
         },
         background: cli.background,
@@ -271,6 +272,7 @@ fn jpeg_to_jpeg(data: &[u8], cli: &Cli) -> Result<Encoded> {
     let orientation = jpeg::decode::exif_orientation(data);
     let three = info.sampling.len() == 3;
     let is444 = three && info.sampling.iter().all(|&s| s == (1, 1));
+    let is422 = three && info.sampling[0] == (2, 1) && info.sampling[1..].iter().all(|&s| s == (1, 1));
     let is420 = three && info.sampling[0] == (2, 2) && info.sampling[1..].iter().all(|&s| s == (1, 1));
     let effective_q = cli.quality.min(info.source_quality);
     let arithmetic = use_arithmetic(cli, info.arithmetic);
@@ -282,6 +284,7 @@ fn jpeg_to_jpeg(data: &[u8], cli: &Cli) -> Result<Encoded> {
             // With a quality search the final quality is unknown up front: keep the source layout.
             SubsamplingArg::Auto => is444 && effective_q < 90 && cli.target_ssim.is_none(),
             SubsamplingArg::S420 => !is420,
+            SubsamplingArg::S422 => !is422,
             SubsamplingArg::S444 => !is444,
         };
     // A lossless JPEG stays lossless: the same samples, recoded with the cheapest predictor and optimized tables.
@@ -385,7 +388,7 @@ fn avif_opts(cli: &Cli, quality: u8, depth: u8) -> avif::encode::EncodeOptions {
     let full_chroma = match cli.subsampling {
         SubsamplingArg::Auto => quality >= 90,
         SubsamplingArg::S444 => true,
-        SubsamplingArg::S420 => false,
+        SubsamplingArg::S422 | SubsamplingArg::S420 => false,
     };
     let bit_depth = match cli.bit_depth {
         BitDepthArg::Auto if depth == 16 => 10,
@@ -687,7 +690,7 @@ fn animation_to(mut anim: Animation, in_fmt: Format, out_fmt: Format, cli: &Cli)
             let full_chroma = match cli.subsampling {
                 SubsamplingArg::Auto => cli.quality >= 90,
                 SubsamplingArg::S444 => true,
-                SubsamplingArg::S420 => false,
+                SubsamplingArg::S422 | SubsamplingArg::S420 => false,
             };
             let bit_depth = if cli.bit_depth == BitDepthArg::B10 { 10 } else { 8 };
             let opts = avif::encode::EncodeOptions { quality: cli.quality, full_chroma, effort: cli.level, bit_depth };

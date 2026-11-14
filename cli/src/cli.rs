@@ -40,6 +40,8 @@ pub enum SubsamplingArg {
     Auto,
     #[value(name = "444")]
     S444,
+    #[value(name = "422")]
+    S422,
     #[value(name = "420")]
     S420,
 }

@@ -28,7 +28,7 @@ fn encoded_jpegs_decode_with_reference_decoder() {
     let rgb = png_decode(&fixture("rgb8.png")).unwrap();
     let gray = png_decode(&fixture("gray8.png")).unwrap();
     for (name, img) in [("rgb", &rgb), ("gray", &gray)] {
-        for sub in [Subsampling::S444, Subsampling::S420] {
+        for sub in [Subsampling::S444, Subsampling::S422, Subsampling::S420] {
             for q in [30u8, 75, 95] {
                 let opts = EncodeOptions { quality: q, subsampling: sub, ..Default::default() };
                 let jpg = encode(img, &opts).unwrap();
@@ -65,7 +65,7 @@ fn odd_and_tiny_sizes() {
     for (w, h) in [(1, 1), (7, 9), (8, 8), (9, 9), (17, 1), (1, 17), (33, 31), (250, 3)] {
         for color in [ColorType::Gray, ColorType::Rgb] {
             let img = smooth_image(w, h, color);
-            for sub in [Subsampling::S444, Subsampling::S420] {
+            for sub in [Subsampling::S444, Subsampling::S422, Subsampling::S420] {
                 let jpg = encode(&img, &EncodeOptions { quality: 90, subsampling: sub, ..Default::default() }).unwrap();
                 let back = image::load_from_memory(&jpg).unwrap_or_else(|e| panic!("{w}x{h} {color:?} {sub:?}: {e}"));
                 assert_eq!((back.width(), back.height()), (w, h));
@@ -125,4 +125,25 @@ fn reconstruct_matches_the_decoder() {
         let ci = parse(&bytes).unwrap().into_coefs().unwrap();
         assert_eq!(reconstruct(&ci).unwrap().data, want.data, "{name}");
     }
+}
+
+#[test]
+fn s422_layout_and_fidelity() {
+    let (w, h) = (203u32, 77u32);
+    let mut data = Vec::new();
+    for y in 0..h {
+        for x in 0..w {
+            data.extend([(x * 5 / 4) as u8, (y * 3) as u8, (128 + x / 4 + y) as u8]);
+        }
+    }
+    let img = Image::new(w, h, ColorType::Rgb, 8, data).unwrap();
+    let jpg = encode(&img, &EncodeOptions { quality: 92, subsampling: Subsampling::S422, ..Default::default() }).unwrap();
+    // SOF0/SOF2 component 1 sampling factors must be 2x1 and chroma 1x1.
+    let sof = jpg.windows(2).position(|w| w == [0xFF, 0xC0] || w == [0xFF, 0xC2]).unwrap();
+    assert_eq!(&jpg[sof + 10..sof + 19], &[1, 0x21, 0, 2, 0x11, 1, 3, 0x11, 1]);
+    let back = image::load_from_memory(&jpg).unwrap().to_rgb8().into_raw();
+    assert!(psnr(&back, &img.data) > 30.0);
+    // Our own decoder agrees with the reference decoder on the same stream.
+    let ours = rc_jpeg::decode::decode(&jpg).unwrap();
+    assert!(psnr(&ours.data, &back) > 40.0);
 }

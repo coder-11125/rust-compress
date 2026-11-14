@@ -1,12 +1,12 @@
-//! DEFLATE (RFC 1951) and zlib (RFC 1950) from scratch.
+//! DEFLATE (RFC 1951), zlib (RFC 1950, with preset dictionaries) and gzip (RFC 1952) from scratch.
 
 pub mod encode;
 pub mod inflate;
 pub mod lz77;
 pub mod optimal;
 
-pub use encode::{deflate_compress, zlib_compress};
-pub use inflate::{inflate, zlib_decompress};
+pub use encode::{deflate_compress, deflate_compress_dict, gzip_compress, zlib_compress, zlib_compress_dict};
+pub use inflate::{gzip_decompress, inflate, zlib_decompress, zlib_decompress_dict};
 
 pub(crate) const LEN_BASE: [u16; 29] =
     [3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51, 59, 67, 83, 99, 115, 131, 163, 195, 227, 258];
