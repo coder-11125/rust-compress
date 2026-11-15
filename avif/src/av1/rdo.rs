@@ -135,8 +135,10 @@ impl<C: Coder> TileCoder<'_, C> {
                 bits += cdf_cost(&self.cdf.angle_delta[(b.uv_mode - V_PRED) as usize], (b.angle_uv + 3) as usize);
             }
         }
+        bits += self.palette_bits(b);
         if self.f.seq.enable_filter_intra
             && b.y_mode == DC_PRED
+            && b.pal_size_y == 0
             && block_width(b.bsize).max(block_height(b.bsize)) <= 32
         {
             bits += cdf_cost(&self.cdf.use_filter_intra[b.bsize as usize], b.use_filter_intra as usize);
@@ -329,6 +331,19 @@ impl<C: Coder> TileCoder<'_, C> {
                 best = Some((j, t));
             }
         }
+        if self.palette_allowed(bsize) {
+            for cand in self.luma_palette_candidates(&base) {
+                let mut t = base.clone();
+                self.set_luma_palette(&mut t, &cand);
+                let (log, dist, coef_bits) = self.analyze_planes(&mut t, 1);
+                let skip = log.iter().all(|s| s.eob == 0);
+                let bits = coef_bits + self.mode_bits(&t, skip);
+                let j = dist + lambda * bits as f64 / 256.0;
+                if best.as_ref().is_none_or(|b| j < b.0) {
+                    best = Some((j, t));
+                }
+            }
+        }
         let (_, mut blk) = best.expect("at least one candidate");
 
         // --- Transform size for the winner.
@@ -410,7 +425,25 @@ impl<C: Coder> TileCoder<'_, C> {
                     best_uv = Some((j, t));
                 }
             }
+            if self.palette_allowed(bsize) {
+                for cand in self.chroma_palette_candidates(&blk) {
+                    let mut t = blk.clone();
+                    self.set_chroma_palette(&mut t, &cand);
+                    let (log, dist, coef_bits) = self.analyze_planes(&mut t, 6);
+                    let skip = log.iter().all(|s| s.eob == 0);
+                    let bits = coef_bits + self.mode_bits(&t, skip);
+                    let j = dist + lambda * bits as f64 / 256.0;
+                    if best_uv.as_ref().is_none_or(|b| j < b.0) {
+                        best_uv = Some((j, t));
+                    }
+                }
+            }
             if let Some((_, t)) = best_uv {
+                blk.pal_size_uv = t.pal_size_uv;
+                blk.pal_u = t.pal_u;
+                blk.pal_v = t.pal_v;
+                blk.pal_v_delta_encode = t.pal_v_delta_encode;
+                blk.pal_map_uv = t.pal_map_uv.clone();
                 blk.uv_mode = t.uv_mode;
                 blk.angle_uv = t.angle_uv;
                 blk.cfl_alpha_u = t.cfl_alpha_u;
@@ -634,7 +667,11 @@ impl<C: Coder> TileCoder<'_, C> {
     /// Search one superblock and queue its decisions for the traversal.
     pub(crate) fn plan_sb(&mut self, r: usize, c: usize) {
         let bs = self.sb_size();
+        // The search records candidate palettes as neighbours for the blocks after them; the writing pass must see
+        // only what was really written.
+        let saved = self.save_palette_ctx(r, c, NUM_4X4_WIDE[bs as usize] as usize);
         let node = self.search_node(r, c, bs);
+        self.restore_palette_ctx(saved);
         // The traversal writes the blocks in order and sees only what precedes each of them.
         self.clear_planned(r, c, NUM_4X4_WIDE[bs as usize] as usize);
         self.part_cache = node.parts.into();

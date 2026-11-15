@@ -61,6 +61,16 @@ fn main() {
     if let Ok(v) = std::env::var("AV1_ROUND") {
         p.quant_round = v.parse().unwrap();
     }
+    // AV1_TOOLS=plain|palette|ibc restricts the screen-content tools tried (for cross-decoder checks).
+    match std::env::var("AV1_TOOLS").as_deref() {
+        Ok("plain") => (p.palette, p.intrabc) = (false, false),
+        Ok("palette") => (p.palette, p.intrabc) = (true, false),
+        Ok("ibc") => (p.palette, p.intrabc) = (false, true),
+        _ => {}
+    }
+    if std::env::var_os("AV1_FORCE_PALETTE").is_some() {
+        p.palette_frame = true;
+    }
     let e = encode_picture(&frame, &color, &p).unwrap();
     let mut obu = vec![0x12, 0x00];
     obu.extend_from_slice(&e.data);

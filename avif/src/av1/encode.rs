@@ -330,6 +330,10 @@ pub struct EncodeParams {
     pub intrabc: bool,
     /// This pass codes the frame with intra block copy allowed (set by the trial, not by callers).
     pub ibc_frame: bool,
+    /// Try palette mode for pictures with flat or few-colour areas (and keep it only if it wins).
+    pub palette: bool,
+    /// This pass codes the frame with palette mode allowed (set by the trial, not by callers).
+    pub palette_frame: bool,
     /// Code an inter frame predicted from this picture (the previous output) instead of a key frame.
     pub reference: Option<std::sync::Arc<Frame>>,
 }
@@ -345,6 +349,8 @@ impl Default for EncodeParams {
             still: true,
             intrabc: true,
             ibc_frame: false,
+            palette: true,
+            palette_frame: false,
             reference: None,
         }
     }
@@ -408,45 +414,113 @@ pub fn make_sequence_header(color: &ColorConfig, width: usize, height: usize, st
 /// content (screenshots, text, UI) a second pass allows intra block copy, and the cheaper of the two in
 /// rate-distortion terms is kept: block copy frames cannot use the deblocking, CDEF and restoration filters.
 pub fn encode_picture(src: &Frame, color: &ColorConfig, p: &EncodeParams) -> Result<Encoded> {
-    let plain = encode_frame(src, color, &EncodeParams { ibc_frame: false, ..p.clone() })?;
-    if !p.intrabc || p.ibc_frame || p.reference.is_some() || src.width < 128 || src.height < 64 || p.base_q_idx == 0 {
-        return Ok(plain);
+    let stats = std::env::var_os("AV1_STATS").is_some();
+    if p.palette_frame || p.ibc_frame {
+        // A pass the caller forces (the trials below, or a test): no comparison.
+        return encode_frame(src, color, p);
     }
-    let (w, h) = (src.width, src.height);
-    let probe = ibc_search::IbcIndex::build(&src.planes[0], w, h);
-    if !probe.as_ref().is_some_and(ibc_search::looks_repetitive) {
-        if std::env::var_os("AV1_STATS").is_some() {
-            eprintln!("intra block copy: picture not repetitive enough");
-        }
-        return Ok(plain);
+    let plain_params = EncodeParams { ibc_frame: false, palette_frame: false, ..p.clone() };
+    let mut best = encode_frame(src, color, &plain_params)?;
+    let trials_allowed = p.reference.is_none() && !p.ibc_frame && !p.palette_frame && p.base_q_idx != 0;
+    if !trials_allowed {
+        return Ok(best);
     }
-    drop(probe);
-    let copy = match encode_frame(src, color, &EncodeParams { ibc_frame: true, ..p.clone() }) {
-        Ok(c) => c,
-        Err(e) => {
-            if std::env::var_os("AV1_STATS").is_some() {
-                eprintln!("intra block copy trial failed: {e}");
-            }
-            return Ok(plain);
-        }
-    };
-    // Same quantizer on both sides, so compare error plus lambda times bits.
+    // Same quantizer on every side, so compare error plus lambda times bits.
     let q = ac_q_for(p.base_q_idx, color.bit_depth) / 8.0;
     let lambda = p.lambda_scale * q * q;
     let cost = |e: &Encoded| {
         let sse: f64 = (0..src.planes.len()).map(|pl| plane_sse(&e.recon, src, pl)).sum();
         sse + lambda * 8.0 * e.data.len() as f64
     };
-    if std::env::var_os("AV1_STATS").is_some() {
+    if p.palette && std::env::var_os("AV1_NO_PALETTE").is_none() && palette_like(src) {
+        match encode_frame(src, color, &EncodeParams { palette_frame: true, ..plain_params.clone() }) {
+            Ok(pal) => {
+                if stats {
+                    eprintln!(
+                        "palette trial: plain {} bytes (J {:.0}), palette {} bytes (J {:.0})",
+                        best.data.len(),
+                        cost(&best),
+                        pal.data.len(),
+                        cost(&pal)
+                    );
+                }
+                if cost(&pal) < cost(&best) {
+                    best = pal;
+                }
+            }
+            Err(e) => {
+                if stats {
+                    eprintln!("palette trial failed: {e}");
+                }
+            }
+        }
+    } else if stats {
+        eprintln!("palette: picture has too few palette-like blocks");
+    }
+    if !p.intrabc || src.width < 128 || src.height < 64 {
+        return Ok(best);
+    }
+    let (w, h) = (src.width, src.height);
+    let probe = ibc_search::IbcIndex::build(&src.planes[0], w, h);
+    if !probe.as_ref().is_some_and(ibc_search::looks_repetitive) {
+        if stats {
+            eprintln!("intra block copy: picture not repetitive enough");
+        }
+        return Ok(best);
+    }
+    drop(probe);
+    // Block copy frames cannot use the deblocking, CDEF and restoration filters; they allow palette mode too.
+    let copy = match encode_frame(src, color, &EncodeParams { ibc_frame: true, ..plain_params.clone() }) {
+        Ok(c) => c,
+        Err(e) => {
+            if stats {
+                eprintln!("intra block copy trial failed: {e}");
+            }
+            return Ok(best);
+        }
+    };
+    if stats {
         eprintln!(
-            "intra block copy trial: plain {} bytes (J {:.0}), copy {} bytes (J {:.0})",
-            plain.data.len(),
-            cost(&plain),
+            "intra block copy trial: best so far {} bytes (J {:.0}), copy {} bytes (J {:.0})",
+            best.data.len(),
+            cost(&best),
             copy.data.len(),
             cost(&copy)
         );
     }
-    Ok(if cost(&copy) < cost(&plain) { copy } else { plain })
+    Ok(if cost(&copy) < cost(&best) { copy } else { best })
+}
+
+/// Does the picture have enough small flat-colour blocks (text, UI, line art) to be worth a palette trial? Counts 8x8
+/// luma blocks with two to eight distinct values.
+fn palette_like(src: &Frame) -> bool {
+    let pl = &src.planes[0];
+    let (w, h) = (src.width, src.height);
+    if w < 16 || h < 16 {
+        return false;
+    }
+    let (mut blocks, mut hits) = (0u32, 0u32);
+    for by in (0..h - 7).step_by(8) {
+        for bx in (0..w - 7).step_by(8) {
+            let mut seen = [0u16; 9];
+            let mut n = 0;
+            'blk: for y in 0..8 {
+                for x in 0..8 {
+                    let v = pl.at(bx + x, by + y);
+                    if !seen[..n].contains(&v) {
+                        if n == 9 {
+                            break 'blk;
+                        }
+                        seen[n] = v;
+                        n += 1;
+                    }
+                }
+            }
+            blocks += 1;
+            hits += (2..=8).contains(&n) as u32;
+        }
+    }
+    blocks > 0 && hits * 50 >= blocks
 }
 
 fn encode_frame(src: &Frame, color: &ColorConfig, p: &EncodeParams) -> Result<Encoded> {
@@ -474,10 +548,11 @@ fn encode_frame(src: &Frame, color: &ColorConfig, p: &EncodeParams) -> Result<En
     hdr.loop_filter.ref_deltas = [1, 0, 0, 0, -1, 0, -1, -1];
     hdr.cdef.damping = 3;
     hdr.tx_mode_select = true;
-    if p.ibc_frame {
+    if p.ibc_frame || p.palette_frame {
+        // Palette mode is a screen content tool; so is block copy, which also needs integer vectors.
         hdr.allow_screen_content_tools = true;
         hdr.force_integer_mv = true;
-        hdr.allow_intrabc = true;
+        hdr.allow_intrabc = p.ibc_frame;
     }
 
     if p.reference.is_some() {

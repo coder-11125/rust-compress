@@ -24,6 +24,7 @@ pub mod motion_field;
 pub mod mvpred;
 pub mod obu;
 pub mod obu_write;
+pub mod palette;
 pub mod qm_tables;
 pub mod rdo;
 pub mod refs;

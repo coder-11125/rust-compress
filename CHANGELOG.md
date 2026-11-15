@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- AVIF encoder palette mode: pictures with enough small few-colour blocks (screenshots, UI, text, line art) get a
+  second pass with `allow_screen_content_tools`, and the cheaper pass in rate-distortion terms is kept (so photos
+  are untouched and pay nothing). Per block the search tries the block's exact colours when it has 2-8 of them, or
+  8/4 clustered colours (weighted k-means) when it has up to 64, for luma and for the U/V pair, and prices the
+  palette cache reuse, colour literals/deltas, V delta coding and the index map from the live CDFs. Block-copy
+  frames can use palette blocks too. Output is bit-exact in dav1d and libaom (8/10-bit, 4:2:0/4:4:4, monochrome,
+  odd sizes, many tiles). Palette is used for key frames only (not inter frames of animations).
 - APNG dirty rectangles and blend modes: after the first frame, each frame is stored as only the rectangle that
   changed from the previous canvas (`fcTL` offsets), using `APNG_BLEND_OP_OVER` when that is exact and smaller
   (unchanged pixels inside the rectangle become transparent; only possible when every changed pixel is opaque) and

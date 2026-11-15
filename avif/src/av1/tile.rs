@@ -217,6 +217,9 @@ pub struct Blk {
     pub pal_u: [u16; 8],
     pub pal_v: [u16; 8],
     pub pal_v_delta_encode: bool,
+    /// Encoder: the colour index maps (stride 64, already extended past the picture edge) of a palette block.
+    pub pal_map_y: Option<std::sync::Arc<Vec<u8>>>,
+    pub pal_map_uv: Option<std::sync::Arc<Vec<u8>>>,
     pub tx_size: u8,
     /// Encoder inputs (ignored when decoding): the `cdef_idx` and the reduced delta-q / delta-lf values.
     pub cdef_value: u32,
@@ -444,6 +447,38 @@ impl<'a, C: Coder> TileCoder<'a, C> {
                 self.f.pal_size[1][i] = b.pal_size_uv;
                 self.f.delta_lf[i] = dlf;
             }
+        }
+        // The palette cache of later blocks (the encoder's search looks at these before the block is written).
+        for x in 0..bw4 {
+            if c + x < cols + 32 {
+                self.above_pal[0][c + x] = b.pal_y;
+                self.above_pal[1][c + x] = b.pal_u;
+            }
+        }
+        for y in 0..bh4 {
+            if r + y < rows + 32 {
+                self.left_pal[0][r + y] = b.pal_y;
+                self.left_pal[1][r + y] = b.pal_u;
+            }
+        }
+    }
+
+    /// The palette-cache context arrays for a square region (the encoder's search overwrites them as it goes).
+    pub(crate) fn save_palette_ctx(&self, r: usize, c: usize, n4: usize) -> PaletteCtx {
+        let cols = |v: &[[u16; 8]]| v[c.min(v.len())..(c + n4).min(v.len())].to_vec();
+        let rows = |v: &[[u16; 8]]| v[r.min(v.len())..(r + n4).min(v.len())].to_vec();
+        PaletteCtx {
+            above: [cols(&self.above_pal[0]), cols(&self.above_pal[1])],
+            left: [rows(&self.left_pal[0]), rows(&self.left_pal[1])],
+            r,
+            c,
+        }
+    }
+
+    pub(crate) fn restore_palette_ctx(&mut self, s: PaletteCtx) {
+        for p in 0..2 {
+            self.above_pal[p][s.c..s.c + s.above[p].len()].copy_from_slice(&s.above[p]);
+            self.left_pal[p][s.r..s.r + s.left[p].len()].copy_from_slice(&s.left[p]);
         }
     }
 
@@ -680,10 +715,6 @@ impl<'a, C: Coder> TileCoder<'a, C> {
         }
     }
 
-    fn literal_ns(&mut self, n: u32) -> u32 {
-        self.code_ns(n, 0)
-    }
-
     /// `NS(n)` coded with literal bits.
     fn code_ns(&mut self, n: u32, want: u32) -> u32 {
         if n <= 1 {
@@ -897,7 +928,7 @@ impl<'a, C: Coder> TileCoder<'a, C> {
         }
         if self.trace {
             eprintln!(
-                "BLK r{} c{} sz{} inter{} mode{} ref{:?} mv{:?} skip{} tx{} filt{:?} ymode{} uv{}",
+                "BLK r{} c{} sz{} inter{} mode{} ref{:?} mv{:?} skip{} tx{} filt{:?} ymode{} uv{} pal{}/{} {:?}",
                 b.mi_row,
                 b.mi_col,
                 b.bsize,
@@ -909,7 +940,10 @@ impl<'a, C: Coder> TileCoder<'a, C> {
                 b.tx_size,
                 b.interp_filter,
                 b.y_mode,
-                b.uv_mode
+                b.uv_mode,
+                b.pal_size_y,
+                b.pal_size_uv,
+                &b.pal_y[..b.pal_size_y as usize]
             );
         }
         self.store_block_info(&b);
@@ -1082,14 +1116,22 @@ impl<'a, C: Coder> TileCoder<'a, C> {
                 b.angle_uv = s as i8 - 3;
             }
         }
+        let planned = (b.pal_size_y, b.pal_size_uv);
         b.pal_size_y = 0;
         b.pal_size_uv = 0;
+        if !C::DECODING {
+            // The encoder arrives with the palette sizes it chose; palette_mode_info codes them.
+            (b.pal_size_y, b.pal_size_uv) = planned;
+        }
         if b.bsize >= BLOCK_8X8
             && block_width(b.bsize) <= 64
             && block_height(b.bsize) <= 64
             && self.f.hdr.allow_screen_content_tools
         {
             self.palette_mode_info(b);
+        } else if !C::DECODING {
+            b.pal_size_y = 0;
+            b.pal_size_uv = 0;
         }
         // filter_intra_mode_info
         let want_filter = b.use_filter_intra;
@@ -1261,7 +1303,7 @@ impl<'a, C: Coder> TileCoder<'a, C> {
     // Palette
     // ---------------------------------------------------------------------------------------------
 
-    fn palette_cache(&self, b: &Blk, plane: usize) -> Vec<u16> {
+    pub(crate) fn palette_cache(&self, b: &Blk, plane: usize) -> Vec<u16> {
         let (r, c) = (b.mi_row, b.mi_col);
         let above_n =
             if (r * 4) % 64 != 0 && b.avail_u { self.f.pal_size[plane][self.mi(r - 1, c)] as usize } else { 0 };
@@ -1333,14 +1375,17 @@ impl<'a, C: Coder> TileCoder<'a, C> {
                 b.pal_u = colors;
                 // V colours
                 let maxv = 1i32 << bd;
-                let delta_encode = self.c.literal(1, b.pal_v_delta_encode as u32) != 0;
+                let plan = if C::DECODING || !b.pal_v_delta_encode { None } else { plan_v_deltas(&b.pal_v[..n], bd) };
+                let delta_encode = self.c.literal(1, plan.is_some() as u32) != 0;
                 if delta_encode {
                     let min_bits = bd - 4;
-                    let bits = min_bits + self.c.literal(2, 0);
+                    let (want_extra, deltas) = plan.unwrap_or((0, Vec::new()));
+                    let bits = min_bits + self.c.literal(2, want_extra);
                     b.pal_v[0] = self.c.literal(bd, b.pal_v[0] as u32) as u16;
                     for idx in 1..n {
-                        let mut delta = self.c.literal(bits, 0) as i32;
-                        if delta != 0 && self.c.literal(1, 0) != 0 {
+                        let want = deltas.get(idx - 1).copied().unwrap_or(0);
+                        let mut delta = self.c.literal(bits, want.unsigned_abs()) as i32;
+                        if delta != 0 && self.c.literal(1, (want < 0) as u32) != 0 {
                             delta = -delta;
                         }
                         let mut val = b.pal_v[idx - 1] as i32 + delta;
@@ -1362,29 +1407,36 @@ impl<'a, C: Coder> TileCoder<'a, C> {
     }
 
     fn read_palette_colors(&mut self, colors: &mut [u16; 8], n: usize, cache: &[u16], bd: u32, luma: bool) {
+        // The encoder works out up front how the (sorted) colours are sent; the decoder just reads.
+        let plan = if C::DECODING { None } else { Some(plan_palette_colors(&colors[..n], cache, bd, luma)) };
         let mut idx = 0;
-        for &cv in cache {
+        for (k, &cv) in cache.iter().enumerate() {
             if idx >= n {
                 break;
             }
-            let use_cache = self.c.literal(1, 0) != 0;
+            let want = plan.as_ref().is_some_and(|p| p.use_cache[k]);
+            let use_cache = self.c.literal(1, want as u32) != 0;
             if use_cache {
                 colors[idx] = cv;
                 idx += 1;
             }
         }
         if idx < n {
-            colors[idx] = self.c.literal(bd, colors[idx] as u32) as u16;
+            let want = plan.as_ref().map_or(0, |p| p.first);
+            colors[idx] = self.c.literal(bd, want as u32) as u16;
             idx += 1;
         }
         let mut palette_bits = 0;
         if idx < n {
             let min_bits = bd - 3;
-            palette_bits = min_bits + self.c.literal(2, 0);
+            palette_bits = min_bits + self.c.literal(2, plan.as_ref().map_or(0, |p| p.extra));
         }
         let maxv = (1i32 << bd) - 1;
+        let mut k = 0;
         while idx < n {
-            let mut delta = self.c.literal(palette_bits, 0) as i32;
+            let want = plan.as_ref().map_or(0, |p| p.deltas[k]);
+            k += 1;
+            let mut delta = self.c.literal(palette_bits, want) as i32;
             if luma {
                 delta += 1;
             }
@@ -1407,6 +1459,9 @@ impl<'a, C: Coder> TileCoder<'a, C> {
         let on_w = bw.min((self.f.mi_cols - b.mi_col) * 4);
         if b.pal_size_y > 0 {
             let mut map = std::mem::take(&mut self.color_map_y);
+            if let (false, Some(m)) = (C::DECODING, &b.pal_map_y) {
+                map.copy_from_slice(m);
+            }
             self.read_color_map(&mut map, b.pal_size_y as usize, bw, bh, on_w, on_h, true);
             self.color_map_y = map;
         }
@@ -1422,6 +1477,9 @@ impl<'a, C: Coder> TileCoder<'a, C> {
                 on_h += 2;
             }
             let mut map = std::mem::take(&mut self.color_map_uv);
+            if let (false, Some(m)) = (C::DECODING, &b.pal_map_uv) {
+                map.copy_from_slice(m);
+            }
             self.read_color_map(&mut map, b.pal_size_uv as usize, bw, bh, on_w, on_h, false);
             self.color_map_uv = map;
         }
@@ -1431,8 +1489,7 @@ impl<'a, C: Coder> TileCoder<'a, C> {
     fn read_color_map(&mut self, map: &mut [u8], n: usize, bw: usize, bh: usize, on_w: usize, on_h: usize, luma: bool) {
         // The index map is stored with a fixed stride of 64.
         let stride = 64;
-        debug_assert!(C::DECODING, "palette blocks are not produced by the encoder");
-        let first = self.literal_ns(n as u32) as u8;
+        let first = self.code_ns(n as u32, if C::DECODING { 0 } else { map[0] as u32 }) as u8;
         map[0] = first;
         for i in 1..(on_h + on_w - 1) {
             let jmax = i.min(on_w - 1);
@@ -1688,8 +1745,90 @@ fn interleave(id: i32, r: i32, max: i32) -> i32 {
     (0..max.max(1)).find(|&d| neg_deinterleave(d, r, max) == id).unwrap_or(0)
 }
 
+/// A saved piece of the palette-cache context (see [`TileCoder::save_palette_ctx`]).
+pub(crate) struct PaletteCtx {
+    above: [Vec<[u16; 8]>; 2],
+    left: [Vec<[u16; 8]>; 2],
+    r: usize,
+    c: usize,
+}
+
+/// How a palette's (sorted) colours are sent: which palette-cache entries are reused, then the first remaining colour
+/// as a literal and the others as deltas of `extra + bitdepth - 3` bits.
+pub(crate) struct PalettePlan {
+    pub use_cache: Vec<bool>,
+    pub first: u16,
+    pub extra: u32,
+    pub deltas: Vec<u32>,
+    /// Literal bits the whole description takes.
+    pub bits: u32,
+}
+
+pub(crate) fn plan_palette_colors(colors: &[u16], cache: &[u16], bd: u32, luma: bool) -> PalettePlan {
+    let n = colors.len();
+    let mut rem: Vec<u16> = colors.to_vec();
+    let (mut use_cache, mut taken) = (Vec::new(), 0);
+    for &cv in cache {
+        if taken >= n {
+            break;
+        }
+        match rem.binary_search(&cv) {
+            Ok(i) => {
+                rem.remove(i);
+                taken += 1;
+                use_cache.push(true);
+            }
+            Err(_) => use_cache.push(false),
+        }
+    }
+    let mut plan = PalettePlan { bits: use_cache.len() as u32, use_cache, first: 0, extra: 0, deltas: Vec::new() };
+    if rem.is_empty() {
+        return plan;
+    }
+    plan.first = rem[0];
+    plan.bits += bd;
+    if rem.len() == 1 {
+        return plan;
+    }
+    let sub = luma as i32;
+    let deltas: Vec<u32> = rem.windows(2).map(|w| (w[1] as i32 - w[0] as i32 - sub).max(0) as u32).collect();
+    plan.bits += 2;
+    'extra: for extra in 0..4u32 {
+        let mut bits = bd - 3 + extra;
+        let mut total = 0;
+        for (i, &d) in deltas.iter().enumerate() {
+            if d >= (1u32 << bits) {
+                continue 'extra;
+            }
+            total += bits;
+            let range = (1i32 << bd) - rem[i + 1] as i32 - sub;
+            bits = bits.min(ceil_log2(range.max(0) as u32));
+        }
+        plan.extra = extra;
+        plan.bits += total;
+        break;
+    }
+    plan.deltas = deltas;
+    plan
+}
+
+/// V palette colours as signed deltas (wrapping at the sample range), as `(extra bits, deltas)`; `None` when they do not
+/// fit the delta coding.
+pub(crate) fn plan_v_deltas(v: &[u16], bd: u32) -> Option<(u32, Vec<i32>)> {
+    let maxv = 1i32 << bd;
+    let deltas: Vec<i32> = v
+        .windows(2)
+        .map(|w| {
+            let d = w[1] as i32 - w[0] as i32;
+            [d, d + maxv, d - maxv].into_iter().min_by_key(|x| x.abs()).unwrap()
+        })
+        .collect();
+    let m = deltas.iter().map(|d| d.unsigned_abs()).max().unwrap_or(0);
+    (0..4u32).find(|e| m < (1u32 << (bd - 4 + e))).map(|e| (e, deltas))
+}
+
 /// `get_palette_color_context`: the colour order and CDF context for position (r, c) of the map.
-fn palette_color_context(map: &[u8], stride: usize, r: usize, c: usize, n: usize) -> ([u8; 8], usize) {
+pub(crate) fn palette_color_context(map: &[u8], stride: usize, r: usize, c: usize, n: usize) -> ([u8; 8], usize) {
     let mut scores = [0u32; 8];
     let mut order = [0u8, 1, 2, 3, 4, 5, 6, 7];
     if c > 0 {
@@ -2048,7 +2187,13 @@ impl<C: Coder> TileCoder<'_, C> {
             1 => b.pal_u,
             _ => b.pal_v,
         };
-        let map = if plane == 0 { &self.color_map_y } else { &self.color_map_uv };
+        // The encoder keeps a block's maps with the block; the decoder's are filled while parsing.
+        let own = if plane == 0 { &b.pal_map_y } else { &b.pal_map_uv };
+        let map: &[u8] = match own {
+            Some(m) if !C::DECODING => m,
+            _ if plane == 0 => &self.color_map_y,
+            _ => &self.color_map_uv,
+        };
         let pl = &mut self.f.planes[plane];
         for i in 0..h {
             for j in 0..w {
