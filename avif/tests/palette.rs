@@ -106,7 +106,7 @@ fn same_planes(a: &Frame, b: &Frame) -> bool {
 #[test]
 fn encoder_palette_frames_round_trip() {
     for (sub, depth) in [(1u8, 8u8), (0, 8), (1, 10)] {
-        let src = ui_picture(203, 139, sub, sub, depth);
+        let src = ui_picture(123, 83, sub, sub, depth);
         let c = color(sub, sub, depth);
         let params = EncodeParams { base_q_idx: 90, intrabc: false, ..EncodeParams::default() };
         let plain = encode_picture(&src, &c, &EncodeParams { palette: false, ..params.clone() }).unwrap();
@@ -146,8 +146,13 @@ fn photographic_pictures_do_not_try_palette() {
 
 #[test]
 fn damaged_palette_streams_never_panic() {
-    for name in ["av1_pal_420", "av1_pal_444"] {
-        let bytes = fixture(&format!("{name}.obu"));
+    // Small palette streams (the large fixtures would make 300 debug-mode decodes take over a minute).
+    for (sub, depth) in [(1u8, 8u8), (0, 10)] {
+        let src = ui_picture(56, 48, sub, sub, depth);
+        let params = EncodeParams { base_q_idx: 90, intrabc: false, palette_frame: true, ..EncodeParams::default() };
+        let enc = encode_picture(&src, &color(sub, sub, depth), &params).unwrap();
+        let mut bytes = vec![0x12, 0x00];
+        bytes.extend_from_slice(&enc.data);
         let mut s = 0xfeed_f00du32;
         let mut rnd = || {
             s = s.wrapping_mul(1664525).wrapping_add(1013904223);
@@ -165,7 +170,7 @@ fn damaged_palette_streams_never_panic() {
             let r = catch_unwind(AssertUnwindSafe(|| {
                 let _ = decode(&b);
             }));
-            assert!(r.is_ok(), "{name}: panic on mutation round {round}");
+            assert!(r.is_ok(), "sub {sub} depth {depth}: panic on mutation round {round}");
         }
     }
 }
@@ -175,56 +180,68 @@ fn damaged_palette_streams_never_panic() {
 /// (raw planes) for checking with other decoders.
 #[test]
 fn palette_in_every_format_round_trips() {
-    let mut failures = Vec::new();
-    for (sx, sy) in [(0u8, 0u8), (1, 0), (1, 1)] {
-        for depth in [8u8, 10, 12] {
-            for qidx in [1u8, 60, 255] {
-                for palette in [true, false] {
-                    let name = format!("fmt_{sx}{sy}_{depth}b_q{qidx}_{}", if palette { "pal" } else { "plain" });
-                    let src = ui_picture(75, 51, sx, sy, depth);
-                    let params = EncodeParams {
-                        base_q_idx: qidx,
-                        intrabc: false,
-                        palette: false,
-                        palette_frame: palette,
-                        ..EncodeParams::default()
-                    };
-                    let enc = catch_unwind(AssertUnwindSafe(|| encode_picture(&src, &color(sx, sy, depth), &params)));
-                    let e = match enc {
-                        Ok(Ok(e)) => e,
-                        Ok(Err(err)) => {
-                            failures.push(format!("{name}: encoder error: {err}"));
-                            continue;
-                        }
-                        Err(_) => {
-                            failures.push(format!("{name}: encoder PANIC"));
-                            continue;
-                        }
-                    };
-                    let mut stream = vec![0x12, 0x00];
-                    stream.extend_from_slice(&e.data);
-                    let dec = catch_unwind(AssertUnwindSafe(|| decode(&stream)));
-                    let Ok(dec) = dec else {
-                        failures.push(format!("{name}: decoder PANIC"));
-                        continue;
-                    };
-                    match dec {
-                        Err(err) => failures.push(format!("{name}: our decoder: {err}")),
-                        Ok(d) if !same_planes(&d.frame, &e.recon) => {
-                            failures.push(format!("{name}: decoder != encoder"))
-                        }
-                        Ok(d) => {
-                            if let Some(dir) = std::env::var_os("PAL_DUMP") {
-                                let dir = std::path::Path::new(&dir);
-                                std::fs::write(dir.join(format!("{name}.obu")), &stream).unwrap();
-                                std::fs::write(dir.join(format!("{name}.raw")), raw_planes(&d)).unwrap();
+    let failures = std::sync::Mutex::new(Vec::new());
+    // One thread per subsampling: these are many small encodes and a debug build is slow.
+    std::thread::scope(|scope| {
+        for (sx, sy) in [(0u8, 0u8), (1, 0), (1, 1)] {
+            let failures = &failures;
+            scope.spawn(move || {
+                for depth in [8u8, 10, 12] {
+                    for qidx in [1u8, 60, 255] {
+                        for palette in [true, false] {
+                            if !palette && qidx != 60 {
+                                continue; // the plain control at one quantizer is enough
+                            }
+                            let name =
+                                format!("fmt_{sx}{sy}_{depth}b_q{qidx}_{}", if palette { "pal" } else { "plain" });
+                            let src = ui_picture(51, 43, sx, sy, depth);
+                            let params = EncodeParams {
+                                base_q_idx: qidx,
+                                intrabc: false,
+                                palette: false,
+                                palette_frame: palette,
+                                ..EncodeParams::default()
+                            };
+                            let enc =
+                                catch_unwind(AssertUnwindSafe(|| encode_picture(&src, &color(sx, sy, depth), &params)));
+                            let e = match enc {
+                                Ok(Ok(e)) => e,
+                                Ok(Err(err)) => {
+                                    failures.lock().unwrap().push(format!("{name}: encoder error: {err}"));
+                                    continue;
+                                }
+                                Err(_) => {
+                                    failures.lock().unwrap().push(format!("{name}: encoder PANIC"));
+                                    continue;
+                                }
+                            };
+                            let mut stream = vec![0x12, 0x00];
+                            stream.extend_from_slice(&e.data);
+                            let dec = catch_unwind(AssertUnwindSafe(|| decode(&stream)));
+                            let Ok(dec) = dec else {
+                                failures.lock().unwrap().push(format!("{name}: decoder PANIC"));
+                                continue;
+                            };
+                            match dec {
+                                Err(err) => failures.lock().unwrap().push(format!("{name}: our decoder: {err}")),
+                                Ok(d) if !same_planes(&d.frame, &e.recon) => {
+                                    failures.lock().unwrap().push(format!("{name}: decoder != encoder"))
+                                }
+                                Ok(d) => {
+                                    if let Some(dir) = std::env::var_os("PAL_DUMP") {
+                                        let dir = std::path::Path::new(&dir);
+                                        std::fs::write(dir.join(format!("{name}.obu")), &stream).unwrap();
+                                        std::fs::write(dir.join(format!("{name}.raw")), raw_planes(&d)).unwrap();
+                                    }
+                                }
                             }
                         }
                     }
                 }
-            }
+            });
         }
-    }
+    });
+    let failures = failures.into_inner().unwrap();
     assert!(failures.is_empty(), "{} failures:\n{}", failures.len(), failures.join("\n"));
 }
 

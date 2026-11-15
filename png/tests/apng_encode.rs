@@ -98,3 +98,64 @@ fn translucent_changes_fall_back_to_source() {
         assert_eq!(rgba(&a.image), rgba(&b.image));
     }
 }
+
+/// Streams written by the dirty-rectangle encoder (cropped frames, OVER blending, 1x1 no-ops), then damaged: random
+/// byte changes and truncation anywhere, and frame control chunks with absurd geometry and operations whose CRC is
+/// repaired so the decoder really looks at them. None of it may panic.
+#[test]
+fn damaged_dirty_rectangle_streams_never_panic() {
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+    let bytes = encode_animation(&make(true, 8, Some(4)), &EncodeOptions::default()).unwrap();
+    let mut s = 0x1357_9bdfu32;
+    let mut rnd = || {
+        s = s.wrapping_mul(1664525).wrapping_add(1013904223);
+        s >> 8
+    };
+    for round in 0..300 {
+        let mut b = bytes.clone();
+        for _ in 0..1 + round % 3 {
+            let i = rnd() as usize % b.len();
+            b[i] = rnd() as u8;
+        }
+        if round % 7 == 0 {
+            b.truncate(rnd() as usize % b.len());
+        }
+        assert!(
+            catch_unwind(AssertUnwindSafe(|| drop(decode_animation(&b)))).is_ok(),
+            "panic on mutation round {round}"
+        );
+    }
+    // Rewrite every fcTL with extreme values, fixing the CRC.
+    let crc = |b: &[u8]| rc_core::util::checksum::crc32(b);
+    let extremes: [(u32, u32, u32, u32, u8, u8); 8] = [
+        (0, 0, 0, 0, 0, 0),
+        (u32::MAX, u32::MAX, 0, 0, 0, 0),
+        (1, 1, u32::MAX, u32::MAX, 0, 0),
+        (W, H, 1, 1, 0, 0),
+        (W + 1, H, 0, 0, 0, 0),
+        (4, 4, 2, 2, 9, 0),
+        (4, 4, 2, 2, 0, 9),
+        (W, H, 0, 0, 2, 1),
+    ];
+    for (w, h, x, y, dispose, blend) in extremes {
+        let mut b = bytes.clone();
+        let mut i = 8;
+        while i + 12 <= b.len() {
+            let len = u32::from_be_bytes(b[i..i + 4].try_into().unwrap()) as usize;
+            if &b[i + 4..i + 8] == b"fcTL" {
+                let body = &mut b[i + 8..i + 8 + len];
+                body[4..8].copy_from_slice(&w.to_be_bytes());
+                body[8..12].copy_from_slice(&h.to_be_bytes());
+                body[12..16].copy_from_slice(&x.to_be_bytes());
+                body[16..20].copy_from_slice(&y.to_be_bytes());
+                body[24] = dispose;
+                body[25] = blend;
+                let c = crc(&b[i + 4..i + 8 + len]);
+                b[i + 8 + len..i + 12 + len].copy_from_slice(&c.to_be_bytes());
+            }
+            i += 12 + len;
+        }
+        let r = catch_unwind(AssertUnwindSafe(|| decode_animation(&b)));
+        assert!(r.is_ok(), "panic on frame geometry {w}x{h} at {x},{y} dispose {dispose} blend {blend}");
+    }
+}
