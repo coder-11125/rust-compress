@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.3.0 - 15-11-2026
 
 - AVIF encoder: palette mode now also runs in inter frames (its trial is skipped only for lossless, which the AV1
   encoder never supported), and the AV1 encoder is checked in every format it can be given: 4:4:4, 4:2:2 and 4:2:0
