@@ -30,6 +30,12 @@ chunks_exact_to_as_chunks = "allow"
 # Index loops are intentional in the numeric kernels (they vectorize well and mirror the reference algorithms).
 needless_range_loop = "allow"
 
+# The codecs are tight numeric loops, and the unoptimised default made the test suite many times slower (the slowest
+# AVIF test went from 210 s to 26 s). Overflow checks and debug assertions stay on, so tests still catch arithmetic
+# overflow and out-of-range indices.
+[profile.dev]
+opt-level = 1
+
 [profile.release]
 opt-level = 3
 lto = "fat"
