@@ -12,6 +12,12 @@ through programs written by other people and reports every disagreement:
   resize    linear-light resizing against numpy + Pillow's float Lanczos
   anim      animated WebP and GIF against libwebp and Pillow on panning footage (size and PSNR)
   browser   headless Chrome (WebCodecs ImageDecoder) against Pillow, frame by frame
+  jpeg422   4:2:2 JPEG: this crate's files read by libjpeg-turbo / Pillow / jpeglib (sampling factors, pixels), and
+            libjpeg-turbo's 4:2:2, 4:2:0 and 4:4:4 files through this crate's decoder and its lossless transcode
+  gzip      gzip, zlib and preset-dictionary streams against Python's zlib/gzip and the system gzip, both directions:
+            every level/strategy/window, stored-block and segment boundaries, header fields, concatenated members,
+            dictionaries larger than the window, and random corruption (needs `cargo build --release -p rc-deflate
+            --example gzip_tool`, done for you)
   apng      APNG written with dirty rectangles and OVER/SOURCE blending, decoded by ffmpeg's own APNG decoder and by
             Pillow (libpng), every frame compared with the canvas it must reproduce (needs ffmpeg; Pillow-only without)
 
@@ -294,6 +300,202 @@ await fetch('/result',{method:'POST',body:JSON.stringify(res)});})();</script>""
         report("browser", f"{name}: {len(r['frames'])} frames in Chrome vs Pillow", len(ref) == len(r["frames"]) and worst <= 1, f"worst visible diff {worst}")
 
 
+def check_jpeg422(rc, work):
+    import imagecodecs
+    import jpeglib
+    from PIL import Image, JpegImagePlugin
+
+    rng = np.random.default_rng(1)
+    imgs = {}
+    shot = photo(shrink=8) if PHOTOS.exists() else None
+    if shot is not None:
+        imgs["photo"] = shot
+    xs, ys = np.linspace(0, 255, 331)[None, :, None] * np.ones((1, 1, 3)), np.linspace(0, 255, 177)[:, None, None]
+    imgs["gradient_331x177"] = np.clip(xs * 0.7 + ys * 0.3 + rng.normal(0, 3, (177, 331, 3)), 0, 255).astype(np.uint8)
+    imgs["noise_17x23"] = rng.integers(0, 255, (23, 17, 3), dtype=np.uint8)
+    imgs["noise_9x8"] = rng.integers(0, 255, (8, 9, 3), dtype=np.uint8)
+    sf = lambda path: [tuple(int(v) for v in r) for r in jpeglib.read_dct(str(path)).samp_factor]
+    for name, arr in imgs.items():
+        png = work / f"{name}.png"
+        Image.fromarray(arr).save(png)
+        for q in (60, 90):
+            out = work / f"{name}_q{q}.jpg"
+            subprocess.run([rc, str(png), "-f", "jpeg", "--subsampling", "422", "-q", str(q), "--force", "-o", str(out)], check=True, capture_output=True)
+            data = out.read_bytes()
+            lj, pil = imagecodecs.jpeg8_decode(data), np.asarray(Image.open(out).convert("RGB"))
+            ok = JpegImagePlugin.get_sampling(Image.open(out)) == 1 and sf(out) == [(1, 2), (1, 1), (1, 1)] and lj.shape == arr.shape and np.array_equal(lj, pil)
+            # a 4:2:2 file from libjpeg-turbo's own encoder at the same quality is the yardstick for fidelity
+            ref = imagecodecs.jpeg8_decode(imagecodecs.jpeg8_encode(arr, level=q, subsampling="422"))
+            mse = lambda a: ((a.astype(float) - arr) ** 2).mean()
+            db = lambda a: 99 if mse(a) == 0 else 10 * np.log10(255 * 255 / mse(a))
+            report("jpeg422", f"{name} q{q}: sampling and pixels in libjpeg-turbo / Pillow / jpeglib", ok and db(lj) > db(ref) - 3, f"{db(lj):.1f} dB vs libjpeg's own {db(ref):.1f} dB")
+    for name, arr in imgs.items():
+        for sub in ("422", "420", "444"):
+            f = work / f"lj_{name}_{sub}.jpg"
+            f.write_bytes(imagecodecs.jpeg8_encode(arr, level=85, subsampling=sub))
+            want = imagecodecs.jpeg8_decode(f.read_bytes())
+            back = work / f"ours_{name}_{sub}.png"
+            subprocess.run([rc, str(f), "-f", "png", "--force", "-o", str(back)], check=True, capture_output=True)
+            worst = int(np.abs(np.asarray(Image.open(back).convert("RGB")).astype(int) - want.astype(int)).max())
+            report("jpeg422", f"libjpeg {sub} {name}: this crate's decoder vs libjpeg", worst <= 3, f"worst difference {worst}")
+            if sub != "444":  # 4:4:4 is deliberately resampled to 4:2:0 below q90
+                tr = work / f"tr_{name}_{sub}.jpg"
+                subprocess.run([rc, str(f), "-q", "100", "--force", "-o", str(tr)], check=True, capture_output=True)
+                kept = tr.exists() and np.array_equal(imagecodecs.jpeg8_decode(tr.read_bytes()), want) and sf(tr) == sf(f)
+                report("jpeg422", f"libjpeg {sub} {name}: lossless transcode is pixel-identical", kept)
+    # explicit resampling of a 4:2:0 and a 4:4:4 source to 4:2:2
+    for sub in ("420", "444"):
+        src = work / f"lj_gradient_331x177_{sub}.jpg"
+        out = work / f"to422_{sub}.jpg"
+        subprocess.run([rc, str(src), "--subsampling", "422", "-q", "85", "--force", "-o", str(out)], check=True, capture_output=True)
+        report("jpeg422", f"{sub} source re-sampled to 4:2:2", sf(out) == [(1, 2), (1, 1), (1, 1)] and imagecodecs.jpeg8_decode(out.read_bytes()).shape == imgs["gradient_331x177"].shape)
+
+
+def check_gzip(rc, work):
+    import gzip
+    import random
+    import struct
+    import zlib
+
+    subprocess.run(["cargo", "build", "-q", "--release", "-p", "rc-deflate", "--example", "gzip_tool"], cwd=ROOT, check=True)
+    tool = str(ROOT / "target" / "release" / "examples" / "gzip_tool")
+    rnd = random.Random(11)
+    fails = collections.Counter()
+    total = collections.Counter()
+
+    def run(*a):
+        return subprocess.run([tool, *map(str, a)], capture_output=True, text=True)
+
+    def ours_c(kind, level, data, dic=None):
+        (work / "in").write_bytes(data)
+        args = ["compress", kind, level, work / "in", work / "out"]
+        if dic is not None:
+            (work / "dict").write_bytes(dic)
+            args.append(work / "dict")
+        assert run(*args).returncode == 0
+        return (work / "out").read_bytes()
+
+    def ours_d(kind, blob, dic=None):
+        (work / "in").write_bytes(blob)
+        args = ["decompress", kind, work / "in", work / "out"]
+        if dic is not None:
+            (work / "dict").write_bytes(dic)
+            args.append(work / "dict")
+        r = run(*args)
+        return ((work / "out").read_bytes() if r.returncode == 0 else None), r.stderr.strip()
+
+    def check(group, ok, what):
+        total[group] += 1
+        if not ok:
+            fails[group] += 1
+            print(f"    FAIL {group}: {what}")
+
+    def mixed(n):
+        out = bytearray()
+        while len(out) < n:
+            c = rnd.random()
+            if c < 0.3:
+                out += bytes(rnd.randrange(256) for _ in range(rnd.randrange(50, 400)))
+            elif c < 0.6 and len(out) > 100:
+                s = rnd.randrange(len(out) - 50)
+                out += out[s : s + rnd.randrange(20, 300)]
+            else:
+                out += bytes([rnd.randrange(256)]) * rnd.randrange(5, 200)
+        return bytes(out[:n])
+
+    sets = {"empty": b"", "one": b"x", "s65535": mixed(65535), "s65536": mixed(65536), "s65537": mixed(65537),
+            "text": b"The quick brown fox jumps over the lazy dog. " * 5000, "mixed700k": mixed(700_000),
+            "mixed1.6M": mixed(1_600_000), "random300k": os.urandom(300_000), "zeros2M": bytes(2_000_000)}
+    for name, data in sets.items():
+        for level in (0, 1, 6, 9):
+            g, z, r = ours_c("gzip", level, data), ours_c("zlib", level, data), ours_c("raw", level, data)
+            check("ours -> python", gzip.decompress(g) == data and zlib.decompress(z) == data and zlib.decompress(r, -15) == data, f"{name} L{level}")
+            if level in (1, 9):
+                (work / "o.gz").write_bytes(g)
+                p = subprocess.run(["gzip", "-dc", str(work / "o.gz")], capture_output=True)
+                check("ours -> system gzip", p.returncode == 0 and p.stdout == data, f"{name} L{level}")
+    for name in ("text", "mixed700k", "s65537"):
+        data = sets[name]
+        dic = mixed(40_000)[-20_000:] + data[:3000]
+        for level in (1, 6, 9):
+            o = zlib.decompressobj(zdict=dic)
+            check("ours -> python dictionary", o.decompress(ours_c("zlibdict", level, data, dic)) == data and o.eof, f"{name} L{level}")
+    for name, data in sets.items():
+        for level in range(10):
+            for strat in (zlib.Z_DEFAULT_STRATEGY, zlib.Z_FILTERED, zlib.Z_HUFFMAN_ONLY, zlib.Z_RLE, zlib.Z_FIXED):
+                if (level not in (0, 1, 6, 9) or len(data) > 700_000) and strat != zlib.Z_DEFAULT_STRATEGY:
+                    continue
+                for wbits, kind in ((31, "gzip"), (15, "zlib"), (-15, "raw")):
+                    c = zlib.compressobj(level, zlib.DEFLATED, wbits, 9 if level else 8, strat)
+                    check("python -> ours", ours_d(kind, c.compress(data) + c.flush())[0] == data, f"{kind} {name} L{level} strategy {strat}")
+        for wb in (9, 12):
+            c = zlib.compressobj(6, zlib.DEFLATED, wb, 1)
+            check("python -> ours", ours_d("zlib", c.compress(data) + c.flush())[0] == data, f"window bits {wb} {name}")
+    for name in ("text", "mixed700k", "s65537", "empty"):
+        data = sets[name]
+        dic = mixed(30_000) + data[:2000]
+        for level in (1, 6, 9):
+            c = zlib.compressobj(level, zlib.DEFLATED, 15, 8, zlib.Z_DEFAULT_STRATEGY, dic)
+            blob = c.compress(data) + c.flush()
+            check("python -> ours dictionary", ours_d("zlibdict", blob, dic)[0] == data, f"{name} L{level}")
+            check("wrong dictionary rejected", ours_d("zlibdict", blob, dic[:-1])[0] is None, name)
+    data = sets["mixed700k"]
+    big = mixed(200_000)  # larger than the 32 KiB window
+    for level in (1, 9):
+        c = zlib.compressobj(level, zlib.DEFLATED, 15, 8, zlib.Z_DEFAULT_STRATEGY, big)
+        check("python -> ours dictionary", ours_d("zlibdict", c.compress(data) + c.flush(), big)[0] == data, f"200 KB dictionary L{level}")
+        check("ours -> python dictionary", zlib.decompressobj(zdict=big).decompress(ours_c("zlibdict", level, data, big)) == data, f"200 KB dictionary L{level}")
+    for name in ("text", "mixed700k", "empty"):
+        data = sets[name]
+        (work / "f.bin").write_bytes(data)
+        for opt in ("-1", "-6", "-9", "-N -9", "-n"):
+            blob = subprocess.run(f"gzip {opt} -c {work / 'f.bin'}", shell=True, capture_output=True).stdout
+            check("system gzip -> ours", ours_d("gzip", blob)[0] == data, f"gzip {opt} {name}")
+        one = subprocess.run(f"gzip -c {work / 'f.bin'}", shell=True, capture_output=True).stdout
+        check("concatenated members", ours_d("gzip", one * 3)[0] == data * 3, name)
+    data = sets["text"][:50_000]
+    co = zlib.compressobj(6, zlib.DEFLATED, -15)
+    body = co.compress(data) + co.flush()
+    trailer = struct.pack("<II", zlib.crc32(data), len(data))
+    for flags in range(32):
+        hdr = bytes([0x1F, 0x8B, 8, flags, 1, 2, 3, 4, 2, 3])
+        if flags & 4:
+            hdr += struct.pack("<H", 7) + b"Ap\x04\x00abc"
+        if flags & 8:
+            hdr += b"name.txt\0"
+        if flags & 16:
+            hdr += b"a comment\0"
+        if flags & 2:
+            hdr += struct.pack("<H", zlib.crc32(hdr) & 0xFFFF)
+        blob = hdr + body + trailer
+        check("header fields", ours_d("gzip", blob)[0] == data and gzip.decompress(blob) == data, f"FLG={flags:05b}")
+    g = gzip.compress(data)
+
+    def py(b):
+        try:
+            return gzip.decompress(b)
+        except Exception:
+            return None
+
+    damaged = {"trailing junk": g + b"junk!", "truncated": g[:-3], "bad crc": g[:-8] + bytes([g[-8] ^ 1]) + g[-7:],
+               "bad size": g[:-1] + bytes([g[-1] ^ 1]), "bad magic": b"\x1f\x8c" + g[2:], "bad method": g[:2] + b"\x09" + g[3:]}
+    for k, b in damaged.items():
+        check("damaged streams rejected", ours_d("gzip", b)[0] is None, k)
+    check("zero padding accepted", ours_d("gzip", g + bytes(7))[0] == data, "")
+    # RFC 1952 makes reserved flag bits an error; Python's gzip ignores them, so only ours is held to the RFC.
+    check("reserved flag rejected", ours_d("gzip", g[:3] + b"\x20" + g[4:])[0] is None, "")
+    for i in range(400):
+        b = bytearray(g)
+        for _ in range(rnd.randrange(1, 4)):
+            b[rnd.randrange(len(b))] = rnd.randrange(256)
+        if i % 9 == 0:
+            b = b[: rnd.randrange(len(b))]
+        out, p = ours_d("gzip", bytes(b))[0], py(bytes(b))
+        check("random corruption", out is None or out == data or (p is not None and out == p), f"mutation {i} accepted wrong data")
+    for group in total:
+        report("gzip", group, fails[group] == 0, f"{total[group] - fails[group]} of {total[group]} cases")
+
+
 def check_apng(rc, work):
     from PIL import Image, ImageSequence
 
@@ -329,7 +531,7 @@ def check_apng(rc, work):
             report("apng", f"{name} in ffmpeg", not err, err)
 
 
-AREAS = {"lossless": check_lossless, "arith": check_arith, "hier": check_hier, "resize": check_resize, "anim": check_anim, "browser": check_browser, "apng": check_apng}
+AREAS = {"lossless": check_lossless, "arith": check_arith, "hier": check_hier, "resize": check_resize, "anim": check_anim, "browser": check_browser, "apng": check_apng, "jpeg422": check_jpeg422, "gzip": check_gzip}
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
