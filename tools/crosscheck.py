@@ -12,6 +12,8 @@ through programs written by other people and reports every disagreement:
   resize    linear-light resizing against numpy + Pillow's float Lanczos
   anim      animated WebP and GIF against libwebp and Pillow on panning footage (size and PSNR)
   browser   headless Chrome (WebCodecs ImageDecoder) against Pillow, frame by frame
+  apng      APNG written with dirty rectangles and OVER/SOURCE blending, decoded by ffmpeg's own APNG decoder and by
+            Pillow (libpng), every frame compared with the canvas it must reproduce (needs ffmpeg; Pillow-only without)
 
 Setup (a virtualenv is advisable):
     pip install numpy pillow imagecodecs pylibjpeg-libjpeg jpeglib
@@ -62,8 +64,8 @@ def photo(name="Flower 3.jpg", shrink=4):
     return a[:h, :w].reshape(h // shrink, shrink, w // shrink, shrink, 3).mean(axis=(1, 3)).round().astype(np.uint8)
 
 
-def example(work, name, *args):
-    subprocess.run(["cargo", "run", "-q", "-p", "rc-jpeg", "--example", name, "--", *map(str, args)], cwd=ROOT, check=True)
+def example(work, name, *args, pkg="rc-jpeg"):
+    subprocess.run(["cargo", "run", "-q", "--release", "-p", pkg, "--example", name, "--", *map(str, args)], cwd=ROOT, check=True)
 
 
 # ----------------------------------------------------------------------------------------------------------------------
@@ -292,7 +294,42 @@ await fetch('/result',{method:'POST',body:JSON.stringify(res)});})();</script>""
         report("browser", f"{name}: {len(r['frames'])} frames in Chrome vs Pillow", len(ref) == len(r["frames"]) and worst <= 1, f"worst visible diff {worst}")
 
 
-AREAS = {"lossless": check_lossless, "arith": check_arith, "hier": check_hier, "resize": check_resize, "anim": check_anim, "browser": check_browser}
+def check_apng(rc, work):
+    from PIL import Image, ImageSequence
+
+    example(work, "apng_cases", work, pkg="rc-png")
+    have_ffmpeg = shutil.which("ffmpeg") is not None
+    if not have_ffmpeg:
+        print("  [skip] apng: ffmpeg not found, checking with Pillow only")
+    for png in sorted(work.glob("*.png")):
+        name = png.stem
+        w, h, nf = map(int, (work / f"{name}.info").read_text().split())
+        want = np.frombuffer((work / f"{name}.rgba").read_bytes(), np.uint8).reshape(nf, h, w, 4).astype(int)
+        exact = name.endswith("_keephidden")  # hidden colours of transparent pixels must survive too
+
+        def same(got):
+            if got.shape != want.shape:
+                return f"{got.shape[0]} frames of {got.shape[1:]} vs {want.shape[0]} of {want.shape[1:]}"
+            diff = (got != want).any(axis=-1)
+            if not exact:
+                diff &= ~((got[..., 3] == 0) & (want[..., 3] == 0))
+            if diff.any():
+                k, y, x = np.argwhere(diff)[0]
+                return f"frame {k} pixel {x},{y}: want {want[k, y, x].tolist()} got {got[k, y, x].tolist()}"
+            return ""
+
+        pil = np.stack([np.asarray(f.convert("RGBA")) for f in ImageSequence.Iterator(Image.open(png))]).astype(int)
+        err = same(pil)
+        report("apng", f"{name} in Pillow", not err, err)
+        if have_ffmpeg:
+            raw = work / f"{name}.ff"
+            subprocess.run(["ffmpeg", "-v", "fatal", "-y", "-i", str(png), "-fps_mode", "passthrough", "-f", "rawvideo", "-pix_fmt", "rgba", str(raw)], check=True)
+            data = np.frombuffer(raw.read_bytes(), np.uint8)
+            err = same(data.reshape(-1, h, w, 4).astype(int)) if data.size % (w * h * 4) == 0 else "output size"
+            report("apng", f"{name} in ffmpeg", not err, err)
+
+
+AREAS = {"lossless": check_lossless, "arith": check_arith, "hier": check_hier, "resize": check_resize, "anim": check_anim, "browser": check_browser, "apng": check_apng}
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
