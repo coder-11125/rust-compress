@@ -128,7 +128,7 @@ dependencies = [
 
 [[package]]
 name = "rc-avif"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "rayon",
  "rc-core",
@@ -136,14 +136,14 @@ dependencies = [
 
 [[package]]
 name = "rc-core"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "rayon",
 ]
 
 [[package]]
 name = "rc-deflate"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "rayon",
  "rc-core",
@@ -151,14 +151,14 @@ dependencies = [
 
 [[package]]
 name = "rc-gif"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "rc-core",
 ]
 
 [[package]]
 name = "rc-jpeg"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "rayon",
  "rc-core",
@@ -166,7 +166,7 @@ dependencies = [
 
 [[package]]
 name = "rc-png"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "rayon",
  "rc-core",
@@ -175,7 +175,7 @@ dependencies = [
 
 [[package]]
 name = "rc-webp"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "rayon",
  "rc-core",
