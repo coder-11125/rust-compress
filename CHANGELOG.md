@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- AVIF encoder: palette mode now also runs in inter frames (its trial is skipped only for lossless, which the AV1
+  encoder never supported), and the AV1 encoder is checked in every format it can be given: 4:4:4, 4:2:2 and 4:2:0
+  at 8, 10 and 12 bits, palette on and off, all bit-exact in dav1d and libaom. Two bugs that this exposed are fixed:
+  the sequence header wrote profile 1 for 12-bit 4:4:4 (the 12-bit flag was never sent, so decoders read 10-bit),
+  and the partition search tried partitions with no valid chroma block size in 4:2:2 and panicked. `base_q_idx = 0`
+  (lossless) now returns an error instead of panicking. None of these formats is reachable from the CLI.
 - AVIF encoder palette mode: pictures with enough small few-colour blocks (screenshots, UI, text, line art) get a
   second pass with `allow_screen_content_tools`, and the cheaper pass in rate-distortion terms is kept (so photos
   are untouched and pay nothing). Per block the search tries the block's exact colours when it has 2-8 of them, or

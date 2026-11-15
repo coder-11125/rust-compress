@@ -375,10 +375,11 @@ fn level_for(width: usize, height: usize) -> u8 {
 
 pub fn make_sequence_header(color: &ColorConfig, width: usize, height: usize, still: bool) -> SequenceHeader {
     let bits = |n: usize| (usize::BITS - (n.max(2) - 1).leading_zeros()).max(1);
-    let profile = if color.sub_x == 0 && color.sub_y == 0 && !color.mono_chrome {
-        1
-    } else if (color.sub_x == 1 && color.sub_y == 0) || color.bit_depth == 12 {
+    // Profile 2 carries 4:2:2 and every 12-bit picture; profile 1 is 4:4:4 up to 10 bits; profile 0 the rest.
+    let profile = if color.bit_depth == 12 || (color.sub_x == 1 && color.sub_y == 0 && !color.mono_chrome) {
         2
+    } else if color.sub_x == 0 && color.sub_y == 0 && !color.mono_chrome {
+        1
     } else {
         0
     };
@@ -415,13 +416,16 @@ pub fn make_sequence_header(color: &ColorConfig, width: usize, height: usize, st
 /// rate-distortion terms is kept: block copy frames cannot use the deblocking, CDEF and restoration filters.
 pub fn encode_picture(src: &Frame, color: &ColorConfig, p: &EncodeParams) -> Result<Encoded> {
     let stats = std::env::var_os("AV1_STATS").is_some();
+    if p.base_q_idx == 0 {
+        return Err(rc_core::error::Error::unsupported("lossless AV1 encoding"));
+    }
     if p.palette_frame || p.ibc_frame {
         // A pass the caller forces (the trials below, or a test): no comparison.
         return encode_frame(src, color, p);
     }
     let plain_params = EncodeParams { ibc_frame: false, palette_frame: false, ..p.clone() };
     let mut best = encode_frame(src, color, &plain_params)?;
-    let trials_allowed = p.reference.is_none() && !p.ibc_frame && !p.palette_frame && p.base_q_idx != 0;
+    let trials_allowed = !p.ibc_frame && !p.palette_frame;
     if !trials_allowed {
         return Ok(best);
     }
@@ -457,7 +461,8 @@ pub fn encode_picture(src: &Frame, color: &ColorConfig, p: &EncodeParams) -> Res
     } else if stats {
         eprintln!("palette: picture has too few palette-like blocks");
     }
-    if !p.intrabc || src.width < 128 || src.height < 64 {
+    if !p.intrabc || p.reference.is_some() || src.width < 128 || src.height < 64 {
+        // (Block copy is for key frames only.)
         return Ok(best);
     }
     let (w, h) = (src.width, src.height);
@@ -551,7 +556,7 @@ fn encode_frame(src: &Frame, color: &ColorConfig, p: &EncodeParams) -> Result<En
     if p.ibc_frame || p.palette_frame {
         // Palette mode is a screen content tool; so is block copy, which also needs integer vectors.
         hdr.allow_screen_content_tools = true;
-        hdr.force_integer_mv = true;
+        hdr.force_integer_mv = p.reference.is_none();
         hdr.allow_intrabc = p.ibc_frame;
     }
 

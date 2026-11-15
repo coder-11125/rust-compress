@@ -13,12 +13,13 @@ fuzz_target!(|data: &[u8]| {
     }
     let (head, body) = data.split_at(6);
     let (w, h) = (8 + head[0] as usize % 72, 8 + head[1] as usize % 72);
-    let (mono, sub) = match head[2] % 3 {
-        0 => (false, 0u8),
-        1 => (false, 1),
-        _ => (true, 1),
+    let (mono, sx, sy) = match head[2] % 4 {
+        0 => (false, 0u8, 0u8),
+        1 => (false, 1, 1),
+        2 => (false, 1, 0),
+        _ => (true, 1, 1),
     };
-    let bit_depth = if head[2] & 0x80 != 0 { 10 } else { 8 };
+    let bit_depth = [8u8, 10, 12][(head[2] >> 6) as usize % 3];
     let sh = bit_depth as u32 - 8;
     let qidx = 1 + head[3] as u32 % 255;
     let palette: Vec<[u8; 3]> =
@@ -33,7 +34,7 @@ fuzz_target!(|data: &[u8]| {
         }
         c
     };
-    let (cw, ch) = (w.div_ceil(1 << sub), h.div_ceil(1 << sub));
+    let (cw, ch) = (w.div_ceil(1 << sx), h.div_ceil(1 << sy));
     let mut planes = vec![Plane::new(w, h)];
     if !mono {
         planes.push(Plane::new(cw, ch));
@@ -43,13 +44,13 @@ fuzz_target!(|data: &[u8]| {
         for x in 0..w {
             let c = pick(x, y);
             planes[0].data[y * w + x] = (c[0] as u16) << sh;
-            if !mono && x % (1 << sub) == 0 && y % (1 << sub) == 0 {
-                planes[1].data[(y >> sub) * cw + (x >> sub)] = (c[1] as u16) << sh;
-                planes[2].data[(y >> sub) * cw + (x >> sub)] = (c[2] as u16) << sh;
+            if !mono && x % (1 << sx) == 0 && y % (1 << sy) == 0 {
+                planes[1].data[(y >> sy) * cw + (x >> sx)] = (c[1] as u16) << sh;
+                planes[2].data[(y >> sy) * cw + (x >> sx)] = (c[2] as u16) << sh;
             }
         }
     }
-    let frame = Frame { planes, bit_depth, sub_x: sub, sub_y: sub, width: w, height: h };
+    let frame = Frame { planes, bit_depth, sub_x: sx, sub_y: sy, width: w, height: h };
     let color = ColorConfig {
         bit_depth,
         mono_chrome: mono,
@@ -57,8 +58,8 @@ fuzz_target!(|data: &[u8]| {
         transfer_characteristics: 13,
         matrix_coefficients: 6,
         color_range: true,
-        sub_x: sub,
-        sub_y: sub,
+        sub_x: sx,
+        sub_y: sy,
         chroma_sample_position: 0,
         separate_uv_delta_q: false,
     };

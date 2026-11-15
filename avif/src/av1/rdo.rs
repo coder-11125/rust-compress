@@ -564,6 +564,11 @@ impl<C: Coder> TileCoder<'_, C> {
         } else {
             options.push(PARTITION_SPLIT);
         }
+        if self.f.num_planes > 1 {
+            // A partition may not produce a block whose chroma size does not exist (4x8 in 4:2:2, say).
+            let (sx, sy) = (self.f.sub_x as u8, self.f.sub_y as u8);
+            options.retain(|&p| subsampled_size(partition_subsize(p, bsize), sx, sy) != BLOCK_INVALID);
+        }
         let effort = self.enc_src.as_ref().map_or(9, |e| e.effort);
         self.clear_planned(r, c, num4);
         let (mut none_j, mut split_j): (Option<f64>, Option<f64>) = (None, None);
