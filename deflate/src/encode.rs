@@ -398,6 +398,10 @@ pub fn zlib_compress(data: &[u8], level: u32) -> Vec<u8> {
 
 /// zlib stream using a preset dictionary (FDICT set, dictionary Adler-32 in the header).
 pub fn zlib_compress_dict(data: &[u8], level: u32, dict: &[u8]) -> Vec<u8> {
+    if dict.is_empty() {
+        // Nothing to preset: an ordinary zlib stream, which every decoder takes without a dictionary.
+        return zlib_compress(data, level);
+    }
     let body = deflate_compress_dict(data, level, dict);
     let mut out = Vec::with_capacity(body.len() + 10);
     out.extend_from_slice(&zlib_header(level, true));

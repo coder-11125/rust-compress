@@ -81,3 +81,17 @@ path = "fuzz_targets/av1_obu.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "gzip"
+path = "fuzz_targets/gzip.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "palette_roundtrip"
+path = "fuzz_targets/palette_roundtrip.rs"
+test = false
+doc = false
+bench = false

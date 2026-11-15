@@ -1,17 +1,19 @@
 # Fuzzing
 
-Eight libFuzzer targets cover every parser that touches untrusted bytes:
+Ten libFuzzer targets cover every parser that touches untrusted bytes, plus a differential check of the palette encoder:
 
 | target | covers |
 | --- | --- |
 | `inflate` | DEFLATE / zlib decoding, stream statistics |
+| `gzip` | gzip members (multi-member, header fields), preset-dictionary zlib/DEFLATE, and round trips of the input |
 | `png` | PNG and APNG decoding, plus a re-encode round trip |
 | `jpeg_decode` | every JPEG variant (baseline, progressive, arithmetic, 12-bit, lossless, hierarchical, CMYK) to pixels |
 | `jpeg_coefs` | the lossless-recompression path: coefficient parsing, requantize, both entropy writers |
 | `webp` | VP8, VP8L, alpha, animated WebP, plus a re-encode round trip |
 | `gif` | GIF and animated GIF |
 | `avif` | AVIF container, image sequences, and the AV1 decoder behind them |
-| `av1_obu` | a bare AV1 OBU stream, skipping the container |
+| `av1_obu` | a bare AV1 OBU stream, skipping the container (palette streams are in the seed corpus) |
+| `palette_roundtrip` | not a parser: builds a small few-colour picture from the input, encodes it with palette mode forced on, and requires the decoder to reproduce the encoder's reconstruction exactly |
 
 Run one locally (needs nightly and `cargo install cargo-fuzz`):
 

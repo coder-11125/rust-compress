@@ -85,3 +85,12 @@ fn dictionary_larger_than_window_and_multi_segment() {
     assert_eq!(out, data);
     assert!(rc_deflate::inflate::inflate_with_end_dict(&raw, &dict, 0, 1000).is_err());
 }
+
+#[test]
+fn empty_dictionary_gives_a_plain_zlib_stream() {
+    let d = sample(2000);
+    let z = zlib_compress_dict(&d, 6, &[]);
+    assert_eq!(z[1] & 0x20, 0, "no FDICT flag without a dictionary");
+    assert_eq!(zlib_decompress(&z, 0, 1 << 20).unwrap(), d);
+    assert_eq!(zlib_decompress_dict(&z, &[], 0, 1 << 20).unwrap(), d);
+}

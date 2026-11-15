@@ -4,7 +4,7 @@ cd "$SRC/rust-compress"
 cargo fuzz build -O --fuzz-dir fuzz
 
 TARGET_DIR="fuzz/target/x86_64-unknown-linux-gnu/release"
-for target in inflate png jpeg_decode jpeg_coefs webp gif avif av1_obu; do
+for target in inflate gzip png jpeg_decode jpeg_coefs webp gif avif av1_obu palette_roundtrip; do
   cp "$TARGET_DIR/$target" "$OUT/$target"
 done
 
@@ -13,6 +13,7 @@ seed() { # seed <target> <glob...>
   zip -qj "$OUT/${name}_seed_corpus.zip" "$@"
 }
 seed inflate     fixtures/*.png
+seed gzip        fixtures/*.gz
 seed png         fixtures/*.png
 seed jpeg_decode fixtures/*.jpg
 seed jpeg_coefs  fixtures/*.jpg
