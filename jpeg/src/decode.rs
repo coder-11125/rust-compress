@@ -9,7 +9,7 @@ use super::encode::{CoefComponent, CoefImage};
 use super::hierarchical::{Hier, HierComp, MAX_FRAMES, Plane, expand};
 use rayon::prelude::*;
 use rc_core::error::{Error, Result};
-use rc_core::image::{ColorType, Image, MAX_PIXELS, Metadata};
+use rc_core::image::{ColorType, Image, Metadata, max_pixels};
 
 // ---------------------------------------------------------------- bit reader
 
@@ -277,6 +277,10 @@ const XMP_PREFIX: &[u8] = b"http://ns.adobe.com/xap/1.0/\0";
 const PHOTOSHOP_PREFIX: &[u8] = b"Photoshop 3.0\0";
 /// Descriptive metadata is capped so a hostile file cannot make us hoard memory.
 const MAX_EXTRA_SEGMENTS: usize = 256;
+
+/// Most scans one frame may have. Real progressive files use up to a few dozen; every scan costs a pass over the
+/// whole image, so a file that repeats a scan thousands of times is a way to burn time, not an image.
+const MAX_SCANS: usize = 1000;
 
 /// Assemble the `Metadata` of a decoded file from the ICC fragments and descriptive segments it held.
 fn build_meta(mut icc_parts: Vec<(u8, Vec<u8>)>, extras: Vec<(u8, Vec<u8>)>) -> Metadata {
@@ -678,6 +682,9 @@ impl Decoder<'_> {
                 0xEE if body.len() >= 12 && &body[..5] == b"Adobe" => self.adobe_transform = Some(body[11]),
                 0xE1 | 0xED | 0xFE if self.extras.len() < MAX_EXTRA_SEGMENTS => self.extras.push((m, body.to_vec())),
                 0xDA => {
+                    if self.scans_seen >= MAX_SCANS {
+                        return Err(Error::unsupported("too many scans in a JPEG frame"));
+                    }
                     self.read_sos(body)?;
                     self.scans_seen += 1;
                 }
@@ -742,7 +749,7 @@ impl Decoder<'_> {
         if w == 0 || h == 0 {
             return Err(Error::invalid("zero hierarchical JPEG dimension"));
         }
-        if (w as u64) * (h as u64) > MAX_PIXELS {
+        if (w as u64) * (h as u64) > max_pixels() {
             return Err(Error::invalid("unreasonable image dimensions"));
         }
         if !(2..=16).contains(&precision) {
@@ -981,7 +988,7 @@ impl Decoder<'_> {
         if w == 0 || h == 0 {
             return Err(Error::invalid("zero JPEG dimension (DNL not supported)"));
         }
-        if (w as u64) * (h as u64) > MAX_PIXELS {
+        if (w as u64) * (h as u64) > max_pixels() {
             return Err(Error::invalid("unreasonable image dimensions"));
         }
         if nc != 1 && nc != 3 && nc != 4 {

@@ -32,6 +32,18 @@ impl ColorType {
 /// Sanity limit on decoded size, to stop hostile headers from exhausting memory.
 pub const MAX_PIXELS: u64 = 150_000_000;
 
+static PIXEL_LIMIT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(MAX_PIXELS);
+
+/// The pixel limit decoders enforce right now: [`MAX_PIXELS`] unless lowered with [`set_max_pixels`].
+pub fn max_pixels() -> u64 {
+    PIXEL_LIMIT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Lower the pixel limit (never above [`MAX_PIXELS`]), for callers that want to bound memory more tightly.
+pub fn set_max_pixels(limit: u64) {
+    PIXEL_LIMIT.store(limit.clamp(1, MAX_PIXELS), std::sync::atomic::Ordering::Relaxed);
+}
+
 /// Metadata carried through recompression.
 ///
 /// The color-management part (`icc`, `png_color`) always survives, since dropping it shifts colors.
@@ -53,7 +65,28 @@ pub struct Metadata {
     pub png_extra: Vec<([u8; 4], Vec<u8>)>,
 }
 
+/// Largest ICC profile that is carried along. Real profiles are a few KB to a few MB; the JPEG format allows 16 MB of
+/// them in 255 segments, which only makes sense as a place to hide data.
+pub const MAX_ICC_BYTES: usize = 8 << 20;
+
+/// Whether `profile` looks like an ICC profile: a 128-byte header whose size field matches the data (a few padding
+/// bytes are tolerated) and the `acsp` signature. Anything else is not something a colour-managed viewer would use.
+pub fn plausible_icc(profile: &[u8]) -> bool {
+    if profile.len() < 128 || profile.len() > MAX_ICC_BYTES || &profile[36..40] != b"acsp" {
+        return false;
+    }
+    let declared = u32::from_be_bytes([profile[0], profile[1], profile[2], profile[3]]) as usize;
+    declared >= 128 && declared <= profile.len() && profile.len() - declared <= 3
+}
+
 impl Metadata {
+    /// Drop an embedded ICC profile that is not a plausible one (see [`plausible_icc`]).
+    pub fn drop_invalid_icc(&mut self) {
+        if self.icc.as_deref().is_some_and(|p| !plausible_icc(p)) {
+            self.icc = None;
+        }
+    }
+
     /// Forget everything that is not needed to display the image correctly.
     pub fn drop_descriptive(&mut self) {
         self.exif = None;
@@ -183,5 +216,31 @@ impl Image {
             }
         }
         Image { width: dw as u32, height: dh as u32, data: out, ..self }
+    }
+}
+
+#[cfg(test)]
+mod icc_tests {
+    use super::*;
+
+    fn profile(len: usize, declared: u32) -> Vec<u8> {
+        let mut p = vec![0u8; len];
+        p[..4].copy_from_slice(&declared.to_be_bytes());
+        p[36..40].copy_from_slice(b"acsp");
+        p
+    }
+
+    #[test]
+    fn only_profiles_with_a_consistent_header_are_plausible() {
+        assert!(plausible_icc(&profile(600, 600)));
+        assert!(plausible_icc(&profile(602, 600)), "a little padding is fine");
+        assert!(!plausible_icc(&profile(600, 4000)), "declared size larger than the data");
+        assert!(!plausible_icc(&profile(700, 600)), "a long tail is something else");
+        assert!(!plausible_icc(&profile(100, 100)), "shorter than the 128-byte header");
+        assert!(!plausible_icc(&vec![0x41; 5000]), "no signature");
+        assert!(!plausible_icc(&profile(MAX_ICC_BYTES + 1, (MAX_ICC_BYTES + 1) as u32)));
+        let mut meta = Metadata { icc: Some(vec![0x41; 5000]), ..Default::default() };
+        meta.drop_invalid_icc();
+        assert!(meta.icc.is_none());
     }
 }

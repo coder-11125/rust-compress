@@ -164,3 +164,32 @@ fn icc_profile_is_kept_by_default() {
     let m = jpeg_meta(&run(&fixture("icc.jpg"), &[], "jpg"));
     assert!(m.icc.is_some());
 }
+
+/// `rc` leaves an animated PNG alone, but a file that is kept as it is must still lose its descriptive metadata by
+/// default: the original bytes used to be copied with their text chunks, so an author name or a location survived a
+/// run that promised to keep only colour information.
+#[test]
+fn kept_original_bytes_lose_their_text_chunks_unless_keep_metadata() {
+    let clean = fixture("apng_anim.png");
+    let ihdr_end = 8 + 12 + 13;
+    let dirty =
+        [&clean[..ihdr_end], &png_chunk(b"tEXt", b"Location\0home address 12 Example Street"), &clean[ihdr_end..]]
+            .concat();
+    let d = tempdir().unwrap();
+    let input = d.path().join("anim.png");
+    fs::write(&input, &dirty).unwrap();
+
+    let out = d.path().join("out.png");
+    let run = cmd().arg(&input).arg("-o").arg(&out).arg("--json").assert().success();
+    let stdout = String::from_utf8_lossy(&run.get_output().stdout).to_string();
+    assert!(stdout.contains("descriptive metadata removed"), "{stdout}");
+    assert_eq!(fs::read(&out).unwrap(), clean, "only the text chunk may go");
+
+    let kept = d.path().join("kept.png");
+    cmd().arg(&input).arg("-o").arg(&kept).arg("--keep-metadata").assert().success();
+    assert_eq!(fs::read(&kept).unwrap(), dirty, "--keep-metadata copies the original");
+
+    // --in-place rewrites the file when something was removed.
+    cmd().arg(&input).arg("--in-place").assert().success();
+    assert_eq!(fs::read(&input).unwrap(), clean);
+}

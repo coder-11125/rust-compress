@@ -4,9 +4,9 @@
 use super::SIGNATURE;
 use super::encode::{EncodeOptions, idat_for_rows};
 use rayon::prelude::*;
-use rc_core::animation::{AnimFrame, Animation, MAX_ANIMATION_PIXELS, normalize_delay};
+use rc_core::animation::{AnimFrame, Animation, MAX_ANIMATION_FRAMES, MAX_ANIMATION_PIXELS, normalize_delay};
 use rc_core::error::{Error, Result};
-use rc_core::image::{ColorType, Image, MAX_PIXELS};
+use rc_core::image::{ColorType, Image, max_pixels};
 use rc_core::util::checksum::crc32;
 
 struct Chunk<'a> {
@@ -66,7 +66,7 @@ pub fn decode_animation(data: &[u8]) -> Result<Animation> {
     let ihdr = list.first().filter(|c| &c.kind == b"IHDR" && c.body.len() == 13);
     let ihdr = ihdr.ok_or_else(|| Error::invalid("PNG without IHDR"))?.body;
     let (cw, ch) = (be32(&ihdr[0..4]) as usize, be32(&ihdr[4..8]) as usize);
-    if cw == 0 || ch == 0 || (cw as u64) * (ch as u64) > MAX_PIXELS {
+    if cw == 0 || ch == 0 || (cw as u64) * (ch as u64) > max_pixels() {
         return Err(Error::invalid("bad PNG dimensions"));
     }
     let mut plays = 1u32;
@@ -119,7 +119,7 @@ pub fn decode_animation(data: &[u8]) -> Result<Animation> {
             loop_forever: false,
         });
     }
-    if (frames.len() as u64) * (cw as u64) * (ch as u64) > MAX_ANIMATION_PIXELS {
+    if (frames.len() as u64) * (cw as u64) * (ch as u64) > MAX_ANIMATION_PIXELS || frames.len() > MAX_ANIMATION_FRAMES {
         return Err(Error::unsupported("APNG animation too large"));
     }
 

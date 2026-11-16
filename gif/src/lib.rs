@@ -2,9 +2,9 @@
 //! transparency. [`decode`] refuses animated GIFs rather than flattening them to their first frame; use
 //! [`decode_animation`] for those.
 
-use rc_core::animation::{AnimFrame, Animation, MAX_ANIMATION_PIXELS, normalize_delay};
+use rc_core::animation::{AnimFrame, Animation, MAX_ANIMATION_FRAMES, MAX_ANIMATION_PIXELS, normalize_delay};
 use rc_core::error::{Error, Result};
-use rc_core::image::{ColorType, Image, MAX_PIXELS};
+use rc_core::image::{ColorType, Image, max_pixels};
 
 pub mod encode;
 pub use encode::{EncodeOptions, encode_animation, palette_is_exact};
@@ -167,7 +167,7 @@ pub fn decode(data: &[u8]) -> Result<Image> {
     let packed = c.u8()?;
     let _background = c.u8()?;
     let _aspect = c.u8()?;
-    if sw == 0 || sh == 0 || (sw as u64) * (sh as u64) > MAX_PIXELS {
+    if sw == 0 || sh == 0 || (sw as u64) * (sh as u64) > max_pixels() {
         return Err(Error::invalid("bad GIF dimensions"));
     }
     let global = if packed & 0x80 != 0 { Some(color_table(&mut c, packed)?) } else { None };
@@ -247,7 +247,7 @@ pub fn decode_animation(data: &[u8]) -> Result<Animation> {
     let packed = c.u8()?;
     let _background = c.u8()?;
     let _aspect = c.u8()?;
-    if sw == 0 || sh == 0 || (sw as u64) * (sh as u64) > MAX_PIXELS {
+    if sw == 0 || sh == 0 || (sw as u64) * (sh as u64) > max_pixels() {
         return Err(Error::invalid("bad GIF dimensions"));
     }
     let global = if packed & 0x80 != 0 { Some(color_table(&mut c, packed)?) } else { None };
@@ -299,7 +299,9 @@ pub fn decode_animation(data: &[u8]) -> Result<Animation> {
                 if fp & 0x40 != 0 {
                     idx = deinterlace(&idx, w, h);
                 }
-                if (frames.len() as u64 + 1) * (sw * sh) as u64 > MAX_ANIMATION_PIXELS {
+                if (frames.len() as u64 + 1) * (sw * sh) as u64 > MAX_ANIMATION_PIXELS
+                    || frames.len() >= MAX_ANIMATION_FRAMES
+                {
                     return Err(Error::unsupported("GIF animation too large"));
                 }
                 // Dispose of the previous frame first.

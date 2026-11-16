@@ -43,7 +43,7 @@
 
 use super::sequence::TrackOut;
 use rc_core::error::{Error, Result};
-use rc_core::image::{MAX_PIXELS, Metadata};
+use rc_core::image::{Metadata, max_pixels};
 use std::cell::Cell;
 use std::collections::HashMap;
 
@@ -848,7 +848,7 @@ impl<'a> Loader<'a> {
     }
 
     fn check_size(w: u32, h: u32) -> Result<()> {
-        if w == 0 || h == 0 || w as u64 * h as u64 > MAX_PIXELS {
+        if w == 0 || h == 0 || w as u64 * h as u64 > max_pixels() {
             return Err(Error::invalid(format!("image size {w}x{h} out of range")));
         }
         Ok(())

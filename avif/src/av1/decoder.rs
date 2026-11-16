@@ -274,7 +274,7 @@ impl Decoder {
 
 fn check_limits(seq: &SequenceHeader, h: &FrameHeader) -> Result<()> {
     let pixels = h.upscaled_width as u64 * h.frame_height as u64;
-    if pixels > rc_core::image::MAX_PIXELS {
+    if pixels > rc_core::image::max_pixels() {
         return Err(Error::unsupported("AV1 picture too large"));
     }
     if seq.color.mono_chrome && h.frame_type > 3 {

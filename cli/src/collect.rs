@@ -227,6 +227,15 @@ fn walk(dir: &Path, recursive: bool, suffix: &str, out: &mut Vec<PathBuf>) -> st
     Ok(())
 }
 
+/// Why an input is neither a file nor a directory: it does not exist, or it is a pipe, device or socket.
+fn missing_input(p: &Path) -> String {
+    if p.exists() {
+        format!("{}: not a regular file (pipes and devices are not supported; use `-` for standard input)", p.display())
+    } else {
+        format!("{}: no such file or directory", p.display())
+    }
+}
+
 /// Returns jobs plus human-readable problems with individual inputs.
 pub fn collect(cli: &Cli) -> (Vec<Job>, Vec<String>) {
     let mut problems = Vec::new();
@@ -247,7 +256,7 @@ pub fn collect(cli: &Cli) -> (Vec<Job>, Vec<String>) {
         } else if cli.inputs[0].is_dir() {
             problems.push(format!("{}: cannot write a directory to standard output", cli.inputs[0].display()));
         } else if from_stdin == 0 && !cli.inputs[0].is_file() {
-            problems.push(format!("{}: no such file or directory", cli.inputs[0].display()));
+            problems.push(missing_input(&cli.inputs[0]));
         }
         if !problems.is_empty() {
             return (Vec::new(), problems);
@@ -287,7 +296,7 @@ pub fn collect(cli: &Cli) -> (Vec<Job>, Vec<String>) {
             let output = output_path(cli, input, &rel, &file_root(input), dir_mode);
             jobs.push(Job { input: input.clone(), output });
         } else {
-            problems.push(format!("{}: no such file or directory", input.display()));
+            problems.push(missing_input(input));
         }
     }
     // Two jobs writing the same file would race; reject the later ones.

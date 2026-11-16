@@ -91,7 +91,7 @@ cat in.png | rc - > out.png  # stdin to stdout
 
 **Pipes** — `-` as the input reads one image from standard input; `-o -` (the default for stdin) writes to standard output, with all reporting moved to standard error.
 
-**Safety** — an output is never larger than its input (the original bytes are kept instead), files are written atomically, existing outputs are not overwritten without `--force`, ICC profiles and PNG color chunks are kept (`--strip-icc` to drop them), animations are never flattened, and decoders are hardened against truncated/corrupt/hostile input (see *Testing*).
+**Safety** — when a file keeps its format, the output is never larger than its input (the original bytes are kept instead; converting to another format or resizing can make a file bigger, and the report then says "larger"), files are written atomically, existing outputs are not overwritten without `--force`, ICC profiles and PNG color chunks are kept (`--strip-icc` to drop them), animations are never flattened, and decoders are hardened against truncated/corrupt/hostile input (see *Testing*).
 
 ## Usage
 
@@ -125,7 +125,9 @@ rc [OPTIONS] <INPUT>...
       --resize <SIZE>     shrink to fit: WxH, Wx, xH or P% (never enlarges)
       --resize-encoded    with --resize: filter the stored values instead of linear light
       --background <HEX>  color for flattening transparency (default ffffff)
-  -j, --jobs <N>          worker threads (default: all cores)
+      --max-pixels <N>    reject images with more than N pixels (default and maximum 150000000)
+      --max-memory <MIB>  soft limit on the memory images processed at once may need (default 4096); the rest wait
+  -j, --jobs <N>          worker threads, 1-1024 (default: all cores)
       --dry-run           report savings without writing
       --force             overwrite existing outputs
       --quiet             only errors and the summary line

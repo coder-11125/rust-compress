@@ -7,7 +7,7 @@ use super::predict::{self, ORIGIN, WS, fill_borders, store_block};
 use super::tables::*;
 use super::transform::{idct_add, iwht};
 use rc_core::error::{Error, Result};
-use rc_core::image::MAX_PIXELS;
+use rc_core::image::max_pixels;
 
 /// A decoded frame: padded planes (whole macroblocks) plus the visible size.
 pub struct Frame {
@@ -183,7 +183,7 @@ fn parse_header(data: &[u8]) -> Result<(Header, BoolDecoder<'_>, usize)> {
     }
     let width = (u16::from_le_bytes([data[6], data[7]]) & 0x3FFF) as usize;
     let height = (u16::from_le_bytes([data[8], data[9]]) & 0x3FFF) as usize;
-    if width == 0 || height == 0 || (width * height) as u64 > MAX_PIXELS {
+    if width == 0 || height == 0 || (width * height) as u64 > max_pixels() {
         return Err(Error::invalid("bad VP8 dimensions"));
     }
     let body = &data[10..];

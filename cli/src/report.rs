@@ -6,6 +6,9 @@ pub enum Status {
     Compressed,
     /// Result was not smaller; original kept / copied.
     NoGain,
+    /// Output written, but bigger than the input: the format was changed or the image resized, so the never-grow
+    /// rule (which keeps the original bytes) does not apply.
+    Larger,
     Failed(String),
 }
 
@@ -18,6 +21,23 @@ pub struct Report {
     pub status: Status,
     /// Extra detail shown after the size change (e.g. the chosen JPEG quality).
     pub note: Option<String>,
+}
+
+/// Make text safe to print on a terminal: control characters (ANSI escapes, newlines, ...) in file names or error
+/// messages are shown as `\xNN` instead of being interpreted.
+pub fn sanitize(s: &str) -> String {
+    if !s.chars().any(char::is_control) {
+        return s.to_string();
+    }
+    let mut out = String::with_capacity(s.len() + 8);
+    for c in s.chars() {
+        if c.is_control() {
+            out.push_str(&format!("\\x{:02x}", c as u32));
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 pub fn human(bytes: u64) -> String {
@@ -40,9 +60,13 @@ pub fn percent(from: u64, to: u64) -> String {
 
 impl Report {
     pub fn line(&self, dry_run: bool) -> String {
+        sanitize(&self.line_raw(dry_run))
+    }
+
+    fn line_raw(&self, dry_run: bool) -> String {
         let name = self.input.display();
         match &self.status {
-            Status::Compressed => format!(
+            Status::Compressed | Status::Larger => format!(
                 "{name}  {} -> {}  ({}){}",
                 human(self.in_size),
                 human(self.out_size),
@@ -52,6 +76,10 @@ impl Report {
                     (Some(n), false) => format!("  [{n}]"),
                     (None, true) => "  [dry run]".to_string(),
                     (None, false) => String::new(),
+                } + if matches!(self.status, Status::Larger) {
+                    "  [larger than the original: format change or resize]"
+                } else {
+                    ""
                 }
             ),
             Status::NoGain => format!(
@@ -68,6 +96,7 @@ impl Report {
 pub struct Summary {
     pub files: usize,
     pub compressed: usize,
+    pub larger: usize,
     pub no_gain: usize,
     pub failed: usize,
     pub bytes_in: u64,
@@ -79,6 +108,7 @@ impl Summary {
         self.files += 1;
         match r.status {
             Status::Compressed => self.compressed += 1,
+            Status::Larger => self.larger += 1,
             Status::NoGain => self.no_gain += 1,
             Status::Failed(_) => {
                 self.failed += 1;
@@ -90,8 +120,9 @@ impl Summary {
     }
 
     pub fn line(&self, secs: f64) -> String {
+        let larger = if self.larger > 0 { format!(", {} larger", self.larger) } else { String::new() };
         format!(
-            "{} file(s): {} compressed, {} no gain, {} failed; {} -> {} ({}) in {:.2}s",
+            "{} file(s): {} compressed{larger}, {} no gain, {} failed; {} -> {} ({}) in {:.2}s",
             self.files,
             self.compressed,
             self.no_gain,
@@ -132,6 +163,7 @@ fn change_percent(from: u64, to: u64) -> String {
 fn status_name(status: &Status) -> &'static str {
     match status {
         Status::Compressed => "compressed",
+        Status::Larger => "larger",
         Status::NoGain => "no_gain",
         Status::Failed(_) => "failed",
     }
@@ -168,9 +200,10 @@ pub fn json(files: &[Report], summary: &Summary, errors: &[String], secs: f64, d
     }
     out.push_str("],\"summary\":{");
     out.push_str(&format!(
-        "\"files\":{},\"compressed\":{},\"no_gain\":{},\"failed\":{},\"bytes_in\":{},\"bytes_out\":{},\"change_percent\":{},\"seconds\":{secs:.2}",
+        "\"files\":{},\"compressed\":{},\"larger\":{},\"no_gain\":{},\"failed\":{},\"bytes_in\":{},\"bytes_out\":{},\"change_percent\":{},\"seconds\":{secs:.2}",
         summary.files,
         summary.compressed,
+        summary.larger,
         summary.no_gain,
         summary.failed,
         summary.bytes_in,

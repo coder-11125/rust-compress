@@ -171,6 +171,111 @@ fn in_place_preserves_permissions() {
     assert_eq!(fs::metadata(&input).unwrap().permissions().mode() & 0o777, 0o640);
 }
 
+#[cfg(unix)]
+#[test]
+fn in_place_follows_a_symlink_and_keeps_the_link() {
+    let d = tempdir().unwrap();
+    let real = put(d.path(), "real/a.png", "rgb8.png");
+    let link = d.path().join("link.png");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    let before = fs::metadata(&real).unwrap().len();
+    cmd().arg(&link).arg("--in-place").assert().success();
+    assert!(fs::symlink_metadata(&link).unwrap().file_type().is_symlink(), "the link must stay a link");
+    assert!(fs::metadata(&real).unwrap().len() < before, "the target is what gets optimized");
+}
+
+#[cfg(unix)]
+#[test]
+fn in_place_refuses_a_hard_linked_file() {
+    let d = tempdir().unwrap();
+    let a = put(d.path(), "a.png", "rgb8.png");
+    let b = d.path().join("b.png");
+    fs::hard_link(&a, &b).unwrap();
+    let out = cmd().arg(&a).arg("--in-place").assert().failure();
+    let stderr = String::from_utf8_lossy(&out.get_output().stderr).to_string();
+    assert!(stderr.contains("hard links"), "{stderr}");
+    assert_eq!(fs::read(&a).unwrap(), fixture("rgb8.png"));
+    assert_eq!(fs::read(&b).unwrap(), fixture("rgb8.png"));
+}
+
+#[test]
+fn control_characters_in_file_names_are_not_printed_raw() {
+    let d = tempdir().unwrap();
+    let name = "x\u{1b}[31mRED.png";
+    let input = d.path().join(name);
+    fs::write(&input, fixture("rgb8.png")).unwrap();
+    let out = cmd().arg(&input).arg("--dry-run").assert().success();
+    let stdout = String::from_utf8_lossy(&out.get_output().stdout).to_string();
+    assert!(!stdout.contains('\u{1b}'), "{stdout:?}");
+    assert!(stdout.contains("\\x1b[31mRED.png"), "{stdout:?}");
+}
+
+#[test]
+fn out_of_range_dither_and_jobs_are_rejected() {
+    let d = tempdir().unwrap();
+    let input = put(d.path(), "a.png", "rgb8.png");
+    for bad in ["NaN", "inf", "5", "-3"] {
+        cmd().arg(&input).arg("--lossy").arg(format!("--dither={bad}")).arg("--dry-run").assert().code(2);
+    }
+    cmd().arg(&input).args(["-j", "100000", "--dry-run"]).assert().code(2);
+    cmd().arg(&input).args(["-j", "0", "--dry-run"]).assert().code(2);
+    cmd().arg(&input).args(["--lossy", "--dither", "0.25", "-j", "2", "--dry-run"]).assert().success();
+}
+
+#[test]
+fn a_format_change_that_grows_the_file_is_reported_as_larger() {
+    let d = tempdir().unwrap();
+    let input = put(d.path(), "photo.jpg", "rgb8.jpg");
+    let out = cmd().arg(&input).args(["-f", "png", "--json"]).assert().success();
+    let stdout = String::from_utf8_lossy(&out.get_output().stdout).to_string();
+    assert!(stdout.contains("\"status\":\"larger\""), "{stdout}");
+    assert!(stdout.contains("\"larger\":1"), "{stdout}");
+    let text = cmd().arg(&input).args(["-f", "png", "--force"]).assert().success();
+    let text = String::from_utf8_lossy(&text.get_output().stdout).to_string();
+    assert!(text.contains("1 larger"), "{text}");
+}
+
+#[cfg(unix)]
+#[test]
+fn pipes_and_devices_are_not_reported_as_missing() {
+    let out = cmd().arg("/dev/null").assert().failure();
+    let stderr = String::from_utf8_lossy(&out.get_output().stderr).to_string();
+    assert!(stderr.contains("not a regular file"), "{stderr}");
+}
+
+#[test]
+fn max_pixels_refuses_bigger_images_and_accepts_the_rest() {
+    let d = tempdir().unwrap();
+    let png = put(d.path(), "a.png", "rgb8.png"); // 67 x 45 = 3015 pixels
+    let jpg = put(d.path(), "b.jpg", "rgb8.jpg");
+    for input in [&png, &jpg] {
+        let out = cmd().arg(input).args(["--max-pixels", "3000", "--dry-run"]).assert().failure();
+        let stderr = String::from_utf8_lossy(&out.get_output().stderr).to_string();
+        assert!(stderr.contains("FAILED"), "{stderr}");
+        cmd().arg(input).args(["--max-pixels", "3015", "--dry-run"]).assert().success();
+    }
+    cmd().arg(&png).args(["--max-pixels", "0"]).assert().code(2);
+    cmd().arg(&png).args(["--max-pixels", "150000001"]).assert().code(2);
+}
+
+#[test]
+fn a_tiny_memory_budget_runs_a_batch_one_image_at_a_time_without_stalling() {
+    let d = tempdir().unwrap();
+    for i in 0..12 {
+        put(d.path(), &format!("in/{i}.png"), "rgb8.png");
+        put(d.path(), &format!("in/{i}.jpg"), "rgb8.jpg");
+    }
+    let out = cmd()
+        .arg(d.path().join("in"))
+        .args(["--max-memory", "1", "--json", "-o"])
+        .arg(d.path().join("out"))
+        .assert()
+        .success();
+    let stdout = String::from_utf8_lossy(&out.get_output().stdout).to_string();
+    assert!(stdout.contains("\"files\":24") && stdout.contains("\"failed\":0"), "{stdout}");
+    cmd().arg(d.path().join("in")).args(["--max-memory", "0"]).assert().code(2);
+}
+
 #[test]
 fn format_conversion_both_ways() {
     let d = tempdir().unwrap();

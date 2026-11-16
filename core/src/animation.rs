@@ -10,6 +10,10 @@ pub const DEFAULT_DELAY_MS: u32 = 100;
 /// Upper bound on frames times pixels held in memory at once.
 pub const MAX_ANIMATION_PIXELS: u64 = 1 << 28;
 
+/// Upper bound on the frames of one animation. A pixel budget alone lets a one-pixel canvas hold hundreds of
+/// thousands of frames, and the per-frame work is then what takes the time.
+pub const MAX_ANIMATION_FRAMES: usize = 50_000;
+
 #[derive(Clone, Debug)]
 pub struct AnimFrame {
     /// The whole canvas as it is shown during this frame (8-bit RGB or RGBA).

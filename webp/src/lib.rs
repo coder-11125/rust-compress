@@ -11,7 +11,7 @@ pub mod vp8l_enc;
 pub use anim_enc::{AnimOptions, encode_animation};
 use rc_core::animation::Animation;
 use rc_core::error::{Error, Result};
-use rc_core::image::{ColorType, Image, MAX_PIXELS, Metadata};
+use rc_core::image::{ColorType, Image, MAX_PIXELS, Metadata, max_pixels};
 
 /// True if `data` starts like a WebP file (`RIFF` size `WEBP`).
 pub fn is_webp(data: &[u8]) -> bool {
@@ -154,7 +154,7 @@ fn le24(b: &[u8]) -> usize {
 /// Every frame of an animated WebP as the canvas it produces (8-bit RGBA, or RGB when nothing is transparent).
 /// A still WebP gives a one-frame animation.
 pub fn decode_animation(data: &[u8]) -> Result<Animation> {
-    use rc_core::animation::{AnimFrame, MAX_ANIMATION_PIXELS, normalize_delay};
+    use rc_core::animation::{AnimFrame, MAX_ANIMATION_FRAMES, MAX_ANIMATION_PIXELS, normalize_delay};
     let list = chunks(data)?;
     let animated = list.iter().any(|c| &c.id == b"ANMF");
     if !animated {
@@ -171,7 +171,7 @@ pub fn decode_animation(data: &[u8]) -> Result<Animation> {
         .find(|c| &c.id == b"VP8X" && c.body.len() >= 10)
         .ok_or_else(|| Error::invalid("animated WebP without VP8X"))?;
     let (cw, ch) = (le24(&vp8x.body[4..7]) + 1, le24(&vp8x.body[7..10]) + 1);
-    if (cw as u64) * (ch as u64) > MAX_PIXELS {
+    if (cw as u64) * (ch as u64) > max_pixels() {
         return Err(Error::invalid("bad WebP canvas size"));
     }
     let loop_forever = list
@@ -185,7 +185,9 @@ pub fn decode_animation(data: &[u8]) -> Result<Animation> {
         if c.body.len() < 16 {
             return Err(Error::invalid("short ANMF chunk"));
         }
-        if (shown.len() as u64 + 1) * (cw as u64) * (ch as u64) > MAX_ANIMATION_PIXELS {
+        if (shown.len() as u64 + 1) * (cw as u64) * (ch as u64) > MAX_ANIMATION_PIXELS
+            || shown.len() >= MAX_ANIMATION_FRAMES
+        {
             return Err(Error::unsupported("WebP animation too large"));
         }
         let b = c.body;

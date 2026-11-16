@@ -302,12 +302,13 @@ pub fn stream_stats(data: &[u8]) -> Result<StreamStats> {
                 st.fixed_blocks += 1;
                 (None, None)
             }
-            _ => {
+            2 => {
                 let before = r.byte_pos() * 8;
                 let (l, d) = read_dynamic_tables(&mut r)?;
                 st.header_bits += (r.byte_pos() * 8 - before) as u64;
                 (Some(l), Some(d))
             }
+            _ => return Err(Error::invalid("reserved deflate block type")),
         };
         let (ll, dist) = match (&ll, &dist) {
             (Some(l), Some(d)) => (l, d),
@@ -316,6 +317,11 @@ pub fn stream_stats(data: &[u8]) -> Result<StreamStats> {
         loop {
             r.refill();
             let sym = ll.decode(&mut r)? as usize;
+            // Past the end of the input the reader supplies zero bits forever, which decode as an endless run of
+            // symbols; stop as `inflate` does.
+            if r.overran() {
+                return Err(Error::invalid("truncated deflate stream"));
+            }
             if sym < 256 {
                 st.literals += 1;
                 out_len += 1;
@@ -375,6 +381,16 @@ mod tests {
         0x8b, 0xb0, 0x4d, 0x02, 0x9f, 0x9f, 0xca, 0xa6, 0x47, 0xa5, 0xa5, 0xa5, 0xa5, 0xa5, 0xa5, 0xa5, 0xa5, 0xa5,
         0xa5, 0xa5, 0xa5, 0xa5, 0xa5, 0xa5, 0xa5, 0xa1, 0xa5, 0x63,
     ];
+
+    // Found by fuzzing (target `inflate`): a block of reserved type 3 was read as a dynamic block, and
+    // `stream_stats` then decoded the zero bits past the end of the input as an endless run of symbols.
+    #[test]
+    fn stream_stats_stops_on_reserved_block_type_and_truncated_input() {
+        assert!(stream_stats(b"6885e182\n").is_err());
+        // Fixed-Huffman block (BFINAL=0, BTYPE=1) holding literals but no end-of-block symbol.
+        assert!(stream_stats(&[0x32, 0x34, 0x32]).is_err());
+        assert!(stream_stats(&[]).is_err());
+    }
 
     #[test]
     fn stream_stats_rejects_reserved_symbols_instead_of_panicking() {

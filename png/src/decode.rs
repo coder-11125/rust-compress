@@ -1,6 +1,6 @@
 use super::SIGNATURE;
 use rc_core::error::{Error, Result};
-use rc_core::image::{ColorType, Image, MAX_PIXELS, Metadata};
+use rc_core::image::{ColorType, Image, Metadata, max_pixels};
 use rc_core::util::checksum::crc32;
 use rc_deflate::zlib_decompress;
 
@@ -41,7 +41,11 @@ fn parse_header(body: &[u8]) -> Result<Header> {
     let width = u32::from_be_bytes(body[0..4].try_into().unwrap()) as u64;
     let height = u32::from_be_bytes(body[4..8].try_into().unwrap()) as u64;
     let (depth, color_type, compression, filter, interlace) = (body[8], body[9], body[10], body[11], body[12]);
-    if width == 0 || height == 0 || width.saturating_mul(height) > MAX_PIXELS || width > (1 << 24) || height > (1 << 24)
+    if width == 0
+        || height == 0
+        || width.saturating_mul(height) > max_pixels()
+        || width > (1 << 24)
+        || height > (1 << 24)
     {
         return Err(Error::invalid("unreasonable image dimensions"));
     }

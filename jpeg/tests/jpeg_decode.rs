@@ -102,3 +102,31 @@ fn baseline_transcode_is_lossless() {
         assert_eq!(back.data, want.data, "{name}");
     }
 }
+
+/// Repeat the third scan of a progressive JPEG (a first-pass AC scan, which can legally be decoded again) `copies`
+/// more times right after itself. Each scan costs a pass over the image, so a file that does this is a time bomb:
+/// 20,000 repeats on a 16-megapixel image took the decoder half a minute.
+fn with_repeated_scan(jpeg: &[u8], copies: usize) -> Vec<u8> {
+    let sos = jpeg.windows(2).enumerate().filter(|(_, w)| *w == [0xFF, 0xDA]).map(|(i, _)| i).nth(2).expect("a scan");
+    let header_len = u16::from_be_bytes([jpeg[sos + 2], jpeg[sos + 3]]) as usize;
+    let mut end = sos + 2 + header_len;
+    while !(jpeg[end] == 0xFF && jpeg[end + 1] != 0 && !(0xD0..=0xD7).contains(&jpeg[end + 1])) {
+        end += 1;
+    }
+    let mut out = jpeg[..end].to_vec();
+    for _ in 0..copies {
+        out.extend_from_slice(&jpeg[sos..end]);
+    }
+    out.extend_from_slice(&jpeg[end..]);
+    out
+}
+
+#[test]
+fn a_flood_of_repeated_scans_is_refused_but_a_few_repeats_are_fine() {
+    let prog = fixture("rgb8_prog.jpg");
+    assert!(decode(&prog).is_ok());
+    let few = decode(&with_repeated_scan(&prog, 5));
+    assert!(few.is_ok(), "a handful of extra scans is harmless: {:?}", few.err());
+    let err = decode(&with_repeated_scan(&prog, 1500)).unwrap_err().to_string();
+    assert!(err.contains("too many scans"), "{err}");
+}

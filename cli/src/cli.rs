@@ -137,7 +137,7 @@ pub struct Cli {
     pub colors: u16,
 
     /// With --lossy on PNG, and for still GIF output: dithering strength 0.0-1.0 (0 disables). Animated GIFs are never dithered.
-    #[arg(long, default_value_t = 0.5)]
+    #[arg(long, default_value_t = 0.5, value_parser = parse_dither)]
     pub dither: f32,
 
     /// PNG / WebP / AVIF effort (0-9). For PNG, 1-6 use greedy/lazy parsing (6 is fast) and 7-9 optimal parsing
@@ -197,8 +197,19 @@ pub struct Cli {
     #[arg(long, default_value = "ffffff", value_parser = parse_hex_color)]
     pub background: [u8; 3],
 
-    /// Number of worker threads (default: all cores).
-    #[arg(short, long)]
+    /// Reject images with more than N pixels (default and maximum: 150000000). Lower it to keep hostile or huge files
+    /// from needing gigabytes: a 16-bit RGBA image takes about 20 bytes per pixel while it is processed.
+    #[arg(long, value_name = "N", value_parser = clap::value_parser!(u64).range(1..=150_000_000))]
+    pub max_pixels: Option<u64>,
+
+    /// Soft limit, in MiB, on the memory that images being processed at the same time may need (estimated from each
+    /// image's size). Images wait for others to finish instead of being decoded together; one image bigger than the
+    /// limit still runs, alone.
+    #[arg(long, value_name = "MIB", default_value_t = 4096, value_parser = clap::value_parser!(u64).range(1..=4194304))]
+    pub max_memory: u64,
+
+    /// Number of worker threads, 1-1024 (default: all cores).
+    #[arg(short, long, value_parser = parse_jobs)]
     pub jobs: Option<usize>,
 
     /// Report what would happen without writing anything.
@@ -236,6 +247,19 @@ fn parse_ssim(s: &str) -> Result<f64, String> {
 fn parse_psnr(s: &str) -> Result<f64, String> {
     let v: f64 = s.parse().map_err(|_| "expected a number in dB".to_string())?;
     if v > 0.0 && v <= 99.0 { Ok(v) } else { Err("PSNR target must be in (0, 99]".into()) }
+}
+
+fn parse_dither(s: &str) -> Result<f32, String> {
+    let v: f32 = s.parse().map_err(|_| "expected a number between 0.0 and 1.0".to_string())?;
+    if (0.0..=1.0).contains(&v) { Ok(v) } else { Err("dither strength must be between 0.0 and 1.0".into()) }
+}
+
+/// Far more threads than any machine has only fail later, while the thread pool is built.
+const MAX_JOBS: usize = 1024;
+
+fn parse_jobs(s: &str) -> Result<usize, String> {
+    let n: usize = s.parse().map_err(|_| "expected a number of threads".to_string())?;
+    if (1..=MAX_JOBS).contains(&n) { Ok(n) } else { Err(format!("--jobs must be between 1 and {MAX_JOBS}")) }
 }
 
 fn parse_suffix(s: &str) -> Result<String, String> {

@@ -2,6 +2,29 @@
 
 ## Unreleased
 
+- Metadata no longer leaks through the "keep the original" fallback. When re-encoding does not help, `rc` keeps the
+  original bytes, which used to carry their EXIF, XMP, text chunks and comments along although only colour
+  information is meant to survive. The descriptive metadata is now cut out of the PNG chunks, JPEG segments or WebP
+  chunks without touching the image data (a saving, reported as such), unless `--keep-metadata` is given. A file
+  whose EXIF rotates the image is left alone, and GIF and AVIF are still copied as they are.
+- `--in-place` follows a symlink and updates the file it points to (the link used to be replaced by a regular file),
+  refuses a file with several hard links (replacing it would split them), and no longer overwrites a file that was
+  changed while it was being processed.
+- New `--max-pixels` lowers the image size limit, and `--max-memory` (default 4096 MiB) makes images that would need a
+  lot of memory wait for each other instead of being decoded all at once; one 20-megapixel 16-bit PNG batch peaked at
+  0.47 GB instead of 1.18 GB. A JPEG with more than 1000 scans and an animation with more than 50,000 frames are
+  refused (they only cost time).
+- Embedded ICC profiles that are not plausible (no `acsp` header, size field not matching, over 8 MiB) are dropped
+  instead of being carried along as an arbitrary payload.
+- A conversion or resize that makes a file bigger is reported as `larger` (JSON status `larger`, summary count
+  `larger`) instead of `compressed`; the README no longer promises that every output is smaller.
+- File names and error text are printed with control characters escaped, so a name cannot inject terminal escape
+  sequences. `--dither` must be 0.0 to 1.0, `--jobs` 1 to 1024, and a pipe or device given as an input is reported
+  as "not a regular file" instead of "no such file". The "no files found" message names all five formats.
+- Fixed an endless loop in `deflate::inflate::stream_stats` on truncated input and on the reserved block type 3 (found
+  by the `inflate` fuzz target); only the fuzzer and an example call it, not the CLI.
+- Removed the stale mention of `oss-fuzz/` from the fuzz README.
+
 - Fixed a crash on any 12 to 15 byte input that starts with an `ftyp` box: the AVIF format check panicked, which
   aborted the whole batch (release builds use `panic = "abort"`) before any report was written.
 - `rc update` and `install.sh` now require the published SHA-256 checksum and refuse to install without one (before,

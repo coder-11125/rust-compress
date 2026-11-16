@@ -215,6 +215,7 @@ fn encode_jpeg_pixels(img: &Image, cli: &Cli, quality: u8, arithmetic: bool) -> 
 
 /// Apply the metadata policy to a freshly decoded image.
 fn apply_metadata_policy(meta: &mut Metadata, cli: &Cli) {
+    meta.drop_invalid_icc();
     if !cli.keep_metadata {
         meta.drop_descriptive();
     }
@@ -524,7 +525,43 @@ fn encode(img: &Image, fmt: Format, cli: &Cli) -> Result<Encoded> {
     }
 }
 
-fn write_atomic(path: &Path, data: &[u8]) -> Result<()> {
+/// An in-place input as it was when it was read. If the file differs by the time the result is ready, somebody has
+/// written to it meanwhile and replacing it would silently throw their edit away.
+struct Snapshot {
+    len: u64,
+    modified: Option<std::time::SystemTime>,
+}
+
+impl Snapshot {
+    fn of(m: &fs::Metadata) -> Self {
+        Snapshot { len: m.len(), modified: m.modified().ok() }
+    }
+
+    fn unchanged(&self, path: &Path) -> bool {
+        fs::metadata(path).is_ok_and(|m| m.len() == self.len && m.modified().ok() == self.modified)
+    }
+}
+
+/// Where `--in-place` writes for `input`, and what the file looks like now. A symlink is followed, so the link keeps
+/// pointing at the updated file (replacing the link itself would leave its target unoptimized). A file with several
+/// hard links is refused: replacing it atomically would split the links, and rewriting it in place is not atomic.
+fn in_place_target(input: &Path) -> std::io::Result<(std::path::PathBuf, Snapshot)> {
+    let real = fs::canonicalize(input)?;
+    let meta = fs::metadata(&real)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if meta.nlink() > 1 {
+            return Err(std::io::Error::other(format!(
+                "has {} hard links, which --in-place would split; write a copy with -o instead",
+                meta.nlink()
+            )));
+        }
+    }
+    Ok((real, Snapshot::of(&meta)))
+}
+
+fn write_atomic(path: &Path, data: &[u8], guard: Option<&Snapshot>) -> Result<()> {
     if let Some(parent) = path.parent()
         && !parent.as_os_str().is_empty()
     {
@@ -536,6 +573,9 @@ fn write_atomic(path: &Path, data: &[u8]) -> Result<()> {
         let mut f = fs::File::create(&tmp)?;
         f.write_all(data)?;
         f.sync_all().ok();
+        if guard.is_some_and(|g| !g.unchanged(path)) {
+            return Err(std::io::Error::other("the file changed while it was being processed; left as it is now"));
+        }
         fs::rename(&tmp, path)
     })();
     if result.is_err() {
@@ -544,12 +584,14 @@ fn write_atomic(path: &Path, data: &[u8]) -> Result<()> {
     result.map_err(Error::from)
 }
 
-fn write_output_preserving(path: &Path, data: &[u8], preserve: bool) -> Result<()> {
-    if !preserve {
+/// Write an in-place result: like [`write_output`], but refuses if the file changed since `guard` was taken, and keeps
+/// the original's permissions and modification time.
+fn write_output_preserving(path: &Path, data: &[u8], guard: Option<&Snapshot>) -> Result<()> {
+    let Some(guard) = guard else {
         return write_output(path, data);
-    }
+    };
     let meta = std::fs::metadata(path).ok();
-    write_output(path, data)?;
+    write_atomic(path, data, Some(guard))?;
     if let Some(m) = meta {
         let _ = std::fs::set_permissions(path, m.permissions());
         if let (Ok(t), Ok(f)) = (m.modified(), std::fs::File::options().write(true).open(path)) {
@@ -567,10 +609,39 @@ fn write_output(path: &Path, data: &[u8]) -> Result<()> {
         out.flush()?;
         return Ok(());
     }
-    write_atomic(path, data)
+    write_atomic(path, data, None)
 }
 
-fn run(job: &Job, cli: &Cli, data: &[u8]) -> Result<(Status, u64, Option<String>)> {
+/// Keep a file as it is because re-encoding it would not help. The default is still to drop descriptive metadata, so
+/// EXIF, text chunks and comments are cut out of the original bytes (without touching the image data); that is a
+/// real, if small, saving and is reported as one. With `--keep-metadata`, or for a format this cannot cut, the
+/// original bytes are copied unchanged.
+fn keep_original(
+    job: &Job,
+    cli: &Cli,
+    data: &[u8],
+    format: Format,
+    note: Option<String>,
+    guard: Option<&Snapshot>,
+) -> Result<(Status, u64, Option<String>)> {
+    let stripped = if cli.keep_metadata { None } else { crate::strip::descriptive_metadata(data, format) };
+    if let Some(bytes) = stripped {
+        if !cli.dry_run {
+            write_output_preserving(&job.output, &bytes, guard)?;
+        }
+        let note = match note {
+            Some(n) => format!("{n}, descriptive metadata removed"),
+            None => "descriptive metadata removed".to_string(),
+        };
+        return Ok((Status::Compressed, bytes.len() as u64, Some(note)));
+    }
+    if !cli.in_place && !cli.dry_run {
+        write_output(&job.output, data)?;
+    }
+    Ok((Status::NoGain, data.len() as u64, note))
+}
+
+fn run(job: &Job, cli: &Cli, data: &[u8], guard: Option<&Snapshot>) -> Result<(Status, u64, Option<String>)> {
     let in_fmt = Format::sniff(data)
         .or_else(|| Format::from_extension(&job.input))
         .ok_or_else(|| Error::unsupported("unrecognized image format (supported: PNG, JPEG, WebP, AVIF, GIF)"))?;
@@ -607,10 +678,7 @@ fn run(job: &Job, cli: &Cli, data: &[u8]) -> Result<(Status, u64, Option<String>
         _ => None,
     };
     if let Some(note) = untouchable {
-        if !cli.in_place && !cli.dry_run {
-            write_output(&job.output, data)?;
-        }
-        return Ok((Status::NoGain, data.len() as u64, Some(note.into())));
+        return keep_original(job, cli, data, in_fmt, Some(note.into()), guard);
     }
     let animation = if matches!(out_fmt, Format::Avif | Format::Gif | Format::Webp | Format::Png) {
         decode_animation(data, in_fmt)?
@@ -622,11 +690,8 @@ fn run(job: &Job, cli: &Cli, data: &[u8]) -> Result<(Status, u64, Option<String>
             Some(encoded) => encoded,
             None => {
                 // A GIF whose frames do not fit one palette would need a lossy re-quantization.
-                if !cli.in_place && !cli.dry_run {
-                    write_output(&job.output, data)?;
-                }
                 let note = "GIF left unchanged (use --lossy to re-quantize)";
-                return Ok((Status::NoGain, data.len() as u64, Some(note.into())));
+                return keep_original(job, cli, data, in_fmt, Some(note.into()), guard);
             }
         }
     } else if in_fmt == Format::Jpeg && out_fmt == Format::Jpeg {
@@ -643,15 +708,14 @@ fn run(job: &Job, cli: &Cli, data: &[u8]) -> Result<(Status, u64, Option<String>
     let same_format = in_fmt == out_fmt;
     if same_format && !forced && encoded.len() >= data.len() {
         // Never make the file bigger. Keep the original bytes (copy them when writing elsewhere).
-        if !cli.in_place && !cli.dry_run {
-            write_output(&job.output, data)?;
-        }
-        return Ok((Status::NoGain, data.len() as u64, note));
+        return keep_original(job, cli, data, in_fmt, note, guard);
     }
     if !cli.dry_run {
-        write_output_preserving(&job.output, &encoded, cli.in_place)?;
+        write_output_preserving(&job.output, &encoded, guard)?;
     }
-    Ok((Status::Compressed, encoded.len() as u64, note))
+    // Only a format change or a resize gets here with a bigger result (see the never-grow check above).
+    let status = if encoded.len() > data.len() { Status::Larger } else { Status::Compressed };
+    Ok((status, encoded.len() as u64, note))
 }
 
 /// The frames of an animated input, `None` for a still (or a format without animation here).
@@ -730,7 +794,7 @@ fn animation_to(mut anim: Animation, in_fmt: Format, out_fmt: Format, cli: &Cli)
     Ok(Some(encoded.resized(resized)))
 }
 
-pub fn process(job: &Job, cli: &Cli) -> Report {
+pub fn process(job: &Job, cli: &Cli, budget: &crate::budget::Budget) -> Report {
     let mut report = Report {
         input: job.input.clone(),
         output: job.output.clone(),
@@ -739,6 +803,21 @@ pub fn process(job: &Job, cli: &Cli) -> Report {
         status: Status::NoGain,
         note: None,
     };
+    // `--in-place` works on the file a symlink points to, and remembers what it looked like before reading it.
+    let mut work = job.clone();
+    let mut guard = None;
+    if cli.in_place && !is_stdio(&job.input) {
+        match in_place_target(&job.input) {
+            Ok((real, snapshot)) => {
+                work.output = real;
+                guard = Some(snapshot);
+            }
+            Err(e) => {
+                report.status = Status::Failed(e.to_string());
+                return report;
+            }
+        }
+    }
     let read = if is_stdio(&job.input) {
         let mut buf = Vec::new();
         std::io::stdin().lock().read_to_end(&mut buf).map(|_| buf)
@@ -753,7 +832,9 @@ pub fn process(job: &Job, cli: &Cli) -> Report {
         }
     };
     report.in_size = data.len() as u64;
-    match run(job, cli, &data) {
+    // Wait here, before decoding, while other images hold too much memory.
+    let _reserved = budget.acquire(crate::budget::estimate_bytes(&data));
+    match run(&work, cli, &data, guard.as_ref()) {
         Ok((status, out_size, note)) => {
             report.note = note;
             report.status = status;
@@ -762,4 +843,30 @@ pub fn process(job: &Job, cli: &Cli) -> Report {
         Err(e) => report.status = Status::Failed(e.to_string()),
     }
     report
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_in_place_write_is_refused_when_the_file_changed_since_it_was_read() {
+        let d = tempfile::tempdir().unwrap();
+        let path = d.path().join("a.png");
+        fs::write(&path, b"the contents rc read").unwrap();
+        let snapshot = Snapshot::of(&fs::metadata(&path).unwrap());
+
+        // The user saves new content while the image is being compressed.
+        fs::write(&path, b"newer, longer contents saved meanwhile").unwrap();
+        let err = write_output_preserving(&path, b"rc result", Some(&snapshot)).unwrap_err();
+        assert!(err.to_string().contains("changed while it was being processed"), "{err}");
+        assert_eq!(fs::read(&path).unwrap(), b"newer, longer contents saved meanwhile");
+        let leftovers: Vec<_> = fs::read_dir(d.path()).unwrap().map(|e| e.unwrap().file_name()).collect();
+        assert_eq!(leftovers.len(), 1, "no temporary file may stay behind: {leftovers:?}");
+
+        // An untouched file is replaced as before.
+        let snapshot = Snapshot::of(&fs::metadata(&path).unwrap());
+        write_output_preserving(&path, b"rc result", Some(&snapshot)).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"rc result");
+    }
 }

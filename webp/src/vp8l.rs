@@ -535,7 +535,7 @@ pub fn decode(data: &[u8]) -> Result<Decoded> {
     if r.take(3) != 0 {
         return Err(Error::unsupported("VP8L version"));
     }
-    if (width as u64) * (height as u64) > rc_core::image::MAX_PIXELS {
+    if (width as u64) * (height as u64) > rc_core::image::max_pixels() {
         return Err(Error::invalid("unreasonable image dimensions"));
     }
     let argb = decode_body(&mut r, width, height)?;
@@ -545,7 +545,7 @@ pub fn decode(data: &[u8]) -> Result<Decoded> {
 /// Decode a bare VP8L image stream (transforms plus pixels, no signature or size header) of a
 /// known size, as used for the alpha plane of lossy WebP files.
 pub fn decode_headerless(data: &[u8], width: usize, height: usize) -> Result<Vec<u32>> {
-    if width == 0 || height == 0 || (width as u64) * (height as u64) > rc_core::image::MAX_PIXELS {
+    if width == 0 || height == 0 || (width as u64) * (height as u64) > rc_core::image::max_pixels() {
         return Err(Error::invalid("unreasonable image dimensions"));
     }
     let mut r = LsbReader::new(data);

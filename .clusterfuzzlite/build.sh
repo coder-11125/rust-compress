@@ -1,5 +1,5 @@
 #!/bin/bash -eu
-# Same targets and seed corpora as oss-fuzz/build.sh, built from the checked-out source.
+# Builds every fuzz target and its seed corpus from the checked-out source.
 cd "$SRC/rust-compress"
 cargo fuzz build -O --fuzz-dir fuzz
 
