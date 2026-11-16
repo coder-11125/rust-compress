@@ -44,6 +44,7 @@ fn update(args: &UpdateArgs) -> Result<(), String> {
     // Overridable for mirrors and for the tests; releases live at `<base>/releases/...`.
     let base = std::env::var("RC_UPDATE_BASE_URL").unwrap_or_else(|_| DEFAULT_REPO_URL.to_string());
     let base = base.trim_end_matches('/');
+    check_base_url(base)?;
     let target = target_triple()?;
 
     let tag = match &args.to {
@@ -115,20 +116,22 @@ fn update(args: &UpdateArgs) -> Result<(), String> {
     println!("Downloading {asset} ...");
     curl_download(&url, &archive).map_err(|e| format!("download failed ({url}): {e}"))?;
 
+    // The checksum is mandatory: without it a missing or stripped `.sha256` file would silently turn into an
+    // unverified install, and the new binary is executed (`--version`) before it replaces the old one.
     let sum_file = work.path.join(format!("{asset}.sha256"));
-    match curl_download(&format!("{url}.sha256"), &sum_file) {
-        Ok(()) => {
-            let text = fs::read_to_string(&sum_file).map_err(|e| e.to_string())?;
-            let expected = text.split_whitespace().next().unwrap_or("").to_ascii_lowercase();
-            let data = fs::read(&archive).map_err(|e| e.to_string())?;
-            let actual = hex(&sha256(&data));
-            if expected != actual {
-                return Err(format!("checksum mismatch for {asset}: expected {expected}, got {actual}"));
-            }
-            println!("Checksum verified.");
-        }
-        Err(_) => eprintln!("warning: no checksum published for {asset}; skipping verification"),
+    curl_download(&format!("{url}.sha256"), &sum_file)
+        .map_err(|e| format!("no checksum available for {asset}, refusing to install an unverified binary ({e})"))?;
+    let text = fs::read_to_string(&sum_file).map_err(|e| e.to_string())?;
+    let expected = text.split_whitespace().next().unwrap_or("").to_ascii_lowercase();
+    if expected.len() != 64 || !expected.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(format!("the checksum file for {asset} does not contain a SHA-256 digest"));
     }
+    let data = fs::read(&archive).map_err(|e| e.to_string())?;
+    let actual = hex(&sha256(&data));
+    if expected != actual {
+        return Err(format!("checksum mismatch for {asset}: expected {expected}, got {actual}"));
+    }
+    println!("Checksum verified.");
 
     let unpack = work.path.join("unpacked");
     fs::create_dir(&unpack).map_err(|e| e.to_string())?;
@@ -253,10 +256,40 @@ fn latest_tag(base: &str) -> Result<String, String> {
 fn curl_download(url: &str, dest: &Path) -> Result<(), String> {
     run_tool(
         Command::new(tool("curl"))
-            .args(["-fsSL", "--retry", "3", "--retry-delay", "2", "--connect-timeout", "20", "--max-time", "600", "-o"])
+            .args(["-fsSL", "--retry", "3", "--retry-delay", "2", "--connect-timeout", "20", "--max-time", "600"])
+            .args(proto_args(url))
+            .arg("-o")
             .arg(dest)
             .arg(url),
     )
+}
+
+/// An `https` URL may not be redirected back to plain `http`; a loopback `http` URL (tests, local mirrors) is left alone.
+fn proto_args(url: &str) -> &'static [&'static str] {
+    if url.starts_with("https://") { &["--proto", "=https", "--proto-redir", "=https"] } else { &[] }
+}
+
+/// Updates replace the running executable, so the release location must be `https`; plain `http` is accepted only for
+/// a loopback host (the test server, a mirror on the same machine).
+fn check_base_url(base: &str) -> Result<(), String> {
+    if base.starts_with("https://") {
+        return Ok(());
+    }
+    let host = base
+        .strip_prefix("http://")
+        .map(|rest| rest.split(['/', '?', '#']).next().unwrap_or(""))
+        .map(|authority| authority.rsplit('@').next().unwrap_or(""))
+        .map(|hp| {
+            if let Some(v6) = hp.strip_prefix('[') {
+                v6.split(']').next().unwrap_or("")
+            } else {
+                hp.split(':').next().unwrap_or("")
+            }
+        });
+    match host {
+        Some("127.0.0.1" | "localhost" | "::1") => Ok(()),
+        _ => Err(format!("RC_UPDATE_BASE_URL must be an https:// URL (or http:// on localhost), got {base:?}")),
+    }
 }
 
 /// The system's own `curl`/`tar` on Windows, where a `PATH` entry such as Git's can supply a `tar` that cannot read the

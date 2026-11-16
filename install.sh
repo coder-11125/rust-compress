@@ -73,16 +73,14 @@ tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT HUP INT TERM
 
 info "Downloading $asset ..."
-curl -fsSL --retry 3 --retry-delay 2 --connect-timeout 20 "$download" -o "$tmp/$asset" ||
+curl -fsSL --proto '=https' --retry 3 --retry-delay 2 --connect-timeout 20 "$download" -o "$tmp/$asset" ||
     err "download failed: $download"
 
-if curl -fsSL --retry 3 --retry-delay 2 --connect-timeout 20 "$download.sha256" -o "$tmp/$asset.sha256" 2>/dev/null; then
-    expected=$(cut -d ' ' -f 1 "$tmp/$asset.sha256")
-    actual=$(sha256 "$tmp/$asset")
-    [ "$expected" = "$actual" ] || err "checksum mismatch for $asset"
-else
-    info "warning: no checksum published for $asset; skipping verification"
-fi
+curl -fsSL --proto '=https' --retry 3 --retry-delay 2 --connect-timeout 20 "$download.sha256" -o "$tmp/$asset.sha256" 2>/dev/null ||
+    err "no checksum published for $asset; refusing to install an unverified binary"
+expected=$(cut -d ' ' -f 1 "$tmp/$asset.sha256")
+actual=$(sha256 "$tmp/$asset")
+[ "$expected" = "$actual" ] || err "checksum mismatch for $asset"
 
 mkdir -p "$dir" || err "could not create $dir"
 tar -xzf "$tmp/$asset" -C "$tmp"

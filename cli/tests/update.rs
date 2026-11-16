@@ -28,7 +28,12 @@ fn serve(tag: &str, archive: Vec<u8>, checksum: String) -> String {
             } else if path == format!("/releases/tag/{tag}") {
                 ("200 OK", String::new(), Vec::new())
             } else if path.starts_with(&format!("/releases/download/{tag}/")) && path.ends_with(".sha256") {
-                ("200 OK", String::new(), checksum.clone().into_bytes())
+                // An empty checksum plays a release that published none.
+                if checksum.is_empty() {
+                    ("404 Not Found", String::new(), Vec::new())
+                } else {
+                    ("200 OK", String::new(), checksum.clone().into_bytes())
+                }
             } else if path.starts_with(&format!("/releases/download/{tag}/")) {
                 ("200 OK", String::new(), archive.clone())
             } else {
@@ -170,6 +175,61 @@ fn a_bad_checksum_keeps_the_installed_binary() {
     assert!(text(&out.stderr).contains("checksum mismatch"), "{}", text(&out.stderr));
     assert_eq!(fs::read(&rc).unwrap(), before);
     assert!(leftovers(&bin_dir).is_empty());
+}
+
+#[cfg(unix)]
+#[test]
+fn a_missing_checksum_refuses_to_install() {
+    let d = tempdir().unwrap();
+    // The script would leave a marker if it were ever run.
+    let marker = d.path().join("ran");
+    let script = format!("#!/bin/sh\ntouch {}\necho \"rc 9.9.9\"\n", marker.display());
+    let (archive, _) = archive_of_script(d.path(), &script);
+    let base = serve("v9.9.9", archive, String::new());
+    let bin_dir = d.path().join("bin");
+    fs::create_dir(&bin_dir).unwrap();
+    let rc = installed_copy(&bin_dir);
+    let before = fs::read(&rc).unwrap();
+
+    let out = run_update(&rc, &base, &[]);
+    assert!(!out.status.success());
+    assert!(text(&out.stderr).contains("unverified binary"), "{}", text(&out.stderr));
+    assert_eq!(fs::read(&rc).unwrap(), before);
+    assert!(!marker.exists(), "the unverified binary must never be executed");
+    assert!(leftovers(&bin_dir).is_empty());
+}
+
+#[cfg(unix)]
+#[test]
+fn a_garbage_checksum_file_is_rejected() {
+    let d = tempdir().unwrap();
+    let (archive, _) = release_archive(d.path(), "9.9.9");
+    let base = serve("v9.9.9", archive, "<html>not found</html>\n".into());
+    let bin_dir = d.path().join("bin");
+    fs::create_dir(&bin_dir).unwrap();
+    let rc = installed_copy(&bin_dir);
+    let before = fs::read(&rc).unwrap();
+
+    let out = run_update(&rc, &base, &[]);
+    assert!(!out.status.success());
+    assert!(text(&out.stderr).contains("SHA-256 digest"), "{}", text(&out.stderr));
+    assert_eq!(fs::read(&rc).unwrap(), before);
+}
+
+#[test]
+fn a_plain_http_remote_base_url_is_refused() {
+    let d = tempdir().unwrap();
+    let rc = installed_copy(d.path());
+    for base in [
+        "http://example.com/x",
+        "http://127.0.0.1.evil.example/x",
+        "http://user@evil.example:80/x",
+        "ftp://127.0.0.1/x",
+    ] {
+        let out = run_update(&rc, base, &[]);
+        assert!(!out.status.success(), "{base}");
+        assert!(text(&out.stderr).contains("must be an https://"), "{base}: {}", text(&out.stderr));
+    }
 }
 
 #[cfg(unix)]

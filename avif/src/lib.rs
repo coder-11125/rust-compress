@@ -15,7 +15,9 @@ use rc_core::image::{ColorType, Image};
 /// True if `data` looks like an AVIF/HEIF file (`ftyp` with an AVIF brand).
 pub fn is_avif(data: &[u8]) -> bool {
     data.len() >= 12 && &data[4..8] == b"ftyp" && {
-        let size = (u32::from_be_bytes(data[0..4].try_into().unwrap()) as usize).clamp(16, data.len());
+        // The box size is trusted only within 16..=len; a file shorter than 16 bytes just uses all of it
+        // (`clamp(16, len)` panics when len < 16).
+        let size = (u32::from_be_bytes(data[0..4].try_into().unwrap()) as usize).clamp(16.min(data.len()), data.len());
         data[8..size].chunks(4).any(|b| b == b"avif" || b == b"avis")
     }
 }
@@ -270,4 +272,31 @@ fn add_alpha(img: Image, alpha: &Frame, full_range: bool, premultiplied: bool) -
         }
     }
     Ok(Image { color: new_color, data: out, ..img })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_avif;
+
+    /// `is_avif` runs on every input of every format, so it must accept any bytes (it once panicked on files of 12 to
+    /// 15 bytes that start with a `ftyp` box).
+    #[test]
+    fn sniffing_never_panics_on_short_or_odd_inputs() {
+        for len in 0..=40usize {
+            for size in [0u32, 1, 8, 12, 15, 16, 17, 20, 24, u32::MAX] {
+                let mut d = vec![0u8; len];
+                for (i, b) in d.iter_mut().enumerate() {
+                    *b = b"\0\0\0\0ftypavifavis"[i % 16];
+                }
+                if len >= 4 {
+                    d[..4].copy_from_slice(&size.to_be_bytes());
+                }
+                let _ = is_avif(&d);
+            }
+        }
+        // A 12-byte file whose only brand is `avif` is accepted, not a panic.
+        assert!(is_avif(b"\0\0\0\x0cftypavif"));
+        assert!(is_avif(b"\0\0\0\x14ftypavif\0\0\0\0avif"));
+        assert!(!is_avif(b"\0\0\0\x14ftypheic\0\0\0\0mif1"));
+    }
 }

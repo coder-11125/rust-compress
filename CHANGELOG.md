@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+- Fixed a crash on any 12 to 15 byte input that starts with an `ftyp` box: the AVIF format check panicked, which
+  aborted the whole batch (release builds use `panic = "abort"`) before any report was written.
+- `rc update` and `install.sh` now require the published SHA-256 checksum and refuse to install without one (before,
+  a missing `.sha256` only printed a warning and the unverified binary was installed and run). The checksum file must
+  hold a real digest, `RC_UPDATE_BASE_URL` must be `https://` (plain `http://` is accepted only for localhost), and
+  downloads cannot be redirected from `https` back to `http`.
+
 ## 0.3.0 - 15-11-2026
 
 - AVIF encoder: palette mode now also runs in inter frames (its trial is skipped only for lossless, which the AV1
