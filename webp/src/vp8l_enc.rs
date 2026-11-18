@@ -54,7 +54,8 @@ fn subtract_green(px: &mut [u32]) {
 }
 
 /// Residuals of the best per-tile predictor, and the image of chosen modes (mode in green, opaque).
-fn predictor_transform(src: &[u32], w: usize, h: usize, bits: u32) -> (Vec<u32>, Vec<u32>) {
+/// The modes are chosen from every `sample`-th pixel of each row and column of a tile.
+fn predictor_transform(src: &[u32], w: usize, h: usize, bits: u32, sample: usize) -> (Vec<u32>, Vec<u32>) {
     let (tw, th) = (div_round_up(w, bits), div_round_up(h, bits));
     let tile = 1usize << bits;
     let modes: Vec<u32> = (0..th)
@@ -66,8 +67,8 @@ fn predictor_transform(src: &[u32], w: usize, h: usize, bits: u32) -> (Vec<u32>,
                 let mut best = (u64::MAX, 0u32);
                 for mode in 0..14u32 {
                     let mut cost = 0u64;
-                    for y in y0.max(1)..y1 {
-                        for x in x0.max(1)..x1 {
+                    for y in (y0.max(1)..y1).step_by(sample) {
+                        for x in (x0.max(1)..x1).step_by(sample) {
                             let i = y * w + x;
                             let pred = predict(mode, src[i - 1], src[i - w], src[i - w + 1], src[i - w - 1]);
                             cost += abs_residual(sub_pixels(src[i], pred)) as u64;
@@ -135,7 +136,9 @@ fn best_coefficient(candidates: impl Iterator<Item = i32>, mut cost: impl FnMut(
 
 /// Per-tile decorrelation of red and blue from green (and blue from red). Returns the corrected
 /// pixels and the coefficient image (red = red_to_blue, green = green_to_blue, blue = green_to_red).
-fn cross_color_transform(src: &[u32], w: usize, h: usize, bits: u32) -> (Vec<u32>, Vec<u32>) {
+/// With `sample` above 1 the coefficients are fitted on every `sample`-th pixel of each row and
+/// column of a tile, over a sweep that is `sample` times coarser.
+fn cross_color_transform(src: &[u32], w: usize, h: usize, bits: u32, sample: usize) -> (Vec<u32>, Vec<u32>) {
     let (tw, th) = (div_round_up(w, bits), div_round_up(h, bits));
     let tile = 1usize << bits;
     let coefs: Vec<(i8, i8, i8)> = (0..th)
@@ -144,13 +147,15 @@ fn cross_color_transform(src: &[u32], w: usize, h: usize, bits: u32) -> (Vec<u32
             (0..tw).map(move |tx| {
                 let (x0, y0) = (tx * tile, ty * tile);
                 let (x1, y1) = ((x0 + tile).min(w), (y0 + tile).min(h));
-                let px = || (y0..y1).flat_map(move |y| (x0..x1).map(move |x| src[y * w + x]));
+                let px = || {
+                    (y0..y1).step_by(sample).flat_map(move |y| (x0..x1).step_by(sample).map(move |x| src[y * w + x]))
+                };
                 let hist_of = |f: &dyn Fn(u32) -> u8| {
                     let mut hist = [0u32; 256];
                     px().for_each(|p| hist[f(p) as usize] += 1);
                     entropy256(&hist)
                 };
-                let sweep = || (-64..=64).step_by(8);
+                let sweep = || (-64..=64).step_by(8 * sample);
                 let g2r = best_coefficient(sweep(), |t| {
                     hist_of(&|p| ((p >> 16) as i32 - color_delta(t, (p >> 8) as i8)) as u8)
                 });
@@ -818,7 +823,7 @@ struct GroupPlan {
 
 /// Cluster the image's tiles by their symbol statistics; `None` when one group is as good.
 fn plan_groups(toks: &[Tok], xsize: usize, ysize: usize, cache_size: usize, level: u32) -> Option<GroupPlan> {
-    if level < 3 || xsize * ysize < 4096 {
+    if level < 2 || xsize * ysize < 4096 {
         return None;
     }
     // Tiles of 2^bits pixels a side, as large as needed to keep their number manageable.
@@ -861,7 +866,8 @@ fn plan_groups(toks: &[Tok], xsize: usize, ysize: usize, cache_size: usize, leve
         .collect();
     drop(counts);
     let (max_groups, passes) = match level {
-        0..=4 => (24, 1),
+        0..=3 => (24, 1),
+        4 => (48, 2),
         5..=7 => (96, 2),
         _ => (256, 3),
     };
@@ -945,9 +951,14 @@ fn write_image(w: &mut LsbWriter, toks: &[Tok], cache_bits: u32, main: bool, xsi
 fn encode_image(w: &mut LsbWriter, px: &[u32], xsize: usize, level: u32, main: bool) {
     let plane = plane_table();
     let ysize = px.len() / xsize.max(1);
+    // The main image of the fast levels (0-4) takes the cheapest parse: on the images they are tuned
+    // for, a deeper search gains nothing that clustering does not.
+    let fast = main && level <= 4;
     let (depth, lazy) = match level {
         0..=1 => (2, false),
+        2..=3 if fast => (2, false),
         2..=3 => (8, false),
+        4 if fast => (2, false),
         4..=5 => (24, true),
         6..=7 => (64, true),
         _ => (192, true),
@@ -1048,6 +1059,8 @@ struct Direct {
     cross: bool,
     /// Predictor tile size (log2); 0 = pick by image size.
     pred_bits: u32,
+    /// Pixel stride when fitting predictor modes and cross-colour coefficients (1 = every pixel).
+    sample: usize,
 }
 
 fn prepare_direct(argb: &[u32], width: usize, height: usize, d: Direct) -> Prepared {
@@ -1059,13 +1072,13 @@ fn prepare_direct(argb: &[u32], width: usize, height: usize, d: Direct) -> Prepa
     }
     if d.predictor {
         let bits = if d.pred_bits > 0 { d.pred_bits } else { predictor_bits(width, height) };
-        let (res, modes) = predictor_transform(&px, width, height, bits);
+        let (res, modes) = predictor_transform(&px, width, height, bits, d.sample);
         transforms.push(Transform::Predictor { bits, modes, xsize: div_round_up(width, bits) });
         px = res;
     }
     if d.cross {
         let bits = 5;
-        let (fixed, data) = cross_color_transform(&px, width, height, bits);
+        let (fixed, data) = cross_color_transform(&px, width, height, bits, d.sample);
         transforms.push(Transform::CrossColor { bits, data, xsize: div_round_up(width, bits) });
         px = fixed;
     }
@@ -1087,9 +1100,9 @@ fn prepare_palette(argb: &[u32], width: usize, height: usize, palette: &[u32]) -
 
 /// Quick size estimate in bits: greedy parse and entropy, with and without a small colour cache,
 /// but no grouping.
-fn quick_cost(px: &[u32], xsize: usize) -> u64 {
+fn quick_cost(px: &[u32], xsize: usize, cheap: bool) -> u64 {
     let plane = plane_table();
-    let steps = parse(px, xsize, 8, false);
+    let steps = parse(px, xsize, if cheap { 2 } else { 8 }, false);
     [0u32, 6]
         .iter()
         .map(|&bits| {
@@ -1103,18 +1116,18 @@ fn quick_cost(px: &[u32], xsize: usize) -> u64 {
 }
 
 impl Prepared {
-    fn estimate(&self) -> u64 {
+    fn estimate(&self, cheap: bool) -> u64 {
         let side: u64 = self
             .transforms
             .iter()
             .map(|t| match t {
-                Transform::Predictor { modes, xsize, .. } => quick_cost(modes, *xsize),
-                Transform::CrossColor { data, xsize, .. } => quick_cost(data, *xsize),
-                Transform::Palette { deltas } => quick_cost(deltas, deltas.len()) + 8,
+                Transform::Predictor { modes, xsize, .. } => quick_cost(modes, *xsize, cheap),
+                Transform::CrossColor { data, xsize, .. } => quick_cost(data, *xsize, cheap),
+                Transform::Palette { deltas } => quick_cost(deltas, deltas.len(), cheap) + 8,
                 Transform::SubtractGreen => 0,
             })
             .sum();
-        side + quick_cost(&self.pixels, self.xsize)
+        side + quick_cost(&self.pixels, self.xsize, cheap)
     }
 
     fn write(&self, width: usize, height: usize, alpha: bool, level: u32) -> Vec<u8> {
@@ -1156,7 +1169,7 @@ pub fn encode(argb: &[u32], width: usize, height: usize, has_alpha: bool, opts: 
         px.iter_mut().filter(|p| **p >> 24 == 0).for_each(|p| *p = 0);
     }
     let level = opts.level.min(9);
-    let direct = |sg, predictor, cross, pred_bits| Direct { sg, predictor, cross, pred_bits };
+    let direct = |sg, predictor, cross, pred_bits| Direct { sg, predictor, cross, pred_bits, sample: 1 };
     let mut candidates: Vec<Prepared> = Vec::new();
     if let Some(palette) = small_palette(&px) {
         candidates.push(prepare_palette(&px, width, height, &palette));
@@ -1164,8 +1177,16 @@ pub fn encode(argb: &[u32], width: usize, height: usize, has_alpha: bool, opts: 
         if level >= 6 && palette.len() > 16 {
             candidates.push(prepare_direct(&px, width, height, direct(true, true, true, 0)));
         }
+    } else if level <= 4 {
+        // Fast levels: the photographic pipeline, fitted on fewer pixels the lower the level, and
+        // from level 3 the unpredicted one for graphics.
+        let sample = if level == 0 { 4 } else { 2 };
+        candidates.push(prepare_direct(&px, width, height, Direct { sample, ..direct(false, true, true, 0) }));
+        if level >= 3 {
+            candidates.push(prepare_direct(&px, width, height, direct(true, false, false, 0)));
+        }
     } else {
-        candidates.push(prepare_direct(&px, width, height, direct(true, true, level >= 4, 0)));
+        candidates.push(prepare_direct(&px, width, height, direct(true, true, true, 0)));
         if level >= 3 {
             // Graphics often do best with no prediction at all.
             candidates.push(prepare_direct(&px, width, height, direct(true, false, false, 0)));
@@ -1186,7 +1207,10 @@ pub fn encode(argb: &[u32], width: usize, height: usize, has_alpha: bool, opts: 
         6..=8 => 2,
         _ => 3,
     };
-    let mut ranked: Vec<(u64, Prepared)> = candidates.into_iter().map(|c| (c.estimate(), c)).collect();
+    if candidates.len() == 1 {
+        return candidates.remove(0).write(width, height, has_alpha, level);
+    }
+    let mut ranked: Vec<(u64, Prepared)> = candidates.into_iter().map(|c| (c.estimate(level <= 4), c)).collect();
     ranked.sort_by_key(|r| r.0);
     ranked
         .into_iter()
