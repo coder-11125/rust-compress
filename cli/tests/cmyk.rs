@@ -93,7 +93,8 @@ fn cmyk_and_ycck_are_requantized_to_the_requested_quality() {
             if name.starts_with("ycck") {
                 assert_eq!(tq[0], tq[3], "{name}: Y and K");
                 assert_eq!(tq[1], tq[2], "{name}: Cb and Cr");
-                assert_ne!(tq[0], tq[1], "{name}: luma vs chroma");
+                // Luma and chroma are quantized with the same perceptual table (like mozjpeg's default), so they
+                // share one slot; the roles above are what must hold.
             } else {
                 assert!(tq.iter().all(|&t| t == tq[0]), "{name}: CMYK channels differ: {tq:?}");
             }

@@ -6,11 +6,18 @@
 //! zero; zeroing is expressed by skipping a position. Dynamic programming over the candidate
 //! positions finds the best run-length structure, including where to place the end-of-block.
 
+/// Exponent of the per-frequency distortion weight `(median step / step)^gamma`: errors in coefficients
+/// with fine quantization steps (low frequencies) count more, which tracks what SSIMULACRA2 penalizes.
+/// 0 would be plain MSE. Tuned with tools/bench_jpeg.py (0 costs 3-4% more at equal quality, -0.5 about 8%).
+const FREQ_WEIGHT_GAMMA: f32 = 1.0;
+
 /// Parameters for one component class (luma or chroma).
 pub struct Rdo {
     /// Quantization step per zigzag position.
     q: [f32; 64],
     lambda: f32,
+    /// Distortion weight per zigzag position.
+    w: [f32; 64],
     /// Estimated code length in bits of each AC symbol (`run << 4 | size`).
     len: [f32; 256],
 }
@@ -30,7 +37,11 @@ impl Rdo {
         for (l, &s) in len.iter_mut().zip(sizes) {
             *l = if s == 0 { 18.0 } else { s as f32 };
         }
-        Rdo { q, lambda: kappa * median * median, len }
+        let mut w = [1f32; 64];
+        for k in 1..64 {
+            w[k] = (median / q[k]).powf(FREQ_WEIGHT_GAMMA);
+        }
+        Rdo { q, lambda: kappa * median * median, len, w }
     }
 
     #[inline]
@@ -54,7 +65,7 @@ impl Rdo {
         let mut zd = [0f32; 64];
         for k in 1..64 {
             let e = a[k] * self.q[k];
-            zd[k] = zd[k - 1] + e * e;
+            zd[k] = zd[k - 1] + e * e * self.w[k];
         }
         let mut nodes: Vec<Node> = Vec::with_capacity(48);
         for i in 1..64 {
@@ -66,7 +77,7 @@ impl Rdo {
             let lo = if v0 > 1 { v0 - 1 } else { v0 };
             for v in lo..=v0 {
                 let e = (m - v as f32) * self.q[i];
-                let dnz = e * e;
+                let dnz = e * e * self.w[i];
                 // Predecessor = start of block (everything before i zeroed) ...
                 let mut best = zd[i - 1] + self.lambda * self.rate(i - 1, v) + dnz;
                 let mut prev = START;

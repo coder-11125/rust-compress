@@ -37,7 +37,9 @@ impl Default for EncodeOptions {
 }
 
 /// Lambda scale for trellis quantization (relative to the squared median quantizer step).
-pub const TRELLIS_KAPPA: f32 = 0.015;
+/// Tuned together with the frequency weighting in `rdo.rs`: 0.008-0.02 all land within 1% of each other, 0.03
+/// and above lose 8-10% at equal SSIMULACRA2 against mozjpeg because it zeroes detail the metric notices.
+pub const TRELLIS_KAPPA: f32 = 0.02;
 
 /// `ZZ_T[k]`: index into the transposed (`[u][v]`) DCT output for zigzag position k.
 const ZZ_T: [usize; 64] = {

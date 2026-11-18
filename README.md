@@ -2,6 +2,37 @@
 
 A fast command-line image compressor for **PNG**, **JPEG**, **WebP**, **AVIF** and **GIF**. The compression engine is written from scratch in Rust — DEFLATE, PNG, JPEG, GIF, WebP (lossless and lossy) and AVIF (AV1) codecs, Huffman coding, DCT, color quantization — with no codec crates. Only [`clap`](https://crates.io/crates/clap) (argument parsing) and [`rayon`](https://crates.io/crates/rayon) (parallelism) are dependencies.
 
+## Why rc (TL;DR)
+
+**One binary, five image formats, no codec libraries.** Every codec (DEFLATE, PNG, JPEG, GIF, WebP, AV1/AVIF) is written from scratch in Rust, so there is nothing to install besides `rc` itself: no libjpeg, libpng, libwebp or libaom, no C compiler to build it, and nothing to patch when a C library has a security bug. It beats or matches the established single-purpose tools where it matters most, and is honest about where it still trails.
+
+**What you get**
+
+- **A top-tier PNG optimizer.** Lossless PNG with a Zopfli-style optimal parser, a binary-tree match finder and brute-force per-row filter search: smaller than `oxipng -o2` on 11 of 14 files and within about 2% of `oxipng -o max -Z`/zopflipng at a twentieth of their time; 6-9% smaller than optipng, advpng and pngcrush. Invisible pixels under transparency are rewritten for size (580 KB → 4 KB on a noisy-under-alpha test image where tools that keep the hidden RGB stay huge).
+- **JPEG at parity with mozjpeg, perceptually.** Tuned against SSIMULACRA2, not just PSNR: on average 0.8-1.2% *smaller* than mozjpeg at equal perceptual quality (see the numbers below). Existing JPEGs are processed in the DCT domain, so most are never decoded to pixels, and a source already at or below the target quality is transcoded losslessly (same pixels, better entropy coding; +0.4% vs mozjpeg's `jpegtran`).
+- **Formats and corners others skip.** Arithmetic-coded JPEG (about 15% smaller than the original on photographs, though browsers cannot open it, so it is opt-in), 12-bit, lossless and hierarchical JPEG, CMYK/YCCK, 16-bit PNG, APNG, animated GIF/WebP/AVIF in any direction, and an AV1 decoder bit-exact with dav1d.
+- **Aims at a quality, not a number.** `--target-ssim`, `--target-psnr`, `--target-ms-ssim` and `--target-size` search for the cheapest setting that meets your goal, per image.
+- **Safe by construction.** The output is never larger than the input when the format is kept, files are written atomically, existing outputs are not overwritten without `--force`, metadata is handled deliberately (ICC kept, EXIF/XMP opt-in), and every decoder and encoder path is mutation-tested with truncated, bit-flipped and corrupt input on every test run (more than 440 tests; deterministic mutation testing, not coverage-guided fuzzing).
+- **Built for batches and pipelines.** Parallel over all cores, directory trees with include/exclude globs and name templates, `--in-place`, `--dry-run`, JSON reports, stdin/stdout pipes, memory limits, and `rc update` with checksum verification.
+
+**Benchmark at a glance** (details, caveats and the methodology in [Head-to-head](#head-to-head-with-established-tools))
+
+| Area | Against | Result |
+|---|---|---|
+| Lossless PNG, `-l 9` | `oxipng -o2` / `-o4` | **−1.2% / −0.6%** total size; smaller on 11 of 14 files |
+| Lossless PNG, default | `oxipng -o2` | Same size, 1.8× its CPU |
+| Lossless PNG, `-l 9` | zopflipng, `oxipng -o max -Z` | Within ~2%, **~20× faster** |
+| Lossy PNG (`--lossy`) | pngquant | **4% smaller** at similar quality (pngquant + oxipng is 6% smaller still) |
+| Lossy JPEG | mozjpeg 4.0.3, equal SSIMULACRA2 | **−0.8% to −1.2%** mean at scores 55-85 (worst file +3.5%, on a 10-image corpus) |
+| Lossless JPEG | mozjpeg `jpegtran` | +0.4% (beats libjpeg-turbo's `jpegtran` and jpegoptim) |
+| WebP lossless | `cwebp -lossless` | +2% at ~10× the CPU |
+| WebP lossy | `cwebp -m 6` | +6-12% at ~3× the CPU |
+| AVIF | libaom speed 6 / speed 4 | +3-4% / +9-12%, ~30× slower than speed 6 |
+| GIF kept as GIF | gifsicle | −0.9% vs −4.5%; `--lossy` −5% vs `--lossy=80` −32% |
+| GIF → WebP | gif2webp | Lossless −23% vs +10% (better); lossy ~4% larger |
+
+**Where it is weaker, plainly:** lossy WebP, AVIF and GIF `--lossy` are behind the dedicated encoders, and the AVIF encoder is far slower than libaom's fast presets. The PNG, WebP, AVIF and GIF rows come from the project's benchmark run and were not re-run when the JPEG encoder was retuned; the JPEG row was re-measured with `tools/bench_jpeg.py` on a small corpus of smooth desktop images, so re-run it on your own photos (it takes any folder via `--src`).
+
 ## Install
 
 ```
@@ -44,8 +75,9 @@ cat in.png | rc - > out.png  # stdin to stdout
 ## What it does
 
 **JPEG** — works in the DCT domain, so most files are never decoded to pixels:
-- Sources at or below the target quality (`-q`, default 80) are *transcoded losslessly*: same pixels, better entropy coding. The progressive scan layout is searched (72 candidate layouts, costed from symbol statistics) and compared against baseline; the smallest wins.
+- Sources at or below the target quality (`-q`, default 80) are *transcoded losslessly*: same pixels, better entropy coding. The progressive scan layout is searched (144 candidate layouts for colour images, 24 for gray: DC and AC successive-approximation depths and AC band splits at coefficients 2, 5 and 8, costed from symbol statistics) and compared against baseline; the smallest wins. A split at coefficient 2, which gives the lowest frequencies their own Huffman table, is what mozjpeg's default scan script uses and cut the luma scan's bytes by about 12% on one smooth test image.
 - Higher-quality sources are re-quantized directly on the coefficients (never to a finer table than the source had) with **trellis quantization**: a per-block dynamic program that trades distortion against the bit cost of each run/size symbol, using Huffman code lengths measured on a first pass (`--no-trellis` to skip).
+- **Perceptually tuned quality scale.** `-q` maps to a flatter base quantization table than the JPEG standard's Annex K tables (the same one mozjpeg writes by default, for luma and chroma alike, clamped to 255 so output stays baseline-compatible), and the trellis weights each coefficient's error by `(median step / step)`, so errors in finely quantized low frequencies count more, with a trellis strength (κ = 0.02) tuned for SSIMULACRA2 and not for MSE. The tuning target was size at equal **SSIMULACRA2** against mozjpeg 4.0.3 (`tools/bench_jpeg.py`): with the Annex K tables the encoder was 15-19% larger than mozjpeg at equal SSIMULACRA2, the table change took that to 3-5%, and a trellis twice as strong as the old default ended up a further 5-6 percentage points behind. The trade-off is **PSNR**: at the same `-q` the picture scores lower in PSNR than with the Annex K tables (about 1.4 dB at q95 on the test fixture), so a q value no longer gives the same PSNR as libjpeg's. A source whose quantization tables are already at or coarser than the target is still transcoded losslessly.
 - `--target-ssim S` replaces the guess-a-quality step: it bisects for the lowest quality whose reconstruction still scores at least SSIM `S` against the original (mean 8×8-window SSIM over all channels). The needed quality varies enormously between images — at 0.95 the sample files needed anywhere from q17 to q85 — so this saves bytes on easy images and protects hard ones.
 - Pixels are only touched when something must change: chroma subsampling (4:4:4 → 4:2:0 below q90, or `--subsampling 444|422|420`), EXIF orientation (baked into the pixels because EXIF is stripped), or PNG → JPEG conversion.
 - **Arithmetic coding** (SOF9 sequential, SOF10 progressive, with restart intervals and `DAC` conditioning) is read and written. A source that is arithmetic-coded stays arithmetic-coded (`--arithmetic auto`, the default), so the result opens wherever the input did; `--arithmetic on` converts any JPEG, `off` converts back to Huffman for compatibility. The coefficients are untouched, so the picture is identical. On five 5120×2880 photographs (55 MB of JPEG) the arithmetic files are 15.1% smaller than the originals and 6.0% smaller (2.0-8.4%) than this tool's own optimized-Huffman output, at about the same encoding CPU time. **The catch:** browsers and many programs cannot open arithmetic-coded JPEG at all (libjpeg and libjpeg-turbo can), which is why it is never switched on by itself for Huffman sources.
@@ -63,14 +95,14 @@ cat in.png | rc - > out.png  # stdin to stdout
 
 **WebP (lossy)** — a from-scratch VP8 key-frame encoder and decoder (`-f webp --lossy -q N`):
 - The decoder is bit-exact with libwebp (planes and RGB output, including the "fancy" chroma upsampling, loop filters, segments, multiple partitions and `ALPH`).
-- The encoder does rate-distortion mode decisions (16x16, 4x4 and chroma intra modes), quantizes with deadzone biasing, tunes the token probabilities from first-pass statistics, and searches the loop-filter level. Its streams decode to the identical picture in libwebp. At the same `-q` on twelve real images it lands within a few percent of libwebp's size at equal or slightly higher PSNR.
+- The encoder does rate-distortion mode decisions (16x16, 4x4 and chroma intra modes), quantizes with deadzone biasing, tunes the token probabilities from first-pass statistics, and searches the loop-filter level. Its streams decode to the identical picture in libwebp. In the current head-to-head benchmark (see *Head-to-head* below) it is 6-12% larger than `cwebp -m 6` at about 3x the CPU, so lossy WebP is behind libwebp.
 - Transparency is stored losslessly in an `ALPH` chunk (best of four prediction filters, coded with the VP8L encoder); hidden pixels are smoothed to be cheap. Lossy WebP inputs are only re-encoded with `--lossy`; otherwise they are left untouched.
 
 **AVIF** — a from-scratch AV1 still-picture decoder and intra encoder inside a HEIF container (`-f avif -q N`):
 - The decoder implements the AV1 intra-frame toolset: all partition types, intra modes (directional with edge filtering and upsampling, smooth, Paeth, filter-intra, chroma-from-luma, palette), every transform size and type, segmentation, delta-q/lf, quantizer matrices, the deblocking filter, CDEF, loop restoration (Wiener and self-guided), super-resolution and film grain, in 8/10/12 bits and 4:0:0/4:2:0/4:2:2/4:4:4. Output matches dav1d bit for bit on streams from libaom, SVT-AV1, rav1e and ffmpeg, and libavif/Pillow pixel for pixel (±1 from chroma upsampling). Containers: single images, grids, alpha auxiliary images (also premultiplied), `clap`/`irot`/`imir`, `colr` nclx and ICC, EXIF and XMP. **Inter prediction** — reference slots with CDF and segmentation-map carry-over, single and compound references (average, distance, wedge, difference-weighted), inter-intra, OBMC, local and global warped motion, temporal motion vectors, scaled references and `show_existing_frame` — decodes libaom streams (all tools on, 8/10-bit, 4:0:0/4:2:0/4:4:4, tiles, odd sizes) bit for bit like dav1d; scaled references, 4:2:2 and film grain on inter frames are implemented but not cross-checked; animated AVIFs with inter frames (libavif, ffmpeg) decode too. **Intra block copy** (`allow_intrabc`, with its displacement vector prediction, variable transform trees and inter transform sets) is decoded bit for bit like dav1d. Bit depths above 8 and 4:2:2 are implemented but have had less cross-checking than 8-bit 4:2:0 / 4:4:4.
 - The encoder is lossy only. It searches partitions, intra modes with angle deltas, chroma-from-luma and transform sizes per superblock by rate-distortion cost using the real adaptive entropy-coder state, then picks the deblocking level and CDEF strengths by measured error, tries **intra block copy** for pictures with repeated content (screenshots, text, UI: a hash of every 8x8 window finds exact duplicates, and the copy variant is kept only if it wins in rate-distortion terms, since block copy frames cannot use the loop filters), tries **palette mode** (exact or clustered per-block colour lists with a colour index map) for pictures with many flat few-colour blocks, keeping it only when it wins in rate-distortion terms, and chooses a loop-restoration filter (Wiener or self-guided) per unit. Restoration parameters live inside the tile data, so the tiles are written a second time from the decisions already made. Output is 8-bit or 10-bit (`--bit-depth auto|8|10`; auto keeps 16-bit sources at 10 bits) 4:2:0 (4:4:4 at `-q 90` and up, or `--subsampling 444`) or monochrome for gray images; transparency is a monochrome auxiliary image. ICC, EXIF (with `--keep-metadata`) and XMP are stored. Streams decode identically in dav1d, libaom and Pillow.
 - AVIF inputs are left untouched unless `--lossy` is given, since re-encoding only adds generation loss.
-- The encoder is considerably slower than the JPEG/WebP ones and about the size of libaom (`cpu-used 4`) at equal RGB PSNR: on eight photos and screenshots, −6.5% on average, from −26% to +4.3% per image, both decoded through the same dav1d/ffmpeg path; palette, filter-intra and compound/OBMC/warp tools are not implemented in the encoder. Inter frames (one reference, block matching with quarter-sample vectors) are used for animations.
+- The encoder is considerably slower than the JPEG/WebP ones. An earlier PSNR-only comparison against libaom (`cpu-used 4`) on eight photos and screenshots found it −6.5% smaller on average (from −26% to +4.3% per image, both decoded through the same dav1d/ffmpeg path), but the current head-to-head benchmark (see below) puts it 3-4% larger than libaom speed 6 and 9-12% larger than speed 4, and about 30x slower than speed 6; treat that table as the current figure. Palette, filter-intra and compound/OBMC/warp tools are not implemented in the encoder. Inter frames (one reference, block matching with quarter-sample vectors) are used for animations.
 
 **WebP (lossless)** — full VP8L encoder and decoder:
 - Encoder tries a palette transform (bundling up to 8 pixels per symbol) or subtract-green + per-tile predictor + cross-color decorrelation, ranks the pipelines with a cheap estimate and fully encodes the best ones.
@@ -138,29 +170,48 @@ rc [OPTIONS] <INPUT>...
 
 ## Head-to-head with established tools
 
-JPEG and lossy-PNG rows: five real JPEGs and three PNG screenshots (mozjpeg 4.1.5, oxipng 10.2.1 with `-t 1`, pngquant 3.0.3). Timings are single-threaded **CPU time** on a loaded 2-core laptop, so treat them as indicative; sizes are exact.
+Results of the project's current benchmark against the established tools; **PNG, WebP, AVIF and GIF rows are carried over from that benchmark run and were not re-run when the JPEG encoder changed.** Only the *Lossy JPEG* row was re-measured with `tools/bench_jpeg.py` (rc vs mozjpeg 4.0.3 through `jpeglib`, sizes interpolated at equal SSIMULACRA2 over a sweep of quality settings, ICC stripped on our side so profile bytes do not count against us; 10 macOS desktop-wallpaper images downscaled to 1280 px, which are smoother than typical photographs, so treat it as indicative and re-run it on your own images with `--src`). Sizes are exact; timings are indicative CPU times and vary with the machine.
 
-Lossless-PNG and WebP rows: 12 PNGs (screenshots, diagrams, UI art, a 16-bit image, a gradient, a 6 MB RGBA illustration) against oxipng 9.1.1 (as packaged in `pyoxipng`), compared with `--keep-hidden-pixels` so neither side gets credit for rewriting invisible pixels. Sizes are exact; times are wall-clock on 4 cores for the whole process.
+| Area | Result | Verdict |
+|---|---|---|
+| Lossless PNG, `-l 9` | −1.2% total vs `oxipng -o2` (smaller on 11 of 14 files), −0.6% vs `-o4`; within about 2% of `oxipng -o max -Z` and zopflipng, which are 20× slower; beats optipng/advpng/pngcrush by 6-9% | **Best area** |
+| Lossless PNG, default | Same size as `oxipng -o2`, 1.8× its CPU | Parity |
+| Lossy PNG (`--lossy`) | 4% smaller than pngquant at similar quality; pngquant + oxipng is 6% smaller still | Competitive |
+| Lossy JPEG | **−0.8% / −1.1% / −1.2% / −1.0% mean size vs mozjpeg at equal SSIMULACRA2 55 / 65 / 75 / 85** (worst single file +3.5% / +3.1% / +1.7% / −0.2%; the 85 row has only 2 images). Before the perceptual tuning this was +16-19% at 55-75. Lower PSNR than libjpeg's tables at the same `-q` (see *What it does*) | Parity on this small corpus (worst files ~3% behind at low quality) |
+| Lossless JPEG (`-q 100`) | +0.4% vs mozjpeg's jpegtran (up to +3.5% on one file); beats libjpeg-turbo jpegtran and jpegoptim | Good |
+| WebP lossless | +2% vs `cwebp -lossless` at about 10× the CPU | Behind |
+| WebP lossy | +6-12% vs `cwebp -m 6`, about 3× the CPU | Behind |
+| AVIF | +3-4% vs libaom speed 6 (+9-12% vs speed 4), about 30× slower than speed 6 | Behind, slow |
+| GIF (kept as GIF) | −0.9% vs gifsicle −4.5%; `--lossy` gives −5% vs `gifsicle --lossy=80` −32% | Behind |
+| GIF → WebP | Lossless: −23% vs gif2webp +10% (better). Lossy: about 4% larger | Mixed |
 
-| Task | rust-compress vs. the established tool |
-|---|---|
-| Lossy JPEG (`-q 60/70/80`) | **At parity with mozjpeg at equal PSNR**: mean +1.4% / −0.4% / +0.6% size (per file −10% … +7%) |
-| Lossy JPEG speed | 51-246 ms vs `cjpeg` 64-410 ms (cjpeg excludes decoding; with trellis) |
-| Lossless JPEG (`-q 100`) | +0.6% vs `jpegtran -optimize -progressive` (range +0.1% … +1.0%), **faster** (55-206 ms vs 86-236 ms) |
-| Lossless PNG, default `-l 7` | **Equal or smaller than `oxipng -o2` on 8 of 12 files**, worst +1.5%, best −19.2%; 12-image total −1.5%. Wall time 0.09-1.3 s per file vs 0.04-2.0 s for `-o2` (faster on the larger files) |
-| Lossless PNG, `-l 9` | **Equal or smaller than `oxipng -o4` on 11 of 12 files**, worst +0.7%, best −19.0%; total −1.6%. Wall time 0.3-6.9 s per file vs 0.1-3.4 s for `-o4` (slower on the largest image: 6.9 s vs 3.4 s) |
-| Lossless PNG, `-l 6` | +11% vs `oxipng -o2` in total (worst +16.6%), at a fraction of the CPU: the fast levels use hash-chain LZ77 only |
-| Lossless WebP (`-f webp`, `-l 7`) | **+6.4% in total vs libwebp at its maximum effort** (`method=6, quality=100`, via Pillow): within +0.4% … +14.5% on 11 of 12 images, one image at +31%. Roughly **2-10× faster** in wall time than libwebp's max effort. About **22% smaller than our optimised PNG** of the same pixels (excluding two 16-bit images that WebP stores at 8-bit) |
-| Lossy PNG (`--lossy`) | **Better than pngquant**: 0.4-1.0 dB higher PSNR at −4.3%, −4.5%, −4.0% size; 1.5-1.9× its CPU time |
-| PNG with hidden transparent pixels | tools that keep invisible RGB (oxipng by default) can be orders of magnitude larger: 580 KB → 4 KB on a noisy-under-alpha test image |
+Two measurements from earlier runs that the table above does not repeat: `-l 6` PNG is about 11% larger than `oxipng -o2` in total at a fraction of the CPU (the fast levels use hash-chain LZ77 only), and PNGs with hidden transparent pixels can be orders of magnitude smaller than what tools that keep the invisible RGB (oxipng by default) produce: 580 KB → 4 KB on a noisy-under-alpha test image.
 
-So it matches the established tools on JPEG, beats pngquant on lossy PNG, and matches or beats oxipng on lossless PNG at `-l 7`/`-l 9`. Against weaker baselines it is far ahead (e.g. 14-28% smaller than PIL's `optimize=True` PNGs).
+So PNG is the strong area, JPEG is at parity with mozjpeg on perceptual quality (on the small test corpus above), and lossy WebP, AVIF and GIF `--lossy` are still behind, with AVIF also much slower. Against weaker baselines it is far ahead (e.g. 14-28% smaller than PIL's `optimize=True` PNGs).
 
 What it offers beyond ratio: no C dependencies, one binary for all of these formats, a coefficient-domain JPEG pipeline, pipe support, and parallel batch processing.
 
 ## Testing
 
 `cargo test` runs the unit tests and integration suites, which cross-check the decoders against the `image` crate (and, for WebP and CMYK/YCCK, against files made by libwebp and libjpeg-turbo, or decoded by it) and verify encoder output with independent decoders. `cli/tests/hostile.rs` feeds every decoder and encoder path truncated, bit-flipped and header-corrupted variants of every fixture and requires no panic, no hang and (for WebP) an exact re-encode round trip. This is deterministic mutation testing, not coverage-guided fuzzing. For a deeper sweep: `HOSTILE_ROUNDS=20000 cargo test --release -p rust-compress --test hostile`.
+
+### Benchmarking
+
+`tools/bench_jpeg.py` compares `rc`'s size against another encoder at equal SSIMULACRA2 on any images you give it, for lossy JPEG, WebP or AVIF, on Linux, macOS and Windows:
+
+```
+python3 -m venv env && env/bin/pip install numpy pillow ssimulacra2 jpeglib
+cargo build --release -p rust-compress
+env/bin/python tools/bench_jpeg.py /tmp/bench --src ~/Pictures/photos [--src another/dir] [--limit 0] [--size 0]
+```
+
+- **Inputs:** `--src` takes image files or directories (repeatable, or `RC_BENCH_SRC` with `os.pathsep`-separated paths); `--limit N` caps the image count (default 12, 0 = all); `--size PX` downscales the longer side (0 keeps full size). Use pristine photographs: inputs are re-saved as lossless PNG first, so already heavily compressed JPEGs bring their artifacts into both encoders.
+- **Format:** `--format jpeg|webp|avif` (default `jpeg`; `webp` is lossy WebP); `--subsampling 420|444` for JPEG.
+- **Reference encoder:** JPEG compares against mozjpeg 4.0.3 through `jpeglib` by default. For anything else pass `--ref-cmd` with `{in}`, `{out}` and `{q}` placeholders, e.g. `--ref-cmd 'cwebp -q {q} {in} -o {out}' --format webp`, or `--ref-cmd 'avifenc -q {q} {in} {out}' --format avif --ref-qs 10,20,30,40,50,60` when the reference's quality scale differs from `rc`'s. Its results are cached per command.
+- **Sweep:** `--qs` (rc's quality settings) and `--targets` (SSIMULACRA2 scores to compare at); `--rc PATH` picks the binary; `--rc-arg` passes extra options to `rc`; `--keep-icc` stops stripping ICC profiles from `rc`'s output (stripped by default so profile bytes do not count against it).
+- **Output:** each file's size difference at every score, then the mean and the worst file; positive means `rc` is larger. Both encoders' outputs are decoded with Pillow for scoring, so the format must be readable by your Pillow (AVIF needs Pillow 11.3+ or `pillow-avif-plugin`).
+
+Only the JPEG path against mozjpeg is used for the README's *Lossy JPEG* row; the WebP and AVIF paths exist so the other gaps can be measured the same way (a three-image check of lossy WebP against libwebp method 6 through this script gave +4.6% to +7.3% mean, in line with the table above, but that sample is far too small to quote).
 
 ## Build
 
@@ -175,6 +226,7 @@ Requires a stable Rust toolchain (edition 2024); `rust-toolchain.toml` pins `sta
 ## Layout
 
 ```
+tools/      `crosscheck.py` (decoder cross-checks) and `bench_jpeg.py` (size at equal SSIMULACRA2 against another encoder: JPEG, WebP, AVIF)
 core/       shared types and utilities (rc-core): image and animation types, errors, bit I/O, CRC-32 / Adler-32, canonical Huffman, EXIF editing, Lanczos-3 downscaling, SSIM/PSNR/MS-SSIM, color quantizer
 deflate/    inflate, LZ77 matchers (hash chains; binary tree for levels 7-9), block encoder, optimal parser (levels 7-9)
 png/        decoder (all color types/depths, Adam7, APNG), filters, encoder (reduction + strategy search, APNG writer)

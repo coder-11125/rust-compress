@@ -248,10 +248,10 @@ fn scripts(ncomp: usize) -> Vec<Vec<Scan>> {
     let all: Vec<usize> = (0..ncomp).collect();
     // Every component after the first is coded like chroma (Cb/Cr, or the M/Y/K planes of CMYK).
     let chroma_als: &[u32] = if ncomp >= 3 { &[0, 1] } else { &[0] };
-    let chroma_splits: &[Option<usize>] = if ncomp >= 3 { &[None, Some(5)] } else { &[None] };
+    let chroma_splits: &[Option<usize>] = if ncomp >= 3 { &[None, Some(2), Some(5)] } else { &[None] };
     let mut out = Vec::new();
     for dc_al in [0u32, 1] {
-        for split in [None, Some(5usize), Some(8)] {
+        for split in [None, Some(2usize), Some(5), Some(8)] {
             for luma_al in [0u32, 1, 2] {
                 for (&chroma_al, chroma_split) in
                     chroma_als.iter().flat_map(|a| chroma_splits.iter().map(move |c| (a, *c)))

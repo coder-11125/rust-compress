@@ -1,6 +1,6 @@
 //! Mapping of a 1..=100 quality setting to quantization tables.
 
-use super::{STD_CHROMA_Q, STD_LUMA_Q};
+use super::STD_LUMA_Q;
 
 /// IJG-style scaling of a base table.
 pub fn scale_table(base: &[u8; 64], quality: u8) -> [u8; 64] {
@@ -20,10 +20,24 @@ pub fn estimate_quality(luma: &[u8; 64]) -> u8 {
     q.round().clamp(1.0, 100.0) as u8
 }
 
+/// Base table for new encodes: flatter than the Annex K tables, the same table mozjpeg writes for luma
+/// and chroma by default (values above 255 are clamped by `scale_table` to stay baseline-compatible). Chosen
+/// by measuring size at equal SSIMULACRA2 (tools/bench_jpeg.py); the Annex K tables cost 15-19% more.
+pub const PERCEPTUAL_Q: [u8; 64] = [
+    16, 16, 16, 18, 25, 37, 56, 85, //
+    16, 17, 20, 27, 34, 40, 53, 75, //
+    16, 20, 24, 31, 43, 62, 91, 135, //
+    18, 27, 31, 40, 53, 74, 106, 156, //
+    25, 34, 43, 53, 69, 94, 131, 189, //
+    37, 40, 62, 74, 94, 124, 169, 238, //
+    56, 53, 91, 106, 131, 169, 226, 255, //
+    85, 75, 135, 156, 189, 238, 255, 255,
+];
+
 pub fn luma_table(quality: u8) -> [u8; 64] {
-    scale_table(&STD_LUMA_Q, quality)
+    scale_table(&PERCEPTUAL_Q, quality)
 }
 
 pub fn chroma_table(quality: u8) -> [u8; 64] {
-    scale_table(&STD_CHROMA_Q, quality)
+    scale_table(&PERCEPTUAL_Q, quality)
 }
