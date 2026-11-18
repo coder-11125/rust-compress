@@ -20,12 +20,45 @@ pub struct EncodeOptions {
     /// Error diffusion strength (0-1) for stills. Animations are never dithered: the noise would change from frame
     /// to frame and defeat the frame differencing.
     pub dither: f32,
+    /// Lossiness, 0 (exact, the default) to 200, on a scale comparable to gifsicle's `--lossy`. Pixels may be
+    /// replaced by a nearby palette colour, or by "unchanged from the previous frame", when that lets the LZW coder
+    /// extend a match; larger values allow bigger colour differences. Applies to the shared-palette encoder (not the
+    /// per-frame local palettes used when no single palette fits).
+    pub lossy: u32,
 }
 
 impl Default for EncodeOptions {
     fn default() -> Self {
-        EncodeOptions { colors: 256, dither: 0.5 }
+        EncodeOptions { colors: 256, dither: 0.5, lossy: 0 }
     }
+}
+
+/// Squared distance between two colours (plain RGB; the lossiness thresholds are tuned against it).
+fn dist2(a: [u8; 3], b: [u8; 3]) -> i32 {
+    let d = |x: u8, y: u8| (x as i32 - y as i32).pow(2);
+    d(a[0], b[0]) + d(a[1], b[1]) + d(a[2], b[2])
+}
+
+/// For every palette entry, the other entries within the lossiness threshold, nearest first (at most 16).
+fn near_colors(pal: &[[u8; 3]], lossy: u32) -> (i32, Vec<Vec<u8>>) {
+    if lossy == 0 {
+        return (0, Vec::new());
+    }
+    let t = lossy.min(200) as f32 * 0.4;
+    let t2 = (t * t) as i32;
+    let nb = (0..pal.len())
+        .map(|c| {
+            let mut v: Vec<(i32, u8)> = (0..pal.len())
+                .filter(|&d| d != c)
+                .map(|d| (dist2(pal[c], pal[d]), d as u8))
+                .filter(|&(d2, _)| d2 <= t2)
+                .collect();
+            v.sort_unstable();
+            v.truncate(16);
+            v.into_iter().map(|(_, d)| d).collect()
+        })
+        .collect();
+    (t2, nb)
 }
 
 /// Alpha below this is transparent.
@@ -74,85 +107,45 @@ fn key_color(k: u32) -> [u8; 3] {
     [(k >> 16) as u8, (k >> 8) as u8, k as u8]
 }
 
-/// One frame's exact local palette: index 0 is the transparent/unchanged entry, colours start at 1.
-struct LocalFrame {
-    table: Vec<[u8; 3]>,
-    bits: u8,
-    idx: Vec<u8>,
-    vis: Vec<u32>,
-}
-
-fn local_frame(frame: &[[u8; 4]], limit: usize) -> Option<LocalFrame> {
-    let mut set = HashSet::new();
-    for p in frame {
-        if let Some(k) = opaque_key(*p)
-            && set.insert(k)
-            && set.len() > limit
-        {
-            return None;
-        }
-    }
-    let mut colors: Vec<u32> = set.into_iter().collect();
-    colors.sort_unstable();
-    let map: HashMap<u32, u8> = colors.iter().enumerate().map(|(i, &k)| (k, i as u8 + 1)).collect();
-    let mut idx = Vec::with_capacity(frame.len());
-    let mut vis = Vec::with_capacity(frame.len());
-    for p in frame {
-        let k = opaque_key(*p);
-        vis.push(k.map_or(0, |k| k + 1));
-        idx.push(k.map_or(0, |k| *map.get(&k).unwrap()));
-    }
-    let mut table = Vec::with_capacity(colors.len() + 1);
-    table.push([0, 0, 0]);
-    table.extend(colors.iter().map(|&k| key_color(k)));
-    let table_len = (colors.len() + 1).next_power_of_two().max(2);
-    Some(LocalFrame { table, bits: table_len.trailing_zeros() as u8, idx, vis })
-}
-
-/// Exact multi-palette encoding for animations whose frames each fit a palette even though their union does not.
-/// Returns `None` when any frame needs more than `colors - 1` opaque entries, leaving the caller to quantize.
-fn encode_local_palettes(
-    frames: &[Vec<[u8; 4]>],
-    delays: &[u32],
-    w: usize,
-    h: usize,
+/// One frame of the exact per-frame-palette encoding: the rectangle that must be drawn and its pixels as visible
+/// colour keys (`0` = transparent or unchanged, otherwise `opaque_key + 1`).
+struct LocalPlan {
+    x0: usize,
+    y0: usize,
+    rw: usize,
+    rh: usize,
+    dispose: u8,
+    keys: Vec<u32>,
+    /// Distinct non-zero keys in the rectangle.
     colors: usize,
-    loop_forever: bool,
-) -> Option<Vec<u8>> {
-    if frames.len() < 2 {
+}
+
+/// Plan every frame's rectangle and check that each fits a palette of `colors` entries (counting the transparent
+/// entry when some pixel is left unchanged). A frame may use many colours overall: only the changed rectangle counts.
+/// `None` when a frame's rectangle needs more.
+fn local_plan(frames: &[Vec<[u8; 4]>], w: usize, h: usize, colors: usize) -> Option<Vec<LocalPlan>> {
+    let n = frames.len();
+    if n < 2 {
         return None;
     }
-    let limit = colors.clamp(2, 256) - 1;
-    let local: Option<Vec<LocalFrame>> = frames.iter().map(|f| local_frame(f, limit)).collect();
-    let local = local?;
-    let n = local.len();
+    let vis: Vec<Vec<u32>> =
+        frames.iter().map(|f| f.iter().map(|p| opaque_key(*p).map_or(0, |k| k + 1)).collect()).collect();
     let blank_before: Vec<bool> =
-        (0..n).map(|i| i == 0 || (0..w * h).any(|p| local[i].vis[p] == 0 && local[i - 1].vis[p] != 0)).collect();
-
-    let mut out = b"GIF89a".to_vec();
-    out.extend_from_slice(&(w as u16).to_le_bytes());
-    out.extend_from_slice(&(h as u16).to_le_bytes());
-    out.push(0x70); // No global colour table: every image carries its own.
-    out.extend_from_slice(&[0, 0]);
-    if loop_forever {
-        out.extend_from_slice(&[0x21, 0xFF, 11]);
-        out.extend_from_slice(b"NETSCAPE2.0");
-        out.extend_from_slice(&[3, 1, 0, 0, 0]);
-    }
-
+        (0..n).map(|i| i == 0 || (0..w * h).any(|p| vis[i][p] == 0 && vis[i - 1][p] != 0)).collect();
+    let mut plans = Vec::with_capacity(n);
     for i in 0..n {
-        let lf = &local[i];
-        let base = if blank_before[i] { None } else { Some(&local[i - 1]) };
+        let cur = &vis[i];
+        let base = if blank_before[i] { None } else { Some(&vis[i - 1]) };
         let dispose = if i + 1 < n && blank_before[i + 1] { 2u8 } else { 1u8 };
         let (mut x0, mut y0, mut x1, mut y1) = (w, h, 0, 0);
         for y in 0..h {
             for x in 0..w {
                 let p = y * w + x;
                 let differs = match base {
-                    Some(b) => lf.vis[p] != b.vis[p],
-                    None => lf.vis[p] != 0,
+                    Some(b) => cur[p] != b[p],
+                    None => cur[p] != 0,
                 };
-                if differs || (dispose == 2 && lf.vis[p] != 0) {
+                if differs || (dispose == 2 && cur[p] != 0) {
                     x0 = x0.min(x);
                     y0 = y0.min(y);
                     x1 = x1.max(x + 1);
@@ -164,33 +157,265 @@ fn encode_local_palettes(
             (x0, y0, x1, y1) = (0, 0, 1, 1);
         }
         let (rw, rh) = (x1 - x0, y1 - y0);
-        let mut pixels = Vec::with_capacity(rw * rh);
+        let mut keys = Vec::with_capacity(rw * rh);
         for y in y0..y1 {
             for x in x0..x1 {
                 let p = y * w + x;
-                pixels.push(match base {
-                    Some(b) if lf.vis[p] == b.vis[p] => 0,
-                    _ => lf.idx[p],
+                keys.push(match base {
+                    Some(b) if cur[p] == b[p] => 0,
+                    _ => cur[p],
                 });
             }
         }
-        let delay = ((delays[i] + 5) / 10).clamp(2, 65535) as u16;
-        out.extend_from_slice(&[0x21, 0xF9, 4, dispose << 2 | 1, delay as u8, (delay >> 8) as u8, 0, 0]);
+        let mut set: HashSet<u32> = HashSet::new();
+        for &k in &keys {
+            if k != 0 {
+                set.insert(k);
+            }
+        }
+        let needs_transparent = keys.contains(&0);
+        if set.len() + needs_transparent as usize > colors {
+            return None;
+        }
+        plans.push(LocalPlan { x0, y0, rw, rh, dispose, keys, colors: set.len() });
+    }
+    Some(plans)
+}
+
+/// Exact multi-palette encoding for animations whose changed rectangles each fit a palette even though their union
+/// does not. Returns `None` when some rectangle needs more than `colors` entries, leaving the caller to quantize.
+fn encode_local_palettes(
+    frames: &[Vec<[u8; 4]>],
+    delays: &[u32],
+    w: usize,
+    h: usize,
+    colors: usize,
+    loop_forever: bool,
+    lossy: u32,
+) -> Option<Vec<u8>> {
+    if lossy > 0 {
+        return encode_local_lossy(frames, delays, w, h, colors.clamp(2, 256), loop_forever, lossy);
+    }
+    let plans = local_plan(frames, w, h, colors.clamp(2, 256))?;
+    let mut out = b"GIF89a".to_vec();
+    out.extend_from_slice(&(w as u16).to_le_bytes());
+    out.extend_from_slice(&(h as u16).to_le_bytes());
+    out.push(0x70); // No global colour table: every image carries its own.
+    out.extend_from_slice(&[0, 0]);
+    if loop_forever {
+        out.extend_from_slice(&[0x21, 0xFF, 11]);
+        out.extend_from_slice(b"NETSCAPE2.0");
+        out.extend_from_slice(&[3, 1, 0, 0, 0]);
+    }
+    for (pl, &delay_ms) in plans.iter().zip(delays) {
+        // Table: the transparent entry first if some pixel is unchanged, then the rectangle's colours.
+        let has_transparent = pl.keys.contains(&0);
+        let mut keys_used: Vec<u32> = pl.keys.iter().copied().filter(|&k| k != 0).collect();
+        keys_used.sort_unstable();
+        keys_used.dedup();
+        debug_assert_eq!(keys_used.len(), pl.colors);
+        let first = has_transparent as usize;
+        let map: HashMap<u32, u8> = keys_used.iter().enumerate().map(|(i, &k)| (k, (i + first) as u8)).collect();
+        let mut table: Vec<[u8; 3]> = Vec::with_capacity(keys_used.len() + first);
+        if has_transparent {
+            table.push([0, 0, 0]);
+        }
+        table.extend(keys_used.iter().map(|&k| key_color(k - 1)));
+        let pixels: Vec<u8> = pl.keys.iter().map(|&k| if k == 0 { 0 } else { map[&k] }).collect();
+        let table_len = table.len().next_power_of_two().max(2);
+        let bits = table_len.trailing_zeros() as u8;
+        let delay = ((delay_ms + 5) / 10).clamp(2, 65535) as u16;
+        out.extend_from_slice(&[
+            0x21,
+            0xF9,
+            4,
+            pl.dispose << 2 | has_transparent as u8,
+            delay as u8,
+            (delay >> 8) as u8,
+            0,
+            0,
+        ]);
         out.push(0x2C);
-        for v in [x0, y0, rw, rh] {
+        for v in [pl.x0, pl.y0, pl.rw, pl.rh] {
             out.extend_from_slice(&(v as u16).to_le_bytes());
         }
-        out.push(0x80 | (lf.bits - 1));
-        for t in 0..(1usize << lf.bits) {
-            out.extend_from_slice(lf.table.get(t).copied().unwrap_or([0, 0, 0]).as_slice());
+        out.push(0x80 | (bits - 1));
+        for t in 0..table_len {
+            out.extend_from_slice(table.get(t).copied().unwrap_or([0, 0, 0]).as_slice());
         }
-        let min_code = lf.bits.max(2);
+        let min_code = bits.max(2);
         out.push(min_code);
         for block in lzw_encode(&pixels, min_code).chunks(255) {
             out.push(block.len() as u8);
             out.extend_from_slice(block);
         }
         out.push(0);
+    }
+    out.push(0x3B);
+    Some(out)
+}
+
+/// The lossy variant of [`encode_local_palettes`]: frames are coded one after another, each against what the previous
+/// one actually displays, so a substitution made in one frame is what the next frame compares with. Every pixel stays
+/// within the lossiness budget of its source colour.
+fn encode_local_lossy(
+    frames: &[Vec<[u8; 4]>],
+    delays: &[u32],
+    w: usize,
+    h: usize,
+    colors: usize,
+    loop_forever: bool,
+    lossy: u32,
+) -> Option<Vec<u8>> {
+    let n = frames.len();
+    if n < 2 {
+        return None;
+    }
+    let vis: Vec<Vec<u32>> =
+        frames.iter().map(|f| f.iter().map(|p| opaque_key(*p).map_or(0, |k| k + 1)).collect()).collect();
+    let blank_before: Vec<bool> =
+        (0..n).map(|i| i == 0 || (0..w * h).any(|p| vis[i][p] == 0 && vis[i - 1][p] != 0)).collect();
+    let t = lossy.min(200) as f32 * 0.4;
+    let t2 = (t * t) as i32;
+    let color = |k: u32| key_color(k - 1);
+
+    let mut out = b"GIF89a".to_vec();
+    out.extend_from_slice(&(w as u16).to_le_bytes());
+    out.extend_from_slice(&(h as u16).to_le_bytes());
+    out.push(0x70);
+    out.extend_from_slice(&[0, 0]);
+    if loop_forever {
+        out.extend_from_slice(&[0x21, 0xFF, 11]);
+        out.extend_from_slice(b"NETSCAPE2.0");
+        out.extend_from_slice(&[3, 1, 0, 0, 0]);
+    }
+    // What the viewer sees after the frames written so far (0 = transparent).
+    let mut shown: Vec<u32> = vec![0; w * h];
+    for i in 0..n {
+        let src = &vis[i];
+        let mut cur = src.clone();
+        let base: Option<&[u32]> = if blank_before[i] { None } else { Some(&shown) };
+        if let Some(b) = base {
+            for p in 0..w * h {
+                if cur[p] != 0 && b[p] != 0 && cur[p] != b[p] && dist2(color(cur[p]), color(b[p])) <= t2 {
+                    cur[p] = b[p];
+                }
+            }
+        }
+        let dispose = if i + 1 < n && blank_before[i + 1] { 2u8 } else { 1u8 };
+        let (mut x0, mut y0, mut x1, mut y1) = (w, h, 0, 0);
+        for y in 0..h {
+            for x in 0..w {
+                let p = y * w + x;
+                let differs = match base {
+                    Some(b) => cur[p] != b[p],
+                    None => cur[p] != 0,
+                };
+                if differs || (dispose == 2 && cur[p] != 0) {
+                    x0 = x0.min(x);
+                    y0 = y0.min(y);
+                    x1 = x1.max(x + 1);
+                    y1 = y1.max(y + 1);
+                }
+            }
+        }
+        if x1 == 0 {
+            (x0, y0, x1, y1) = (0, 0, 1, 1);
+        }
+        let (rw, rh) = (x1 - x0, y1 - y0);
+        let pos = |k: usize| (y0 + k / rw) * w + x0 + k % rw;
+        let keys: Vec<u32> = (0..rw * rh)
+            .map(|k| {
+                let p = pos(k);
+                match base {
+                    Some(b) if cur[p] == b[p] => 0,
+                    _ => cur[p],
+                }
+            })
+            .collect();
+        let has_transparent = keys.contains(&0);
+        let mut used: Vec<u32> = keys.iter().copied().filter(|&k| k != 0).collect();
+        used.sort_unstable();
+        used.dedup();
+        if used.len() + has_transparent as usize > colors {
+            return None;
+        }
+        let first = has_transparent as usize;
+        let map: HashMap<u32, u8> = used.iter().enumerate().map(|(j, &k)| (k, (j + first) as u8)).collect();
+        // Table entry -> displayed key (0 for the transparent entry).
+        let mut entry_key: Vec<u32> = Vec::with_capacity(used.len() + first);
+        if has_transparent {
+            entry_key.push(0);
+        }
+        entry_key.extend(used.iter().copied());
+        let table: Vec<[u8; 3]> = entry_key.iter().map(|&k| if k == 0 { [0, 0, 0] } else { color(k) }).collect();
+        let mut pixels: Vec<u8> = keys.iter().map(|&k| if k == 0 { 0 } else { map[&k] }).collect();
+        let (_, near) = near_colors(&table, lossy);
+        let orig = pixels.clone();
+        let table_len = table.len().next_power_of_two().max(2);
+        let bits = table_len.trailing_zeros() as u8;
+        let min_code = bits.max(2);
+        let mut fill = |k: usize, cand: &mut Vec<u8>| {
+            let p = pos(k);
+            if src[p] == 0 {
+                return;
+            }
+            let want = color(src[p]);
+            let ok = |c: u8| (c != 0 || !has_transparent) && dist2(table[c as usize], want) <= t2;
+            let v = orig[k];
+            if v == 0 && has_transparent {
+                // Unchanged pixel: any entry close to the source colour would do as well.
+                if base.is_some() {
+                    cand.extend(
+                        entry_key.iter().enumerate().skip(1).filter(|&(c, _)| ok(c as u8)).map(|(c, _)| c as u8),
+                    );
+                    cand.sort_by_key(|&c| dist2(table[c as usize], want));
+                    cand.truncate(16);
+                }
+            } else {
+                if has_transparent
+                    && let Some(b) = base
+                    && b[p] != 0
+                    && dist2(color(b[p]), want) <= t2
+                {
+                    cand.push(0);
+                }
+                cand.extend(near[v as usize].iter().copied().filter(|&c| ok(c)));
+            }
+        };
+        let data = lzw_core(&mut pixels, min_code, Some(&mut fill));
+        for (k, (&new, &old)) in pixels.iter().zip(&orig).enumerate() {
+            if new != old {
+                let p = pos(k);
+                cur[p] = if new == 0 && has_transparent { base.map_or(0, |b| b[p]) } else { entry_key[new as usize] };
+            }
+        }
+        let delay = ((delays[i] + 5) / 10).clamp(2, 65535) as u16;
+        out.extend_from_slice(&[
+            0x21,
+            0xF9,
+            4,
+            dispose << 2 | has_transparent as u8,
+            delay as u8,
+            (delay >> 8) as u8,
+            0,
+            0,
+        ]);
+        out.push(0x2C);
+        for v in [x0, y0, rw, rh] {
+            out.extend_from_slice(&(v as u16).to_le_bytes());
+        }
+        out.push(0x80 | (bits - 1));
+        for t in 0..table_len {
+            out.extend_from_slice(table.get(t).copied().unwrap_or([0, 0, 0]).as_slice());
+        }
+        out.push(min_code);
+        for block in data.chunks(255) {
+            out.push(block.len() as u8);
+            out.extend_from_slice(block);
+        }
+        out.push(0);
+        shown = cur;
     }
     out.push(0x3B);
     Some(out)
@@ -220,9 +445,9 @@ fn canvases(anim: &Animation) -> Result<Vec<Vec<[u8; 4]>>> {
 pub fn palette_is_exact(anim: &Animation, colors: usize) -> bool {
     let Ok(frames) = canvases(anim) else { return false };
     let colors = colors.clamp(2, 256);
+    let (w, h) = (anim.width as usize, anim.height as usize);
     let limit = colors - reserved(&frames);
-    distinct_colors(&frames, limit).is_some()
-        || (frames.len() > 1 && frames.iter().all(|f| distinct_colors(std::slice::from_ref(f), colors - 1).is_some()))
+    distinct_colors(&frames, limit).is_some() || local_plan(&frames, w, h, colors).is_some()
 }
 
 pub fn encode_animation(anim: &Animation, opts: &EncodeOptions) -> Result<Vec<u8>> {
@@ -253,7 +478,7 @@ pub fn encode_animation(anim: &Animation, opts: &EncodeOptions) -> Result<Vec<u8
     }
     if exact.is_none() && n > 1 {
         let delays: Vec<u32> = anim.frames.iter().map(|f| f.duration_ms).collect();
-        if let Some(bytes) = encode_local_palettes(&frames, &delays, w, h, opts.colors, anim.loop_forever) {
+        if let Some(bytes) = encode_local_palettes(&frames, &delays, w, h, opts.colors, anim.loop_forever, opts.lossy) {
             return Ok(bytes);
         }
     }
@@ -279,7 +504,7 @@ pub fn encode_animation(anim: &Animation, opts: &EncodeOptions) -> Result<Vec<u8
     let bits = table_len.trailing_zeros() as u8; // 1..=8
 
     let mut cache: HashMap<[u8; 3], u8> = HashMap::new();
-    let idx: Vec<Vec<u8>> = frames
+    let mut idx: Vec<Vec<u8>> = frames
         .iter()
         .map(|f| {
             f.iter()
@@ -315,10 +540,27 @@ pub fn encode_animation(anim: &Animation, opts: &EncodeOptions) -> Result<Vec<u8
     }
 
     let min_code = bits.max(2);
+    let pc = pal.colors();
+    let (t2, near) = near_colors(pc, opts.lossy);
+    let lossy = opts.lossy > 0;
     for i in 0..n {
+        // The frame is taken out of `idx` so substitutions can be written back; the previous frame in `idx` already
+        // holds what a viewer sees after its own substitutions, which is what this frame is compared against.
+        let mut cur = std::mem::take(&mut idx[i]);
+        // The frame as the palette quantized it: every substitution below stays within the lossiness budget of this,
+        // so the error against the source never compounds.
+        let src: Vec<u8> = if lossy { cur.clone() } else { Vec::new() };
         let base: Option<&[u8]> = if blank_before[i] { None } else { Some(&idx[i - 1]) };
         let dispose = if i + 1 < n && blank_before[i + 1] { 2u8 } else { 1u8 };
-        let cur = &idx[i];
+        if lossy && let Some(b) = base {
+            // A pixel close enough to what is already on screen is simply left unchanged.
+            for p in 0..w * h {
+                let (c, o) = (cur[p], b[p]);
+                if c != o && c != transparent && o != transparent && dist2(pc[c as usize], pc[o as usize]) <= t2 {
+                    cur[p] = o;
+                }
+            }
+        }
         let differs = |p: usize| match base {
             Some(b) => cur[p] != b[p],
             None => cur[p] != transparent || !has_t,
@@ -361,11 +603,49 @@ pub fn encode_animation(anim: &Animation, opts: &EncodeOptions) -> Result<Vec<u8
         }
         out.push(0);
         out.push(min_code);
-        for block in lzw_encode(&pixels, min_code).chunks(255) {
+        let data = if lossy {
+            let orig = pixels.clone();
+            let pos = |k: usize| (y0 + k / rw) * w + x0 + k % rw;
+            let mut fill = |k: usize, out: &mut Vec<u8>| {
+                let v = orig[k];
+                let p = pos(k);
+                if v == transparent && has_t {
+                    // Unchanged pixel: a colour near the one on screen would do as well.
+                    if let Some(b) = base
+                        && b[p] != transparent
+                    {
+                        let want = pc[src[p] as usize];
+                        out.extend(near[b[p] as usize].iter().copied().filter(|&c| dist2(pc[c as usize], want) <= t2));
+                    }
+                } else {
+                    if has_t
+                        && let Some(b) = base
+                        && b[p] != transparent
+                        && dist2(pc[v as usize], pc[b[p] as usize]) <= t2
+                    {
+                        out.push(transparent);
+                    }
+                    let want = pc[src[p] as usize];
+                    out.extend(near[v as usize].iter().copied().filter(|&c| dist2(pc[c as usize], want) <= t2));
+                }
+            };
+            let data = lzw_core(&mut pixels, min_code, Some(&mut fill));
+            for (k, (&new, &old)) in pixels.iter().zip(&orig).enumerate() {
+                if new != old {
+                    let p = pos(k);
+                    cur[p] = if new == transparent { base.map_or(cur[p], |b| b[p]) } else { new };
+                }
+            }
+            data
+        } else {
+            lzw_encode(&pixels, min_code)
+        };
+        for block in data.chunks(255) {
             out.push(block.len() as u8);
             out.extend_from_slice(block);
         }
         out.push(0);
+        idx[i] = cur;
     }
     out.push(0x3B);
     Ok(out)
@@ -397,8 +677,18 @@ impl BitSink {
     }
 }
 
+/// Source of replacement candidates for the lossy LZW coder: `f(k, out)` appends values for pixel `k`, best first.
+pub(crate) type Subst<'a> = &'a mut dyn FnMut(usize, &mut Vec<u8>);
+
 /// GIF's variable-width LZW. `indices` must not be empty and every index must be below `1 << min_code`.
 pub(crate) fn lzw_encode(indices: &[u8], min_code: u8) -> Vec<u8> {
+    lzw_core(&mut indices.to_vec(), min_code, None)
+}
+
+/// LZW coder with an optional lossy hook. When the dictionary has no entry for the current string plus the next pixel,
+/// `subst(k, out)` lists replacement values for pixel `k` (best first); the first that does extend the match replaces
+/// the pixel in `indices`, so on return `indices` holds what the decoder will reproduce.
+pub(crate) fn lzw_core(indices: &mut [u8], min_code: u8, mut subst: Option<Subst>) -> Vec<u8> {
     const SLOTS: usize = 1 << 13;
     const EMPTY: u32 = u32::MAX;
     let clear = 1u32 << min_code;
@@ -409,12 +699,14 @@ pub(crate) fn lzw_encode(indices: &[u8], min_code: u8) -> Vec<u8> {
     let mut sink = BitSink { out: Vec::with_capacity(indices.len() / 2 + 16), acc: 0, n: 0 };
     let mut size = min_code as u32 + 1;
     let mut next = first_free;
+    let mut cand: Vec<u8> = Vec::new();
     sink.put(clear, size);
     let mut prefix = indices[0] as u32;
-    for &b in &indices[1..] {
+    for k in 1..indices.len() {
+        let mut b = indices[k];
         let key = prefix << 8 | b as u32;
         let mut slot = (key.wrapping_mul(2_654_435_761) >> 19) as usize;
-        let found = loop {
+        let mut found = loop {
             if keys[slot] == key {
                 break Some(vals[slot]);
             }
@@ -423,6 +715,31 @@ pub(crate) fn lzw_encode(indices: &[u8], min_code: u8) -> Vec<u8> {
             }
             slot = (slot + 1) & (SLOTS - 1);
         };
+        if found.is_none()
+            && let Some(f) = subst.as_mut()
+        {
+            cand.clear();
+            f(k, &mut cand);
+            for &c in &cand {
+                let ck = prefix << 8 | c as u32;
+                let mut s = (ck.wrapping_mul(2_654_435_761) >> 19) as usize;
+                let hit = loop {
+                    if keys[s] == ck {
+                        break Some(vals[s]);
+                    }
+                    if keys[s] == EMPTY {
+                        break None;
+                    }
+                    s = (s + 1) & (SLOTS - 1);
+                };
+                if hit.is_some() {
+                    found = hit;
+                    b = c;
+                    indices[k] = c;
+                    break;
+                }
+            }
+        }
         if let Some(code) = found {
             prefix = code as u32;
             continue;

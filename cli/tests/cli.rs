@@ -198,6 +198,8 @@ fn in_place_refuses_a_hard_linked_file() {
     assert_eq!(fs::read(&b).unwrap(), fixture("rgb8.png"));
 }
 
+// Windows forbids control characters in file names, so such a file cannot even be created there.
+#[cfg(unix)]
 #[test]
 fn control_characters_in_file_names_are_not_printed_raw() {
     let d = tempdir().unwrap();

@@ -31,7 +31,7 @@ A fast command-line image compressor for **PNG**, **JPEG**, **WebP**, **AVIF** a
 | GIF kept as GIF | gifsicle | −0.9% vs −4.5%; `--lossy` −5% vs `--lossy=80` −32% |
 | GIF → WebP | gif2webp | Lossless −23% vs +10% (better); lossy ~4% larger |
 
-**Where it is weaker, plainly:** lossy WebP, AVIF and GIF `--lossy` are behind the dedicated encoders, and the AVIF encoder is far slower than libaom's fast presets. The PNG, WebP, AVIF and GIF rows come from the project's benchmark run and were not re-run when the JPEG encoder was retuned; the JPEG row was re-measured with `tools/bench_jpeg.py` on a small corpus of smooth desktop images, so re-run it on your own photos (it takes any folder via `--src`).
+**Where it is weaker, plainly:** lossy WebP and AVIF are behind the dedicated encoders (and GIF `--lossy` was in the benchmark run behind the table; it has since been reworked, see the GIF note under *Head-to-head*), and the AVIF encoder is far slower than libaom's fast presets. The PNG, WebP, AVIF and GIF rows come from the project's benchmark run and were not re-run when the JPEG encoder was retuned; the JPEG row was re-measured with `tools/bench_jpeg.py` on a small corpus of smooth desktop images, so re-run it on your own photos (it takes any folder via `--src`).
 
 ## Install
 
@@ -112,7 +112,7 @@ cat in.png | rc - > out.png  # stdin to stdout
 **Quality targets** — `--target-ssim`, `--target-psnr`, `--target-ms-ssim` and `--target-size` are no longer JPEG-only: for lossy WebP, AVIF and `--lossy` PNG they bisect the cheapest quality (or palette size for PNG) that still meets the goal, and the report note shows what was chosen. JPEG still takes `--target-ssim` only.
 
 **Other formats**
-- **GIF** reads and writes still and animated files (palettes, interlacing, transparency, disposal). A GIF kept as a GIF is re-coded without changing a pixel when every frame fits a palette: frames that share one palette use a single global table, while frames whose palettes differ get a local color table each, still with each frame stored as the rectangle that changed and unchanged pixels transparent; the original is kept when that is not smaller. A GIF whose frames need more colors than 255 in a single frame (leaving room for the transparency/unchanged entry) would have to be re-quantized, so it is left unchanged unless `--lossy` (or `--resize`) is given. Converting *to* GIF (`-f gif`, from any format) quantizes to `--colors` entries (default 256) with one palette for the whole animation, no dithering for animations (the noise would change from frame to frame) and `--dither` for stills; GIF transparency is on/off, so pixels below 50% alpha become transparent.
+- **GIF** reads and writes still and animated files (palettes, interlacing, transparency, disposal). A GIF kept as a GIF is re-coded without changing a pixel when every frame fits a palette: frames that share one palette use a single global table, while frames whose palettes differ get a local color table each, still with each frame stored as the rectangle that changed and unchanged pixels transparent; the original is kept when that is not smaller. A local table holds only the colors of the rectangle its frame actually draws, so a frame may use all 256 colors across its canvas and still be coded exactly when what it changes is small, and its LZW codes get narrower. A GIF whose changed rectangle needs more colors than fit (leaving room for the transparency/unchanged entry) would have to be re-quantized, so it is left unchanged unless `--lossy` (or `--resize`) is given. **Lossy GIF** (`--gif-lossy N`, 0-200 on gifsicle's `--lossy` scale; `--lossy` alone means 80): a pixel within the budget of what the previous frame already shows is left unchanged, and while the LZW coder runs a pixel may take a nearby palette color (or "unchanged") when that lets it extend a dictionary match. Every pixel stays within a color distance (RGB vector length) of 0.4 x N of its source color, a substitution is what the next frame is compared with so errors do not accumulate, and level 0 is exact. It applies to animations that are coded exactly otherwise, with a shared palette or with per-frame ones. Converting *to* GIF (`-f gif`, from any format) quantizes to `--colors` entries (default 256) with one palette for the whole animation, no dithering for animations (the noise would change from frame to frame) and `--dither` for stills; GIF transparency is on/off, so pixels below 50% alpha become transparent.
 - CMYK and YCCK JPEGs stay four-channel and are re-quantized in the DCT domain like any other JPEG (never to a finer table than the source had, so a source at or below `-q` is transcoded losslessly with identical coefficients; the Adobe colour flag is kept). All four channels of plain CMYK use the luma table, since each is an ink amount; in YCCK, Y and K use it and the two colour-difference channels use the chroma table. Converting or resizing them goes through RGB.
 - Animated PNGs kept as PNG are passed through unchanged instead of failing the batch; other animated inputs become an animated PNG with `-f png` (APNG: lossless RGB/RGBA full-canvas frames, `--lossy` quantizes them, `--keep-hidden-pixels` preserves invisible colours).
 - **Animations** — animated GIF, APNG, animated WebP and animated AVIF inputs convert to an animated **PNG/APNG**, **AVIF**, **WebP** or **GIF** (`-f png|avif|webp|gif`; `--lossy` re-encodes an animated WebP or AVIF input). Frames keep the files' disposal and blend rules, per-frame durations and looping (a finite repeat count is played forever). **PNG/APNG**: every frame is stored as a complete canvas, so there are no dirty rectangles yet. **AVIF**: alpha as a second track, the first frame a key frame and the others inter frames predicted from the previous output (a key frame instead where that is smaller, e.g. at scene changes); on camera-pan style content 6–8 times smaller than key frames at the same PSNR; decodes in libavif and dav1d. **WebP**: lossless by default, lossy VP8 frames with `--lossy`; after the first frame only the changed rectangle is stored, and each lossless frame is tried both replacing the canvas and blended over it with the unchanged pixels transparent, keeping the smaller (lossy frames are measured against the canvas as a decoder reconstructs it, so errors do not build up). Decodes in libwebp (Pillow), pixel for pixel in the lossless case. **GIF**: see above.
@@ -142,9 +142,10 @@ rc [OPTIONS] <INPUT>...
       --subsampling <S>   auto | 444 | 422 | 420
       --arithmetic <A>    JPEG output coding: auto (keep the source's) | on | off
       --bit-depth <D>     AVIF output: auto | 8 | 10 (auto: 10 for 16-bit sources)
-      --lossy             PNG palette quantization, lossy WebP with -f webp (animations too), re-encode an AVIF or animated WebP input, a lossless JPEG as lossy JPEG, or re-quantize a GIF that cannot be represented exactly (-q = quality)
+      --lossy             PNG palette quantization, lossy WebP with -f webp (animations too), re-encode an AVIF or animated WebP input, a lossless JPEG as lossy JPEG, re-quantize a GIF that cannot be represented exactly, or code a GIF lossily (level 80, see --gif-lossy) (-q = quality)
       --colors <2-256>    with --lossy (default 256)
       --dither <0.0-1.0>  with --lossy (default 0.5)
+      --gif-lossy <0-200> GIF output: lossiness on gifsicle's --lossy scale (default 0; 80 with --lossy)
   -l, --level <0-9>       PNG / WebP effort (default 7; PNG: 1-6 fast, 7-9 optimal parsing, 9 slowest)
       --no-trellis        JPEG: skip rate-distortion quantization (faster, larger)
       --target-ssim <S>   smallest quality with SSIM >= S (0-1; 0.95 small, 0.97 good, 0.99 near-lossless)
@@ -187,7 +188,9 @@ Results of the project's current benchmark against the established tools; **PNG,
 
 Two measurements from earlier runs that the table above does not repeat: `-l 6` PNG is about 11% larger than `oxipng -o2` in total at a fraction of the CPU (the fast levels use hash-chain LZ77 only), and PNGs with hidden transparent pixels can be orders of magnitude smaller than what tools that keep the invisible RGB (oxipng by default) produce: 580 KB → 4 KB on a noisy-under-alpha test image.
 
-So PNG is the strong area, JPEG is at parity with mozjpeg on perceptual quality (on the small test corpus above), and lossy WebP, AVIF and GIF `--lossy` are still behind, with AVIF also much slower. Against weaker baselines it is far ahead (e.g. 14-28% smaller than PIL's `optimize=True` PNGs).
+**GIF, re-measured after the table above was produced.** The GIF encoder changed after that benchmark run (compact per-frame palettes and lossy coding), so the two GIF rows are from before. With `tools/bench_gif.py` against gifsicle 1.96 (`-O3 --lossy`) on **four synthetic animations that I generated** (a camera pan over a photo, a sprite over a photo, a typing UI and an ffmpeg test pattern; quality is the mean SSIMULACRA2 of 8 sampled frames against the input GIF): lossless re-coding of a GIF whose frames each carry their own palette went from "left unchanged" to −49% (211 KB → 108 KB, pixel-exact, +0.7% vs gifsicle `-O3`); at equal quality rc was 10-32% smaller on the pan, 34-80% smaller on the sprite, 2.7% smaller on the UI animation and 0.7-2.9% larger on the test pattern; lossless output is still about 4-6% above gifsicle `-O3` on the UI animation and the test pattern. The big wins come from animations whose frames are dithered independently, where near-identical pixels become "unchanged"; four synthetic files is a very small sample, and the real-world corpus behind the table has not been re-run.
+
+So PNG is the strong area, JPEG is at parity with mozjpeg on perceptual quality (on the small test corpus above), and lossy WebP and AVIF are still behind, with AVIF also much slower. GIF has improved since the benchmark run (see the note above). Against weaker baselines it is far ahead (e.g. 14-28% smaller than PIL's `optimize=True` PNGs).
 
 What it offers beyond ratio: no C dependencies, one binary for all of these formats, a coefficient-domain JPEG pipeline, pipe support, and parallel batch processing.
 
@@ -197,21 +200,30 @@ What it offers beyond ratio: no C dependencies, one binary for all of these form
 
 ### Benchmarking
 
-`tools/bench_jpeg.py` compares `rc`'s size against another encoder at equal SSIMULACRA2 on any images you give it, for lossy JPEG, WebP or AVIF, on Linux, macOS and Windows:
+One script per format in `tools/`, sharing `tools/benchlib.py`. Each compares `rc` with an established encoder on images you provide, on Linux, macOS and Windows:
+
+| Script | Compares `rc` against | Measures |
+|---|---|---|
+| `bench_png.py` | oxipng through `pyoxipng` (`--ref-levels 2,4`; 7 = `-o max -Z`), or any command | sizes and time per file with a pixel-exactness check; `--lossy` compares palette sizes at equal SSIMULACRA2 (needs `--ref-cmd`, e.g. pngquant, which no pip package bundles) |
+| `bench_jpeg.py` | mozjpeg 4.0.3 through `jpeglib`, or any command | size at equal SSIMULACRA2 |
+| `bench_webp.py` | libwebp method 6 through Pillow, or any command | size at equal SSIMULACRA2; `--lossless` compares bytes (both pixel-exact) |
+| `bench_avif.py` | libavif through Pillow (`--ref-speed`, default 6), or any command | size at equal SSIMULACRA2 |
+| `bench_gif.py` | gifsicle `-O3 --lossy` through `gifsicle-bin`, or any command | size at equal mean-frame SSIMULACRA2 over a lossiness sweep |
 
 ```
-python3 -m venv env && env/bin/pip install numpy pillow ssimulacra2 jpeglib
+python3 -m venv env
+env/bin/pip install numpy pillow ssimulacra2 jpeglib pyoxipng gifsicle-bin   # install what you need
 cargo build --release -p rust-compress
 env/bin/python tools/bench_jpeg.py /tmp/bench --src ~/Pictures/photos [--src another/dir] [--limit 0] [--size 0]
+env/bin/python tools/bench_png.py  /tmp/bench --src ~/Pictures/screenshots --ref-levels 2,4 --level 9
 ```
 
-- **Inputs:** `--src` takes image files or directories (repeatable, or `RC_BENCH_SRC` with `os.pathsep`-separated paths); `--limit N` caps the image count (default 12, 0 = all); `--size PX` downscales the longer side (0 keeps full size). Use pristine photographs: inputs are re-saved as lossless PNG first, so already heavily compressed JPEGs bring their artifacts into both encoders.
-- **Format:** `--format jpeg|webp|avif` (default `jpeg`; `webp` is lossy WebP); `--subsampling 420|444` for JPEG.
-- **Reference encoder:** JPEG compares against mozjpeg 4.0.3 through `jpeglib` by default. For anything else pass `--ref-cmd` with `{in}`, `{out}` and `{q}` placeholders, e.g. `--ref-cmd 'cwebp -q {q} {in} -o {out}' --format webp`, or `--ref-cmd 'avifenc -q {q} {in} {out}' --format avif --ref-qs 10,20,30,40,50,60` when the reference's quality scale differs from `rc`'s. Its results are cached per command.
-- **Sweep:** `--qs` (rc's quality settings) and `--targets` (SSIMULACRA2 scores to compare at); `--rc PATH` picks the binary; `--rc-arg` passes extra options to `rc`; `--keep-icc` stops stripping ICC profiles from `rc`'s output (stripped by default so profile bytes do not count against it).
-- **Output:** each file's size difference at every score, then the mean and the worst file; positive means `rc` is larger. Both encoders' outputs are decoded with Pillow for scoring, so the format must be readable by your Pillow (AVIF needs Pillow 11.3+ or `pillow-avif-plugin`).
+- **Inputs:** `--src` takes files or directories (repeatable, or `RC_BENCH_SRC` with `os.pathsep`-separated paths); `--limit N` caps the count; `--size PX` downscales the longer side (0 keeps full size). The quality benchmarks re-save inputs as lossless PNG first, so use pristine photographs; `bench_png.py` and `bench_gif.py` use your files as they are.
+- **Reference encoder:** every script takes `--ref-cmd` with `{in}`, `{out}` and the quality placeholder (`{q}`, `{c}` for PNG palette size, `{l}` for GIF lossiness) to compare against any command line, e.g. `--ref-cmd 'cwebp -q {q} -m 6 {in} -o {out}'`, and `--ref-qs` when the reference's quality scale differs from `rc`'s. Reference results are cached per command.
+- **Sweep:** `--qs` (rc's settings) and `--targets` (SSIMULACRA2 scores to compare at); `--rc PATH` picks the binary; `--rc-arg` passes extra options to `rc`.
+- **Output:** each file's size difference at every score, then the mean and the worst file; positive means `rc` is larger. A file counts in a score row only if both sweeps reach that score. Outputs are decoded with Pillow for scoring, so your Pillow must read the format (AVIF needs Pillow 11.3+ or `pillow-avif-plugin`).
 
-Only the JPEG path against mozjpeg is used for the README's *Lossy JPEG* row; the WebP and AVIF paths exist so the other gaps can be measured the same way (a three-image check of lossy WebP against libwebp method 6 through this script gave +4.6% to +7.3% mean, in line with the table above, but that sample is far too small to quote).
+The *Lossy JPEG* row and the GIF note above come from these scripts; the PNG, WebP and AVIF rows come from the project's earlier benchmark run. A three-image check of lossy WebP against libwebp method 6 with `bench_webp.py` gave +3% to +9% mean size (worst file +22%), in line with the table, but that sample is far too small to quote.
 
 ## Build
 
@@ -226,7 +238,7 @@ Requires a stable Rust toolchain (edition 2024); `rust-toolchain.toml` pins `sta
 ## Layout
 
 ```
-tools/      `crosscheck.py` (decoder cross-checks) and `bench_jpeg.py` (size at equal SSIMULACRA2 against another encoder: JPEG, WebP, AVIF)
+tools/      `crosscheck.py` (decoder cross-checks) and the benchmarks `bench_png.py`, `bench_jpeg.py`, `bench_webp.py`, `bench_avif.py`, `bench_gif.py` (shared code in `benchlib.py`)
 core/       shared types and utilities (rc-core): image and animation types, errors, bit I/O, CRC-32 / Adler-32, canonical Huffman, EXIF editing, Lanczos-3 downscaling, SSIM/PSNR/MS-SSIM, color quantizer
 deflate/    inflate, LZ77 matchers (hash chains; binary tree for levels 7-9), block encoder, optimal parser (levels 7-9)
 png/        decoder (all color types/depths, Adam7, APNG), filters, encoder (reduction + strategy search, APNG writer)

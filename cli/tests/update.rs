@@ -85,8 +85,29 @@ fn installed_copy(dir: &Path) -> PathBuf {
     copy
 }
 
+/// Run a command built by `make`, retrying while the OS refuses to execute a binary that was just written
+/// (`ETXTBSY`, "Text file busy"). Tests run in parallel: while one thread copies the binary, another thread's
+/// `fork` can briefly hold that open write handle in its child, and `exec` of the fresh copy then fails. It clears
+/// as soon as the child has exec'd or exited.
+fn output_retrying(make: impl Fn() -> Command) -> Output {
+    for attempt in 0.. {
+        match make().output() {
+            Ok(out) => return out,
+            Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy && attempt < 100 => {
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+            Err(e) => panic!("could not run the test binary: {e}"),
+        }
+    }
+    unreachable!()
+}
+
 fn run_update(rc: &Path, base: &str, args: &[&str]) -> Output {
-    Command::new(rc).arg("update").args(args).env("RC_UPDATE_BASE_URL", base).output().unwrap()
+    output_retrying(|| {
+        let mut c = Command::new(rc);
+        c.arg("update").args(args).env("RC_UPDATE_BASE_URL", base);
+        c
+    })
 }
 
 fn text(b: &[u8]) -> String {
@@ -117,7 +138,11 @@ fn replaces_the_binary_and_shows_both_versions() {
     assert!(stdout.contains(&format!("Updating rc {CURRENT} -> 9.9.9")), "{stdout}");
     assert!(stdout.contains("Checksum verified."), "{stdout}");
 
-    let after = Command::new(&rc).arg("--version").output().unwrap();
+    let after = output_retrying(|| {
+        let mut c = Command::new(&rc);
+        c.arg("--version");
+        c
+    });
     assert_eq!(text(&after.stdout).trim(), "rc 9.9.9");
     assert!(leftovers(&bin_dir).is_empty(), "{:?}", leftovers(&bin_dir));
 }

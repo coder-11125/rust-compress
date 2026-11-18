@@ -145,7 +145,10 @@ fn a_still_with_many_colors_is_quantized_and_stays_close() {
         .collect();
     let a = anim(vec![(px.clone(), 100)], ColorType::Rgb, false);
     assert!(!palette_is_exact(&a, 256));
-    let back = decode_animation(&encode_animation(&a, &EncodeOptions { colors: 64, dither: 0.5 }).unwrap()).unwrap();
+    let back = decode_animation(
+        &encode_animation(&a, &EncodeOptions { colors: 64, dither: 0.5, ..Default::default() }).unwrap(),
+    )
+    .unwrap();
     let got = to_rgba(&back.frames[0].image);
     let colors: std::collections::HashSet<_> = got.iter().collect();
     assert!(colors.len() <= 64, "{} colors", colors.len());
@@ -173,7 +176,10 @@ fn a_many_color_animation_is_quantized_to_one_palette() {
         .collect();
     let a = anim(frames, ColorType::Rgb, true);
     assert!(!palette_is_exact(&a, 256));
-    let back = decode_animation(&encode_animation(&a, &EncodeOptions { colors: 32, dither: 0.5 }).unwrap()).unwrap();
+    let back = decode_animation(
+        &encode_animation(&a, &EncodeOptions { colors: 32, dither: 0.5, ..Default::default() }).unwrap(),
+    )
+    .unwrap();
     let mut all = std::collections::HashSet::new();
     for f in &back.frames {
         all.extend(to_rgba(&f.image));
@@ -261,4 +267,120 @@ fn rejects_what_a_gif_cannot_hold() {
     assert!(encode_animation(&empty, &EncodeOptions::default()).is_err());
     let huge = Animation { width: 70_000, height: 2, frames: vec![], loop_forever: false };
     assert!(encode_animation(&huge, &EncodeOptions::default()).is_err());
+}
+
+/// A smooth ramp with small time-varying noise (about 180 distinct colours, so one shared palette holds them) and a
+/// moving square: the kind of picture lossy GIF coding is for.
+fn noisy_frames(n: usize) -> Vec<(Vec<[u8; 4]>, u32)> {
+    (0..n)
+        .map(|t| {
+            let px = (0..W * H)
+                .map(|p| {
+                    let (x, y) = (p % W, p / W);
+                    let noise = ((x * 7 + y * 13 + t * 5) % 3) as u8 * 2;
+                    if (3 + 2 * t..11 + 2 * t).contains(&x) && (5..13).contains(&y) {
+                        [250, 20, 20, 255]
+                    } else {
+                        [((x * 3 + y * 2) % 60 * 4) as u8, 80 + noise, 120, 255]
+                    }
+                })
+                .collect();
+            (px, 60)
+        })
+        .collect()
+}
+
+fn dist2(a: [u8; 4], b: [u8; 4]) -> i32 {
+    (0..3).map(|c| (a[c] as i32 - b[c] as i32).pow(2)).sum()
+}
+
+#[test]
+fn lossy_gif_is_smaller_and_every_pixel_stays_within_the_budget() {
+    let a = anim(noisy_frames(8), ColorType::Rgb, true);
+    assert!(palette_is_exact(&a, 256), "the test picture must fit one palette so the source is the quantized frame");
+    let exact = encode_animation(&a, &EncodeOptions::default()).unwrap();
+    let lossy = encode_animation(&a, &EncodeOptions { lossy: 60, ..Default::default() }).unwrap();
+    assert!(lossy.len() < exact.len(), "lossy {} !< exact {}", lossy.len(), exact.len());
+    let budget = (60.0f32 * 0.4).powi(2) as i32;
+    let back = decode_animation(&lossy).unwrap();
+    assert_eq!(back.frames.len(), 8);
+    let mut changed = 0;
+    for (got, want) in back.frames.iter().zip(&a.frames) {
+        for (g, w) in to_rgba(&got.image).into_iter().zip(to_rgba(&want.image)) {
+            let d = dist2(g, w);
+            assert!(d <= budget, "pixel {g:?} vs {w:?}: distance^2 {d} > {budget}");
+            changed += (d > 0) as usize;
+        }
+    }
+    assert!(changed > 0, "a lossy level of 60 should have altered something");
+    // Level 0 is exact.
+    let zero =
+        decode_animation(&encode_animation(&a, &EncodeOptions { lossy: 0, ..Default::default() }).unwrap()).unwrap();
+    for (got, want) in zero.frames.iter().zip(&a.frames) {
+        same_picture(&got.image, &want.image);
+    }
+}
+
+#[test]
+fn more_lossiness_never_makes_the_file_larger() {
+    let a = anim(noisy_frames(8), ColorType::Rgb, true);
+    let size = |l: u32| encode_animation(&a, &EncodeOptions { lossy: l, ..Default::default() }).unwrap().len();
+    let (s0, s40, s120) = (size(0), size(40), size(120));
+    assert!(s40 <= s0 && s120 <= s40, "{s0} {s40} {s120}");
+}
+
+/// Every frame uses all 256 colours of a ramp, so no frame has a spare entry for transparency, yet each frame after the
+/// first changes only a small block: its table needs just the few colours of that block.
+#[test]
+fn full_palette_frames_with_small_changes_get_compact_local_tables() {
+    let ramp = |p: usize| {
+        let v = ((p / 3) % 256) as u8;
+        [v, 255 - v, v / 2, 255]
+    };
+    let frames: Vec<_> = (0..4)
+        .map(|t| {
+            let px: Vec<[u8; 4]> = (0..W * H)
+                .map(|p| {
+                    let (x, y) = (p % W, p / W);
+                    if t > 0 && (4 * t..4 * t + 4).contains(&x) && (4..8).contains(&y) {
+                        [255, 255, 255, 255]
+                    } else {
+                        ramp(p)
+                    }
+                })
+                .collect();
+            (px, 50)
+        })
+        .collect();
+    let a = anim(frames.clone(), ColorType::Rgb, true);
+    assert!(palette_is_exact(&a, 256), "frames whose changes are small must be accepted exactly");
+    let bytes = encode_animation(&a, &EncodeOptions::default()).unwrap();
+    let back = decode_animation(&bytes).unwrap();
+    for (got, want) in back.frames.iter().zip(&a.frames) {
+        same_picture(&got.image, &want.image);
+    }
+    let first_only =
+        encode_animation(&anim(frames[..1].to_vec(), ColorType::Rgb, true), &EncodeOptions::default()).unwrap();
+    assert!(bytes.len() < first_only.len() + 300, "{} vs first frame alone {}", bytes.len(), first_only.len());
+}
+
+#[test]
+fn lossy_applies_to_frames_with_their_own_palettes_too() {
+    let a = anim(disjoint_palette_frames(), ColorType::Rgb, true);
+    assert!(palette_is_exact(&a, 256));
+    let exact = encode_animation(&a, &EncodeOptions::default()).unwrap();
+    let lossy = encode_animation(&a, &EncodeOptions { lossy: 60, ..Default::default() }).unwrap();
+    assert!(lossy.len() < exact.len(), "lossy {} !< exact {}", lossy.len(), exact.len());
+    assert_eq!(local_table_count(&lossy), 2, "still one local table per frame");
+    let budget = (60.0f32 * 0.4).powi(2) as i32;
+    let back = decode_animation(&lossy).unwrap();
+    let mut changed = 0;
+    for (got, want) in back.frames.iter().zip(&a.frames) {
+        for (g, w) in to_rgba(&got.image).into_iter().zip(to_rgba(&want.image)) {
+            let d = dist2(g, w);
+            assert!(d <= budget, "pixel {g:?} vs {w:?}: distance^2 {d} > {budget}");
+            changed += (d > 0) as usize;
+        }
+    }
+    assert!(changed > 0);
 }

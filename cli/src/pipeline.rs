@@ -731,7 +731,11 @@ fn decode_animation(data: &[u8], fmt: Format) -> Result<Option<Animation>> {
 }
 
 fn gif_options(cli: &Cli) -> gif::EncodeOptions {
-    gif::EncodeOptions { colors: cli.colors as usize, dither: cli.dither }
+    gif::EncodeOptions {
+        colors: cli.colors as usize,
+        dither: cli.dither,
+        lossy: cli.gif_lossy.unwrap_or(if cli.lossy { 80 } else { 0 }),
+    }
 }
 
 /// Encode an animation as an animated AVIF, WebP or GIF, resizing every frame when asked. `None` means the

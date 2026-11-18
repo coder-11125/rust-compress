@@ -136,6 +136,10 @@ pub struct Cli {
     #[arg(long, default_value_t = 256, value_parser = clap::value_parser!(u16).range(2..=256))]
     pub colors: u16,
 
+    /// GIF output: lossiness 0-200 on gifsicle's `--lossy` scale: pixels may change to a nearby palette colour (or stay as in the previous frame) when that shrinks the LZW stream. Default 0, or 80 with --lossy. Not applied to animations that need a separate palette per frame.
+    #[arg(long, value_parser = clap::value_parser!(u32).range(0..=200))]
+    pub gif_lossy: Option<u32>,
+
     /// With --lossy on PNG, and for still GIF output: dithering strength 0.0-1.0 (0 disables). Animated GIFs are never dithered.
     #[arg(long, default_value_t = 0.5, value_parser = parse_dither)]
     pub dither: f32,

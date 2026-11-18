@@ -1,3 +1,5 @@
 /target
 /fuzz/target
 *.omc
+__pycache__/
+*.pyc
