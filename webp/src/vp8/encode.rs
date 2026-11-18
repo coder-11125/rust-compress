@@ -36,6 +36,12 @@ pub struct Planes<'a> {
 
 const QFIX: u32 = 17;
 const MAX_LEVEL: u64 = 2047;
+/// Loop-filter sharpness written to the header. The filter is tuned for SSIMULACRA2, which dislikes
+/// the blur of the MSE-optimal strength, so the interior limit is capped hard.
+const SHARPNESS: i32 = 6;
+/// The MSE-optimal loop-filter level is scaled by this before use (measured: the metric prefers a
+/// weaker filter than the one that minimises squared error).
+const FILTER_SCALE: f32 = 0.5;
 /// The first partition's size field has 19 bits.
 const MAX_FIRST_PARTITION: usize = (1 << 19) - 1;
 
@@ -211,7 +217,7 @@ impl Enc {
         let (ys, cs) = (mbw * 16, mbw * 8);
         let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
         let base_q = quality_to_q(opts.quality);
-        let dq_uv_dc = -2;
+        let dq_uv_dc = -4;
         let dq = dequant_for(base_q, 0, 0, 0, dq_uv_dc, 0);
         let m_y1 = Matrix::new(dq.y1, [96, 110]);
         let m_y2 = Matrix::new(dq.y2, [96, 108]);
@@ -246,7 +252,7 @@ impl Enc {
             m_y2,
             m_uv,
             lambda: 0.0234 * q * q,
-            lambda_uv: 0.047 * (dq.uv[1] as f32).powi(2),
+            lambda_uv: 0.01 * (dq.uv[1] as f32).powi(2),
             bmode_cost,
             ymode_cost: std::array::from_fn(|m| tree_bits(&KF_YMODE_TREE, &KF_YMODE_PROBS, m as u8)),
             uvmode_cost: std::array::from_fn(|m| tree_bits(&UV_MODE_TREE, &KF_UV_MODE_PROBS, m as u8)),
@@ -557,9 +563,15 @@ impl Enc {
         if level <= 0 {
             return FilterInfo::default();
         }
+        let mut ilevel = level;
+        if SHARPNESS > 0 {
+            ilevel >>= if SHARPNESS > 4 { 2 } else { 1 };
+            ilevel = ilevel.min(9 - SHARPNESS);
+        }
+        let ilevel = ilevel.max(1);
         FilterInfo {
-            limit: (3 * level) as u8,
-            ilevel: level as u8,
+            limit: (2 * level + ilevel) as u8,
+            ilevel: ilevel as u8,
             hev_thresh: if level >= 40 {
                 2
             } else if level >= 15 {
@@ -636,7 +648,7 @@ impl Enc {
                 }
             }
         }
-        best.1
+        ((best.1 as f32 * FILTER_SCALE).round() as i32).clamp(0, 63)
     }
 }
 
@@ -712,7 +724,7 @@ pub fn encode_frame(src: &Planes, opts: Options) -> Result<Encoded> {
     p1.flag(false); // no segmentation
     p1.flag(false); // normal loop filter
     p1.literal(filter_level as u32, 6);
-    p1.literal(0, 3); // sharpness
+    p1.literal(SHARPNESS as u32, 3);
     p1.flag(false); // no loop-filter deltas
     p1.literal(0, 2); // one token partition
     p1.literal(enc.base_q as u32, 7);
