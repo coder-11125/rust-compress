@@ -382,7 +382,7 @@ fn jpeg_to_jpeg(data: &[u8], cli: &Cli) -> Result<Encoded> {
 }
 
 fn png_opts(cli: &Cli) -> png::encode::EncodeOptions {
-    png::encode::EncodeOptions { level: cli.level as u32, clean_alpha: !cli.keep_hidden_pixels }
+    png::encode::EncodeOptions { level: cli.effort(7) as u32, clean_alpha: !cli.keep_hidden_pixels }
 }
 
 fn avif_opts(cli: &Cli, quality: u8, depth: u8) -> avif::encode::EncodeOptions {
@@ -396,7 +396,7 @@ fn avif_opts(cli: &Cli, quality: u8, depth: u8) -> avif::encode::EncodeOptions {
         BitDepthArg::Auto | BitDepthArg::B8 => 8,
         BitDepthArg::B10 => 10,
     };
-    avif::encode::EncodeOptions { quality, full_chroma, effort: cli.level, bit_depth }
+    avif::encode::EncodeOptions { quality, full_chroma, effort: cli.effort(7), bit_depth }
 }
 
 fn encode(img: &Image, fmt: Format, cli: &Cli) -> Result<Encoded> {
@@ -442,7 +442,7 @@ fn encode(img: &Image, fmt: Format, cli: &Cli) -> Result<Encoded> {
         }
         Format::Webp => {
             if cli.lossy {
-                let level = cli.level as u32;
+                let level = cli.effort(7) as u32;
                 let clean = !cli.keep_hidden_pixels;
                 if let Some(t) = target(cli) {
                     if let Target::Size(limit) = t {
@@ -479,7 +479,10 @@ fn encode(img: &Image, fmt: Format, cli: &Cli) -> Result<Encoded> {
                     webp::MAX_DIMENSION
                 )));
             }
-            let opts = webp::EncodeOptions { level: cli.level as u32, clean_alpha: !cli.keep_hidden_pixels };
+            let opts = webp::EncodeOptions {
+                level: cli.effort(WEBP_LOSSLESS_DEFAULT_LEVEL) as u32,
+                clean_alpha: !cli.keep_hidden_pixels,
+            };
             let mut encoded: Encoded = webp::encode(img, &opts).into();
             if img.depth == 16 {
                 encoded.note = Some("16-bit reduced to 8-bit".into());
@@ -730,6 +733,10 @@ fn decode_animation(data: &[u8], fmt: Format) -> Result<Option<Animation>> {
     Ok(anim.filter(|a| a.frames.len() > 1))
 }
 
+/// Default effort for lossless WebP. Level 5 is as small as 7 for about half the time on the images measured, and 6 is
+/// larger than both; see tools/bench_webp.py --lossless.
+const WEBP_LOSSLESS_DEFAULT_LEVEL: u8 = 5;
+
 fn gif_options(cli: &Cli) -> gif::EncodeOptions {
     gif::EncodeOptions {
         colors: cli.colors as usize,
@@ -761,14 +768,15 @@ fn animation_to(mut anim: Animation, in_fmt: Format, out_fmt: Format, cli: &Cli)
                 SubsamplingArg::S422 | SubsamplingArg::S420 => false,
             };
             let bit_depth = if cli.bit_depth == BitDepthArg::B10 { 10 } else { 8 };
-            let opts = avif::encode::EncodeOptions { quality: cli.quality, full_chroma, effort: cli.level, bit_depth };
+            let opts =
+                avif::encode::EncodeOptions { quality: cli.quality, full_chroma, effort: cli.effort(7), bit_depth };
             let mut e: Encoded = avif::encode::encode_animation(&anim, &opts)?.into();
             e.forced = true;
             e
         }
         Format::Webp => {
             let opts = webp::AnimOptions {
-                level: cli.level as u32,
+                level: cli.effort(if cli.lossy { 7 } else { WEBP_LOSSLESS_DEFAULT_LEVEL }) as u32,
                 clean_alpha: !cli.keep_hidden_pixels,
                 lossy_quality: cli.lossy.then_some(cli.quality),
             };
@@ -780,7 +788,7 @@ fn animation_to(mut anim: Animation, in_fmt: Format, out_fmt: Format, cli: &Cli)
                     f.image = png::quant::quantize(&f.image, cli.colors as usize, 0.0);
                 }
             }
-            let opts = png::encode::EncodeOptions { level: cli.level as u32, clean_alpha: !cli.keep_hidden_pixels };
+            let opts = png::encode::EncodeOptions { level: cli.effort(7) as u32, clean_alpha: !cli.keep_hidden_pixels };
             png::apng::encode_animation(&anim, &opts)?.into()
         }
         Format::Gif => {

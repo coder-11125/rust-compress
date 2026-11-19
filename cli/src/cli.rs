@@ -145,9 +145,10 @@ pub struct Cli {
     pub dither: f32,
 
     /// PNG / WebP / AVIF effort (0-9). For PNG, 1-6 use greedy/lazy parsing (6 is fast) and 7-9 optimal parsing
-    /// (7 default, 9 smallest and slowest).
-    #[arg(short, long, default_value_t = 7, value_parser = clap::value_parser!(u8).range(0..=9))]
-    pub level: u8,
+    /// (7 default, 9 smallest and slowest). Lossless WebP defaults to 5: it is as small as 7 for about half the
+    /// time (0-4 are faster still, a little larger; 6 is larger than 5 and slower, so there is no reason to pick it).
+    #[arg(short, long, value_parser = clap::value_parser!(u8).range(0..=9))]
+    pub level: Option<u8>,
 
     /// Pick the lowest quality whose result still scores at least this SSIM (0-1, e.g. 0.97)
     /// against the original, instead of a fixed -q. Works for JPEG, and for lossy WebP, AVIF and
@@ -271,4 +272,11 @@ fn parse_suffix(s: &str) -> Result<String, String> {
         return Err("suffix must be a non-empty file-name component".into());
     }
     Ok(s.to_string())
+}
+
+impl Cli {
+    /// The effort level: `-l` if given, otherwise `default` (7 everywhere except lossless WebP, which is 5).
+    pub fn effort(&self, default: u8) -> u8 {
+        self.level.unwrap_or(default)
+    }
 }
