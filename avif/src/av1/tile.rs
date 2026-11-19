@@ -322,6 +322,8 @@ pub struct TileCoder<'a, C: Coder> {
     pub pre_coefs: std::collections::VecDeque<StoredCoefs>,
     pub an_dist: f64,
     pub an_bits: u64,
+    /// Encoder: reusable buffers of the transform block analysis (residual, coefficients, best quantized levels).
+    pub an_scratch: [Vec<i32>; 3],
 }
 
 impl<'a, C: Coder> TileCoder<'a, C> {
@@ -391,6 +393,7 @@ impl<'a, C: Coder> TileCoder<'a, C> {
             pre_coefs: Default::default(),
             an_dist: 0.0,
             an_bits: 0,
+            an_scratch: Default::default(),
         }
         .with_planes(np)
     }
@@ -2119,17 +2122,55 @@ impl<C: Coder> TileCoder<'_, C> {
         have_bl: bool,
         mode: u8,
     ) {
+        let edges = self.intra_edges(plane, x, y, w, h, have_left, have_above, have_ar, have_bl);
+        self.predict_intra_edges(b, plane, x, y, w, h, have_left, have_above, mode, &edges);
+    }
+
+    /// The neighbouring samples of the `w` x `h` region at (`x`, `y`), for [`Self::predict_intra_edges`].
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn intra_edges(
+        &self,
+        plane: usize,
+        x: usize,
+        y: usize,
+        w: usize,
+        h: usize,
+        have_left: bool,
+        have_above: bool,
+        have_ar: bool,
+        have_bl: bool,
+    ) -> ipred::Edges {
         let (sx, sy) = self.plane_sub(plane);
         let bit_depth = self.f.seq.color.bit_depth;
         let max_x = ((self.f.mi_cols * 4) >> sx) - 1;
         let max_y = ((self.f.mi_rows * 4) >> sy) - 1;
-        let smooth_neighbor = self.filter_type(b, plane);
         let mut edges = ipred::Edges::default();
-        let pl = &mut self.f.planes[plane];
+        let pl = &self.f.planes[plane];
         ipred::build_edges(
             &pl.data, pl.stride, x, y, w, h, have_left, have_above, have_ar, have_bl, max_x, max_y, bit_depth,
             &mut edges,
         );
+        edges
+    }
+
+    /// Intra prediction of a `w` x `h` region from edges made by [`Self::intra_edges`] (the same call as
+    /// [`Self::predict_intra_wh`] with the edge construction done by the caller, so that several modes can share it).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn predict_intra_edges(
+        &mut self,
+        b: &Blk,
+        plane: usize,
+        x: usize,
+        y: usize,
+        w: usize,
+        h: usize,
+        have_left: bool,
+        have_above: bool,
+        mode: u8,
+        edges: &ipred::Edges,
+    ) {
+        let bit_depth = self.f.seq.color.bit_depth;
+        let smooth_neighbor = self.filter_type(b, plane);
         let params = ipred::IntraParams {
             mode,
             angle_delta: if plane == 0 { b.angle_y } else { b.angle_uv },
@@ -2142,8 +2183,9 @@ impl<C: Coder> TileCoder<'_, C> {
             smooth_neighbor,
             bit_depth,
         };
+        let pl = &mut self.f.planes[plane];
         let stride = pl.stride;
-        ipred::predict(&mut pl.data[y * stride + x..], stride, &edges, &params);
+        ipred::predict(&mut pl.data[y * stride + x..], stride, edges, &params);
     }
 
     pub(crate) fn predict_cfl(&mut self, b: &Blk, plane: usize, x: usize, y: usize, tx_sz: u8) {
@@ -2624,8 +2666,8 @@ pub(crate) fn code_txb<K: Coder>(k: &mut K, cdf: &mut Cdfs, s: &TxbSetup, cb: &m
 
         // Levels, in reverse scan order.
         let stride = 36usize;
-        let mut levels = vec![0u8; stride * (ch + 4)];
-        let mut quant = vec![0u32; cw * ch];
+        let mut levels_buf = [0u8; 36 * 36];
+        let levels = &mut levels_buf[..stride * (ch + 4)];
         let want_abs = |pos: usize, q: &CoefBlock| q.quant[pos].unsigned_abs();
         for c in (0..eob).rev() {
             let pos = scan[c] as usize;
@@ -2646,11 +2688,11 @@ pub(crate) fn code_txb<K: Coder>(k: &mut K, cdf: &mut Cdfs, s: &TxbSetup, cb: &m
                 let s = k.symbol(&mut cdf.coeff_base_eob[tx_sz_ctx][ptype][ctx], want_level.clamp(1, 3) - 1);
                 level = s + 1;
             } else {
-                let ctx = coeff_base_ctx(&levels, stride, tx_sz, class, row, col);
+                let ctx = coeff_base_ctx(levels, stride, tx_sz, class, row, col);
                 level = k.symbol(&mut cdf.coeff_base[tx_sz_ctx][ptype][ctx], want_level.min(3));
             }
             if level > 2 {
-                let ctx = coeff_br_ctx(&levels, stride, class, row, col, pos);
+                let ctx = coeff_br_ctx(levels, stride, class, row, col, pos);
                 let mut want_rest = want_level.saturating_sub(3);
                 for _ in 0..4 {
                     let sym = k.symbol(&mut cdf.coeff_br[tx_sz_ctx.min(3)][ptype][ctx], want_rest.min(3));
@@ -2662,14 +2704,15 @@ pub(crate) fn code_txb<K: Coder>(k: &mut K, cdf: &mut Cdfs, s: &TxbSetup, cb: &m
                 }
             }
             levels[row * stride + col] = level as u8;
-            quant[pos] = level as u32;
         }
         // Signs and Golomb-coded remainders, in scan order.
         for c in 0..eob {
             let pos = scan[c] as usize;
             let want = cb.quant[pos];
+            // The level decoded above (at most 15) sits in `levels`.
+            let mut level = u32::from(levels[(pos >> bwl) * stride + (pos & (cw - 1))]);
             let mut sign = false;
-            if quant[pos] != 0 {
+            if level != 0 {
                 if c == 0 {
                     let ctx = s.dc_sign_ctx;
                     sign = k.symbol(&mut cdf.dc_sign[ptype][ctx], (want < 0) as usize) != 0;
@@ -2677,7 +2720,7 @@ pub(crate) fn code_txb<K: Coder>(k: &mut K, cdf: &mut Cdfs, s: &TxbSetup, cb: &m
                     sign = k.literal(1, (want < 0) as u32) != 0;
                 }
             }
-            if quant[pos] > 14 {
+            if level > 14 {
                 // Golomb code for the amount above 14.
                 let value = want.unsigned_abs();
                 let x_want = value.wrapping_sub(14);
@@ -2698,14 +2741,14 @@ pub(crate) fn code_txb<K: Coder>(k: &mut K, cdf: &mut Cdfs, s: &TxbSetup, cb: &m
                     let bit = k.literal(1, (x_want >> i) & 1);
                     x = (x << 1) | bit;
                 }
-                quant[pos] = x.wrapping_add(14);
+                level = x.wrapping_add(14);
             }
-            if pos == 0 && quant[pos] > 0 {
+            if pos == 0 && level > 0 {
                 dc_category = if sign { 1 } else { 2 };
             }
-            quant[pos] &= 0xfffff;
-            cul_level = cul_level.wrapping_add(quant[pos]);
-            cb.quant[pos] = if sign { -(quant[pos] as i32) } else { quant[pos] as i32 };
+            level &= 0xfffff;
+            cul_level = cul_level.wrapping_add(level);
+            cb.quant[pos] = if sign { -(level as i32) } else { level as i32 };
         }
         cul_level = cul_level.min(63);
         cb.eob = eob;

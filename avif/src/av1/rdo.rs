@@ -181,9 +181,8 @@ impl<C: Coder> TileCoder<'_, C> {
         let mut sad = 0u64;
         for i in 0..h {
             let (rs, rc) = (&src.data[(y + i) * src.stride + x..][..w], &cur.data[(y + i) * cur.stride + x..][..w]);
-            for j in 0..w {
-                sad += (rs[j] as i64 - rc[j] as i64).unsigned_abs();
-            }
+            // At most 64 samples of at most 16 bits: the row sum fits in 32 bits.
+            sad += u64::from(rs.iter().zip(rc).map(|(&a, &b)| u32::from(a.abs_diff(b))).sum::<u32>());
         }
         sad
     }
@@ -281,10 +280,10 @@ impl<C: Coder> TileCoder<'_, C> {
         // --- Luma mode ranking by prediction error (whole block at once).
         let (txw, txh) = (TX_W[max_rect as usize] as usize, TX_H[max_rect as usize] as usize);
         let mut ranked: Vec<(u64, u8)> = Vec::with_capacity(13);
+        // The neighbouring samples do not depend on the mode (nor on what the predictions write inside the block).
+        let edges = self.intra_edges(0, x, y, txw, txh, base.avail_l, base.avail_u, false, false);
         for &mode in &MODES {
-            let mut t = base.clone();
-            t.y_mode = mode;
-            self.predict_intra_block(&t, 0, x, y, max_rect, base.avail_l, base.avail_u, false, false, mode);
+            self.predict_intra_edges(&base, 0, x, y, txw, txh, base.avail_l, base.avail_u, mode, &edges);
             ranked.push((self.sad_of(0, x, y, txw, txh), mode));
         }
         ranked.sort();
@@ -301,11 +300,11 @@ impl<C: Coder> TileCoder<'_, C> {
             if is_directional(mode) && base.bsize >= BLOCK_8X8 {
                 // Refine the angle by prediction error.
                 let mut best = (u64::MAX, 0i8);
+                let mut t = base.clone();
+                t.y_mode = mode;
                 for d in -3i8..=3 {
-                    let mut t = base.clone();
-                    t.y_mode = mode;
                     t.angle_y = d;
-                    self.predict_intra_block(&t, 0, x, y, max_rect, base.avail_l, base.avail_u, false, false, mode);
+                    self.predict_intra_edges(&t, 0, x, y, txw, txh, base.avail_l, base.avail_u, mode, &edges);
                     let sad = self.sad_of(0, x, y, txw, txh);
                     if sad < best.0 {
                         best = (sad, d);
@@ -378,20 +377,19 @@ impl<C: Coder> TileCoder<'_, C> {
             let (cx, cy) = ((blk.mi_col >> sx) * 4, (blk.mi_row >> sy) * 4);
             let (cw, ch) = (TX_W[uv_tx as usize] as usize, TX_H[uv_tx as usize] as usize);
             let mut ranked: Vec<(u64, u8)> = Vec::new();
+            let uv_edges = self.intra_edges(1, cx, cy, cw, ch, blk.avail_l_chroma, blk.avail_u_chroma, false, false);
             for &mode in &MODES {
-                let mut t = blk.clone();
-                t.uv_mode = mode;
-                self.predict_intra_block(
-                    &t,
+                self.predict_intra_edges(
+                    &blk,
                     1,
                     cx,
                     cy,
-                    uv_tx,
+                    cw,
+                    ch,
                     blk.avail_l_chroma,
                     blk.avail_u_chroma,
-                    false,
-                    false,
                     mode,
+                    &uv_edges,
                 );
                 ranked.push((self.sad_of(1, cx, cy, cw, ch), mode));
             }
