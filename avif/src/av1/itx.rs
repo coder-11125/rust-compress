@@ -609,20 +609,6 @@ static ADST16: Net = {
     Net { inp: &IN, out: &OUT, neg_odd: true, ops: &OPS }
 };
 
-fn dct_net(log2: usize) -> &'static Net {
-    match log2 {
-        2 => &DCT4,
-        3 => &DCT8,
-        4 => &DCT16,
-        5 => &DCT32,
-        _ => &DCT64,
-    }
-}
-
-fn adst_net(log2: usize) -> &'static Net {
-    if log2 == 3 { &ADST8 } else { &ADST16 }
-}
-
 #[inline(always)]
 fn round12(v: i32) -> i32 {
     v.wrapping_add(2048) >> 12
@@ -638,51 +624,69 @@ fn mul_add(m0: i32, x: i32, m1: i32, y: i32) -> i32 {
     m0.wrapping_mul(x).wrapping_add(m1.wrapping_mul(y))
 }
 
-/// Runs the inverse network on `x` (n values), writing n values to `out`. Sums are clamped to `lo..=hi`.
-fn run_inverse(net: &Net, x: &[i32], out: &mut [i32], lo: i32, hi: i32) {
-    let n = net.inp.len();
-    let mut t = [0i32; 64];
-    for i in 0..n {
-        t[i] = x[net.inp[i] as usize];
+/// `L` independent 1-D transforms run side by side: element `i` of the transform is `x[i]`, whose `L` lanes belong
+/// to different rows or columns. Every network step is then a short vector operation the compiler can vectorize.
+type Lanes<const L: usize> = [[i32; L]; 64];
+
+/// Runs the inverse network of `N` points on every lane of `x`, writing to `out`. Sums are clamped to `lo..=hi`.
+#[inline(always)]
+fn run_inverse<const L: usize, const N: usize>(net: &Net, x: &Lanes<L>, out: &mut Lanes<L>, lo: i32, hi: i32) {
+    let mut t = [[0i32; L]; N];
+    for (slot, &p) in t.iter_mut().zip(net.inp) {
+        *slot = x[p as usize & 63];
     }
     for op in net.ops {
-        let (a, b) = (op.a as usize, op.b as usize);
+        let (a, b) = (op.a as usize & (N - 1), op.b as usize & (N - 1));
         let (p, q) = (t[a], t[b]);
+        let (mut np, mut nq) = ([0i32; L], [0i32; L]);
         if op.add {
-            t[a] = p.wrapping_add(q).clamp(lo, hi);
-            t[b] = p.wrapping_sub(q).clamp(lo, hi);
+            for l in 0..L {
+                np[l] = p[l].wrapping_add(q[l]).clamp(lo, hi);
+                nq[l] = p[l].wrapping_sub(q[l]).clamp(lo, hi);
+            }
         } else {
-            t[a] = round12(mul_add(op.m[0], p, op.m[1], q));
-            t[b] = round12(mul_add(op.m[2], p, op.m[3], q));
+            for l in 0..L {
+                np[l] = round12(mul_add(op.m[0], p[l], op.m[1], q[l]));
+                nq[l] = round12(mul_add(op.m[2], p[l], op.m[3], q[l]));
+            }
         }
+        t[a] = np;
+        t[b] = nq;
     }
-    for j in 0..n {
-        let v = t[net.out[j] as usize];
-        out[j] = if net.neg_odd && j & 1 == 1 { v.wrapping_neg() } else { v };
+    for (j, &o) in net.out.iter().enumerate().take(N) {
+        let v = t[o as usize & (N - 1)];
+        out[j & 63] = if net.neg_odd && j & 1 == 1 { v.map(i32::wrapping_neg) } else { v };
     }
 }
 
 /// Runs the transposed network: the forward transform matching `run_inverse`, without clamping.
-fn run_forward(net: &Net, x: &[i32], out: &mut [i32]) {
-    let n = net.inp.len();
-    let mut t = [0i32; 64];
-    for j in 0..n {
-        let v = x[j];
-        t[net.out[j] as usize] = if net.neg_odd && j & 1 == 1 { v.wrapping_neg() } else { v };
+#[inline(always)]
+fn run_forward<const L: usize, const N: usize>(net: &Net, x: &Lanes<L>, out: &mut Lanes<L>) {
+    let mut t = [[0i32; L]; N];
+    for (j, &o) in net.out.iter().enumerate().take(N) {
+        let v = x[j & 63];
+        t[o as usize & (N - 1)] = if net.neg_odd && j & 1 == 1 { v.map(i32::wrapping_neg) } else { v };
     }
     for op in net.ops.iter().rev() {
-        let (a, b) = (op.a as usize, op.b as usize);
+        let (a, b) = (op.a as usize & (N - 1), op.b as usize & (N - 1));
         let (p, q) = (t[a], t[b]);
+        let (mut np, mut nq) = ([0i32; L], [0i32; L]);
         if op.add {
-            t[a] = p.wrapping_add(q);
-            t[b] = p.wrapping_sub(q);
+            for l in 0..L {
+                np[l] = p[l].wrapping_add(q[l]);
+                nq[l] = p[l].wrapping_sub(q[l]);
+            }
         } else {
-            t[a] = round12(mul_add(op.m[0], p, op.m[2], q));
-            t[b] = round12(mul_add(op.m[1], p, op.m[3], q));
+            for l in 0..L {
+                np[l] = round12(mul_add(op.m[0], p[l], op.m[2], q[l]));
+                nq[l] = round12(mul_add(op.m[1], p[l], op.m[3], q[l]));
+            }
         }
+        t[a] = np;
+        t[b] = nq;
     }
-    for i in 0..n {
-        out[net.inp[i] as usize] = t[i];
+    for (i, &p) in net.inp.iter().enumerate().take(N) {
+        out[p as usize & 63] = t[i & (N - 1)];
     }
 }
 
@@ -692,71 +696,81 @@ const SINPI_3_9: i32 = 3344;
 const SINPI_4_9: i32 = 3803;
 
 /// Specification 7.13.2.5: inverse ADST4.
-fn inverse_adst4(x: &[i32], out: &mut [i32]) {
-    let (x0, x1, x2, x3) = (x[0], x[1], x[2], x[3]);
-    let s0 = SINPI_1_9.wrapping_mul(x0);
-    let s1 = SINPI_2_9.wrapping_mul(x0);
-    let s2 = SINPI_3_9.wrapping_mul(x1);
-    let s3 = SINPI_4_9.wrapping_mul(x2);
-    let s4 = SINPI_1_9.wrapping_mul(x2);
-    let s5 = SINPI_2_9.wrapping_mul(x3);
-    let s6 = SINPI_4_9.wrapping_mul(x3);
-    let s7 = x0.wrapping_sub(x2).wrapping_add(x3);
-    let a0 = s0.wrapping_add(s3).wrapping_add(s5);
-    let a1 = s1.wrapping_sub(s4).wrapping_sub(s6);
-    let a3 = s2;
-    let a2 = SINPI_3_9.wrapping_mul(s7);
-    out[0] = round12(a0.wrapping_add(a3));
-    out[1] = round12(a1.wrapping_add(a3));
-    out[2] = round12(a2);
-    out[3] = round12(a0.wrapping_add(a1).wrapping_sub(a3));
-}
-
-/// Forward ADST4: the transpose of the inverse matrix.
-fn forward_adst4(x: &[i32], out: &mut [i32]) {
-    let (x0, x1, x2, x3) = (x[0], x[1], x[2], x[3]);
-    let (s1, s2, s3, s4) = (SINPI_1_9, SINPI_2_9, SINPI_3_9, SINPI_4_9);
-    out[0] = round12(
-        s1.wrapping_mul(x0)
-            .wrapping_add(s2.wrapping_mul(x1))
-            .wrapping_add(s3.wrapping_mul(x2))
-            .wrapping_add(s4.wrapping_mul(x3)),
-    );
-    out[1] = round12(s3.wrapping_mul(x0.wrapping_add(x1).wrapping_sub(x3)));
-    out[2] = round12(
-        s4.wrapping_mul(x0)
-            .wrapping_sub(s1.wrapping_mul(x1))
-            .wrapping_sub(s3.wrapping_mul(x2))
-            .wrapping_add(s2.wrapping_mul(x3)),
-    );
-    out[3] = round12(
-        s2.wrapping_mul(x0)
-            .wrapping_sub(s4.wrapping_mul(x1))
-            .wrapping_add(s3.wrapping_mul(x2))
-            .wrapping_sub(s1.wrapping_mul(x3)),
-    );
-}
-
-/// Identity transform (same in both directions): scale by sqrt(2), 2, 2 sqrt(2) or 4 for 4/8/16/32 points.
-fn identity_scale(x: &[i32], out: &mut [i32], log2: usize) {
-    let n = 1 << log2;
-    match log2 {
-        2 => (0..n).for_each(|i| out[i] = round12(x[i].wrapping_mul(5793))),
-        3 => (0..n).for_each(|i| out[i] = x[i].wrapping_mul(2)),
-        4 => (0..n).for_each(|i| out[i] = round12(x[i].wrapping_mul(11586))),
-        _ => (0..n).for_each(|i| out[i] = x[i].wrapping_mul(4)),
+fn inverse_adst4<const L: usize>(x: &Lanes<L>, out: &mut Lanes<L>) {
+    for l in 0..L {
+        let (x0, x1, x2, x3) = (x[0][l], x[1][l], x[2][l], x[3][l]);
+        let s0 = SINPI_1_9.wrapping_mul(x0);
+        let s1 = SINPI_2_9.wrapping_mul(x0);
+        let s2 = SINPI_3_9.wrapping_mul(x1);
+        let s3 = SINPI_4_9.wrapping_mul(x2);
+        let s4 = SINPI_1_9.wrapping_mul(x2);
+        let s5 = SINPI_2_9.wrapping_mul(x3);
+        let s6 = SINPI_4_9.wrapping_mul(x3);
+        let s7 = x0.wrapping_sub(x2).wrapping_add(x3);
+        let a0 = s0.wrapping_add(s3).wrapping_add(s5);
+        let a1 = s1.wrapping_sub(s4).wrapping_sub(s6);
+        let a3 = s2;
+        let a2 = SINPI_3_9.wrapping_mul(s7);
+        out[0][l] = round12(a0.wrapping_add(a3));
+        out[1][l] = round12(a1.wrapping_add(a3));
+        out[2][l] = round12(a2);
+        out[3][l] = round12(a0.wrapping_add(a1).wrapping_sub(a3));
     }
 }
 
-/// One inverse 1-D transform of `1 << log2` values.
-fn inverse_1d(kind: Kind, log2: usize, x: &[i32], out: &mut [i32], lo: i32, hi: i32) {
+/// Forward ADST4: the transpose of the inverse matrix.
+fn forward_adst4<const L: usize>(x: &Lanes<L>, out: &mut Lanes<L>) {
+    let (s1, s2, s3, s4) = (SINPI_1_9, SINPI_2_9, SINPI_3_9, SINPI_4_9);
+    for l in 0..L {
+        let (x0, x1, x2, x3) = (x[0][l], x[1][l], x[2][l], x[3][l]);
+        out[0][l] = round12(
+            s1.wrapping_mul(x0)
+                .wrapping_add(s2.wrapping_mul(x1))
+                .wrapping_add(s3.wrapping_mul(x2))
+                .wrapping_add(s4.wrapping_mul(x3)),
+        );
+        out[1][l] = round12(s3.wrapping_mul(x0.wrapping_add(x1).wrapping_sub(x3)));
+        out[2][l] = round12(
+            s4.wrapping_mul(x0)
+                .wrapping_sub(s1.wrapping_mul(x1))
+                .wrapping_sub(s3.wrapping_mul(x2))
+                .wrapping_add(s2.wrapping_mul(x3)),
+        );
+        out[3][l] = round12(
+            s2.wrapping_mul(x0)
+                .wrapping_sub(s4.wrapping_mul(x1))
+                .wrapping_add(s3.wrapping_mul(x2))
+                .wrapping_sub(s1.wrapping_mul(x3)),
+        );
+    }
+}
+
+/// Identity transform (same in both directions): scale by sqrt(2), 2, 2 sqrt(2) or 4 for 4/8/16/32 points.
+fn identity_scale<const L: usize>(x: &Lanes<L>, out: &mut Lanes<L>, log2: usize) {
+    let n = 1 << log2;
+    match log2 {
+        2 => (0..n).for_each(|i| out[i] = x[i].map(|v| round12(v.wrapping_mul(5793)))),
+        3 => (0..n).for_each(|i| out[i] = x[i].map(|v| v.wrapping_mul(2))),
+        4 => (0..n).for_each(|i| out[i] = x[i].map(|v| round12(v.wrapping_mul(11586)))),
+        _ => (0..n).for_each(|i| out[i] = x[i].map(|v| v.wrapping_mul(4))),
+    }
+}
+
+/// `L` inverse 1-D transforms of `1 << log2` values each.
+fn inverse_1d<const L: usize>(kind: Kind, log2: usize, x: &Lanes<L>, out: &mut Lanes<L>, lo: i32, hi: i32) {
     match kind {
-        Kind::Dct => run_inverse(dct_net(log2), x, out, lo, hi),
+        Kind::Dct => match log2 {
+            2 => run_inverse::<L, 4>(&DCT4, x, out, lo, hi),
+            3 => run_inverse::<L, 8>(&DCT8, x, out, lo, hi),
+            4 => run_inverse::<L, 16>(&DCT16, x, out, lo, hi),
+            5 => run_inverse::<L, 32>(&DCT32, x, out, lo, hi),
+            _ => run_inverse::<L, 64>(&DCT64, x, out, lo, hi),
+        },
         Kind::Adst | Kind::FlipAdst => {
-            if log2 == 2 {
-                inverse_adst4(x, out);
-            } else {
-                run_inverse(adst_net(log2), x, out, lo, hi);
+            match log2 {
+                2 => inverse_adst4(x, out),
+                3 => run_inverse::<L, 8>(&ADST8, x, out, lo, hi),
+                _ => run_inverse::<L, 16>(&ADST16, x, out, lo, hi),
             }
             if kind == Kind::FlipAdst {
                 out[..1 << log2].reverse();
@@ -766,22 +780,32 @@ fn inverse_1d(kind: Kind, log2: usize, x: &[i32], out: &mut [i32], lo: i32, hi: 
     }
 }
 
-/// One forward 1-D transform of `1 << log2` values.
-fn forward_1d(kind: Kind, log2: usize, x: &[i32], out: &mut [i32]) {
-    let n = 1 << log2;
+/// `L` forward 1-D transforms of `1 << log2` values each.
+fn forward_1d<const L: usize>(kind: Kind, log2: usize, x: &Lanes<L>, out: &mut Lanes<L>) {
     match kind {
-        Kind::Dct => run_forward(dct_net(log2), x, out),
+        Kind::Dct => match log2 {
+            2 => run_forward::<L, 4>(&DCT4, x, out),
+            3 => run_forward::<L, 8>(&DCT8, x, out),
+            4 => run_forward::<L, 16>(&DCT16, x, out),
+            5 => run_forward::<L, 32>(&DCT32, x, out),
+            _ => run_forward::<L, 64>(&DCT64, x, out),
+        },
         Kind::Adst | Kind::FlipAdst => {
-            let mut flipped = [0i32; 16];
+            let n = 1 << log2;
+            let mut flipped = *x;
             let x = if kind == Kind::FlipAdst {
                 for i in 0..n {
                     flipped[i] = x[n - 1 - i];
                 }
-                &flipped[..n]
+                &flipped
             } else {
                 x
             };
-            if log2 == 2 { forward_adst4(x, out) } else { run_forward(adst_net(log2), x, out) }
+            match log2 {
+                2 => forward_adst4(x, out),
+                3 => run_forward::<L, 8>(&ADST8, x, out),
+                _ => run_forward::<L, 16>(&ADST16, x, out),
+            }
         }
         Kind::Identity => identity_scale(x, out, log2),
     }
@@ -837,6 +861,131 @@ fn inverse_wht_add(coefs: &[i32], bit_depth: u8, dst: &mut [u16], dst_stride: us
 // ---------------------------------------------------------------------------------------------------------
 // 2-D transforms
 // ---------------------------------------------------------------------------------------------------------
+
+/// Row transforms of the inverse, `L` rows at a time, in place; each result is rounded and clamped to the range of
+/// the column pass.
+#[allow(clippy::too_many_arguments)]
+fn inverse_rows<const L: usize>(
+    coefs: &mut [i32],
+    lw: usize,
+    rows: usize,
+    cols: usize,
+    rect: bool,
+    kind: Kind,
+    shift: u32,
+    (row_lo, row_hi): (i32, i32),
+    (col_lo, col_hi): (i32, i32),
+) {
+    let w = 1usize << lw;
+    let mut input: Lanes<L> = [[0; L]; 64];
+    let mut output: Lanes<L> = [[0; L]; 64];
+    let mut i0 = 0;
+    while i0 < rows {
+        let n = L.min(rows - i0);
+        // Lanes `n..L` (only in the last group) and columns `cols..w` of `input` are never written: zero.
+        for l in 0..n {
+            for (j, &c) in coefs[(i0 + l) * w..][..cols].iter().enumerate() {
+                let v = if rect { round12(c.wrapping_mul(2896)) } else { c };
+                input[j][l] = v.clamp(row_lo, row_hi);
+            }
+        }
+        inverse_1d(kind, lw, &input, &mut output, row_lo, row_hi);
+        for l in 0..n {
+            for (j, c) in coefs[(i0 + l) * w..][..w].iter_mut().enumerate() {
+                *c = round_shift(output[j][l], shift).clamp(col_lo, col_hi);
+            }
+        }
+        i0 += L;
+    }
+}
+
+/// Column transforms of the inverse, `L` columns at a time, added to the destination.
+#[allow(clippy::too_many_arguments)]
+fn inverse_cols<const L: usize>(
+    coefs: &[i32],
+    (lw, lh): (usize, usize),
+    rows: usize,
+    kind: Kind,
+    (col_lo, col_hi): (i32, i32),
+    pixel_max: i32,
+    dst: &mut [u16],
+    dst_stride: usize,
+) {
+    let (w, h) = (1usize << lw, 1usize << lh);
+    let mut input: Lanes<L> = [[0; L]; 64];
+    let mut output: Lanes<L> = [[0; L]; 64];
+    for j0 in (0..w).step_by(L) {
+        for i in 0..rows {
+            input[i].copy_from_slice(&coefs[i * w + j0..][..L]);
+        }
+        inverse_1d(kind, lh, &input, &mut output, col_lo, col_hi);
+        for i in 0..h {
+            let d = &mut dst[i * dst_stride + j0..][..L];
+            for l in 0..L {
+                d[l] = (d[l] as i32 + round_shift(output[i][l], 4)).clamp(0, pixel_max) as u16;
+            }
+        }
+    }
+}
+
+#[inline(always)]
+fn fwd_scale(v: i32, s: i32) -> i32 {
+    if s >= 0 { v << s } else { round_shift(v, (-s) as u32) }
+}
+
+/// Column pass of the forward transform, `L` columns at a time; the result (row stride `1 << lw`) goes to `mid`.
+fn forward_cols<const L: usize>(
+    residual: &[i32],
+    res_stride: usize,
+    mid: &mut [i32],
+    (lw, lh): (usize, usize),
+    kind: Kind,
+    shift: [i32; 3],
+) {
+    let (w, h) = (1usize << lw, 1usize << lh);
+    let mut input: Lanes<L> = [[0; L]; 64];
+    let mut output: Lanes<L> = [[0; L]; 64];
+    for j0 in (0..w).step_by(L) {
+        for i in 0..h {
+            let r = &residual[i * res_stride + j0..][..L];
+            for l in 0..L {
+                input[i][l] = fwd_scale(r[l], shift[0]);
+            }
+        }
+        forward_1d(kind, lh, &input, &mut output);
+        for i in 0..h {
+            let m = &mut mid[i * w + j0..][..L];
+            for l in 0..L {
+                m[l] = fwd_scale(output[i][l], shift[1]);
+            }
+        }
+    }
+}
+
+/// Row pass of the forward transform, `L` rows at a time and in place: `coefs` holds the column pass result on
+/// entry and the coefficients (only the top-left 32x32 corner non-zero) on exit.
+fn forward_rows<const L: usize>(coefs: &mut [i32], (lw, lh): (usize, usize), rect: bool, kind: Kind, shift: i32) {
+    let (w, h) = (1usize << lw, 1usize << lh);
+    let (h32, w32) = (h.min(32), w.min(32));
+    let mut input: Lanes<L> = [[0; L]; 64];
+    let mut output: Lanes<L> = [[0; L]; 64];
+    for i0 in (0..h32).step_by(L) {
+        for l in 0..L {
+            for (j, &v) in coefs[(i0 + l) * w..][..w].iter().enumerate() {
+                input[j][l] = if rect { round12(v.wrapping_mul(2896)) } else { v };
+            }
+        }
+        forward_1d(kind, lw, &input, &mut output);
+        for l in 0..L {
+            let row = &mut coefs[(i0 + l) * w..][..w];
+            for j in 0..w32 {
+                row[j] = fwd_scale(output[j][l], shift);
+            }
+            row[w32..].fill(0);
+        }
+    }
+    coefs[h32 * w..].fill(0);
+}
 
 /// Inverse transform of one block and add it to `dst` (clipping to the bit depth).
 ///
@@ -897,32 +1046,16 @@ pub fn inverse_transform_add(
         return;
     }
 
-    // Row transforms, in place; each result is rounded and clamped to the range of the column pass.
-    let mut input = [0i32; 64];
-    let mut output = [0i32; 64];
-    for i in 0..rows {
-        let row = &mut coefs[i * w..(i + 1) * w];
-        for j in 0..cols {
-            let v = if rect { round12(row[j].wrapping_mul(2896)) } else { row[j] };
-            input[j] = v.clamp(row_lo, row_hi);
-        }
-        inverse_1d(row_kind, lw, &input, &mut output, row_lo, row_hi);
-        for j in 0..w {
-            row[j] = round_shift(output[j], row_shift).clamp(col_lo, col_hi);
-        }
+    let (row_range, col_range) = ((row_lo, row_hi), (col_lo, col_hi));
+    if cols > 4 || rows > 4 {
+        inverse_rows::<8>(coefs, lw, rows, cols, rect, row_kind, row_shift, row_range, col_range);
+    } else {
+        inverse_rows::<4>(coefs, lw, rows, cols, rect, row_kind, row_shift, row_range, col_range);
     }
-
-    // Column transforms.
-    input = [0; 64];
-    for j in 0..w {
-        for i in 0..rows {
-            input[i] = coefs[i * w + j];
-        }
-        inverse_1d(col_kind, lh, &input, &mut output, col_lo, col_hi);
-        for i in 0..h {
-            let p = &mut dst[i * dst_stride + j];
-            *p = (*p as i32 + round_shift(output[i], 4)).clamp(0, pixel_max) as u16;
-        }
+    if w >= 8 {
+        inverse_cols::<8>(coefs, (lw, lh), rows, col_kind, col_range, pixel_max, dst, dst_stride);
+    } else {
+        inverse_cols::<4>(coefs, (lw, lh), rows, col_kind, col_range, pixel_max, dst, dst_stride);
     }
 }
 
@@ -967,30 +1100,16 @@ pub fn forward_transform(
     let shift = FWD_SHIFT[ts];
     let (col_kind, row_kind) = (COL_KIND[tx_type as usize], ROW_KIND[tx_type as usize]);
     let rect = lw.abs_diff(lh) == 1;
-    let scale = |v: i32, s: i32| if s >= 0 { v << s } else { round_shift(v, (-s) as u32) };
-
-    let mut mid = vec![0i32; w * h];
-    let mut input = [0i32; 64];
-    let mut output = [0i32; 64];
-    for j in 0..w {
-        for i in 0..h {
-            input[i] = scale(residual[i * res_stride + j], shift[0]);
-        }
-        forward_1d(col_kind, lh, &input, &mut output);
-        for i in 0..h {
-            mid[i * w + j] = scale(output[i], shift[1]);
-        }
+    // The column pass leaves its result in `coefs`, which the row pass then transforms in place.
+    if w >= 8 {
+        forward_cols::<8>(residual, res_stride, coefs, (lw, lh), col_kind, shift);
+    } else {
+        forward_cols::<4>(residual, res_stride, coefs, (lw, lh), col_kind, shift);
     }
-    coefs.fill(0);
-    for i in 0..h.min(32) {
-        for j in 0..w {
-            let v = mid[i * w + j];
-            input[j] = if rect { round12(v.wrapping_mul(2896)) } else { v };
-        }
-        forward_1d(row_kind, lw, &input, &mut output);
-        for j in 0..w.min(32) {
-            coefs[i * w + j] = scale(output[j], shift[2]);
-        }
+    if h.min(32) >= 8 {
+        forward_rows::<8>(coefs, (lw, lh), rect, row_kind, shift[2]);
+    } else {
+        forward_rows::<4>(coefs, (lw, lh), rect, row_kind, shift[2]);
     }
 }
 
