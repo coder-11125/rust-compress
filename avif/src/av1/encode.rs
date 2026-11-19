@@ -65,13 +65,21 @@ pub fn quantize(
     let shift = (tx_sz_ctx - 2).max(0);
     let mut any = false;
     for i in 0..ch {
-        for j in 0..cw {
-            let pos = i * cw + j;
-            let c = coefs[i * tw + j] as i64;
-            let step = if pos == 0 { dc_q } else { ac_q };
-            let mag = ((c.abs() << shift) * 256 + step * round) / (step * 256);
+        let (src, dst) = (&coefs[i * tw..i * tw + cw], &mut out[i * cw..(i + 1) * cw]);
+        for (j, (&c, o)) in src.iter().zip(dst.iter_mut()).enumerate() {
+            let step = if i == 0 && j == 0 { dc_q } else { ac_q };
+            let c = c as i64;
+            let (num, den) = (((c.abs() << shift) * 256) + step * round, step * 256);
+            // Most coefficients quantize to zero: skip the division. Narrow operands use the cheaper 32-bit one.
+            let mag = if (0..den).contains(&num) {
+                0
+            } else if num >= 0 && num <= u32::MAX as i64 && den <= u32::MAX as i64 {
+                (num as u32 / den as u32) as i64
+            } else {
+                num / den
+            };
             let q = mag.min(0xfffff) as i32;
-            out[pos] = if c < 0 { -q } else { q };
+            *o = if c < 0 { -q } else { q };
             any |= q != 0;
         }
     }
@@ -90,9 +98,10 @@ pub fn quantize(
     };
     let scan = SCAN_TABLE[tx_sz as usize][kind];
     let mut eob = 0;
-    for (idx, &pos) in scan.iter().enumerate() {
+    for (idx, &pos) in scan.iter().enumerate().rev() {
         if out[pos as usize] != 0 {
             eob = idx + 1;
+            break;
         }
     }
     eob
