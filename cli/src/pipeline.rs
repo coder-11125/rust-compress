@@ -92,6 +92,7 @@ enum Target {
     Ssim(f64),
     Psnr(f64),
     MsSsim(f64),
+    Ssimulacra2(f64),
     Size(u64),
 }
 
@@ -102,6 +103,8 @@ fn target(cli: &Cli) -> Option<Target> {
         Some(Target::Psnr(v))
     } else if let Some(v) = cli.target_ms_ssim {
         Some(Target::MsSsim(v))
+    } else if let Some(v) = cli.target_ssimulacra2 {
+        Some(Target::Ssimulacra2(v))
     } else {
         cli.target_size.map(Target::Size)
     }
@@ -112,24 +115,26 @@ fn metric_name(t: Target) -> &'static str {
         Target::Ssim(_) => "ssim",
         Target::Psnr(_) => "psnr",
         Target::MsSsim(_) => "ms-ssim",
+        Target::Ssimulacra2(_) => "ssimulacra2",
         Target::Size(_) => "size",
     }
 }
 
 fn target_value(t: Target) -> f64 {
     match t {
-        Target::Ssim(v) | Target::Psnr(v) | Target::MsSsim(v) => v,
+        Target::Ssim(v) | Target::Psnr(v) | Target::MsSsim(v) | Target::Ssimulacra2(v) => v,
         Target::Size(_) => 0.0,
     }
 }
 
-fn score(reference: &Image, candidate: &Image, t: Target) -> f64 {
-    match t {
+fn score(reference: &Image, candidate: &Image, t: Target) -> Result<f64> {
+    Ok(match t {
         Target::Ssim(_) => metrics::ssim(reference, candidate),
         Target::Psnr(_) => metrics::psnr(reference, candidate),
         Target::MsSsim(_) => metrics::ms_ssim(reference, candidate),
+        Target::Ssimulacra2(_) => return rc_core::ssimulacra2::ssimulacra2(reference, candidate),
         Target::Size(_) => 0.0,
-    }
+    })
 }
 
 /// Canonical 8-bit RGBA view for metric comparisons.
@@ -187,9 +192,38 @@ fn bisect_size(min: u16, max: u16, limit: u64, mut len: impl FnMut(u16) -> Resul
     Ok(best)
 }
 
-/// Encode pixels as JPEG, honoring `--target-ssim` when given.
+/// A perceptual goal for the JPEG quality search.
+#[derive(Clone, Copy)]
+enum JpegGoal {
+    Ssim(f64),
+    Ssimulacra2(f64),
+}
+
+fn jpeg_goal(cli: &Cli) -> Option<JpegGoal> {
+    cli.target_ssim.map(JpegGoal::Ssim).or(cli.target_ssimulacra2.map(JpegGoal::Ssimulacra2))
+}
+
+/// Search the JPEG quality for `goal`; returns the result and the metric's name for the report.
+fn find_jpeg_quality(
+    reference: &Image,
+    goal: JpegGoal,
+    make: impl FnMut(u8) -> jpeg::encode::CoefImage,
+) -> Result<(jpeg::target::Found, &'static str)> {
+    match goal {
+        JpegGoal::Ssim(t) => Ok((jpeg::target::find_quality(reference, t, 100, make), "ssim")),
+        JpegGoal::Ssimulacra2(t) => {
+            if reference.width < rc_core::ssimulacra2::MIN_SIDE || reference.height < rc_core::ssimulacra2::MIN_SIDE {
+                return Err(Error::unsupported("--target-ssimulacra2 needs an image of at least 8x8 pixels"));
+            }
+            let metric = |a: &Image, b: &Image| rc_core::ssimulacra2::ssimulacra2(a, b).unwrap_or(f64::MIN);
+            Ok((jpeg::target::find_quality_with(reference, t, 100, make, metric), "ssimulacra2"))
+        }
+    }
+}
+
+/// Encode pixels as JPEG, honoring `--target-ssim` / `--target-ssimulacra2` when given.
 fn encode_jpeg_pixels(img: &Image, cli: &Cli, quality: u8, arithmetic: bool) -> Result<Encoded> {
-    let mut encoded = match cli.target_ssim {
+    let mut encoded = match jpeg_goal(cli) {
         None => {
             if img.width > 65535 || img.height > 65535 {
                 return Err(Error::unsupported("JPEG dimensions are limited to 65535 pixels"));
@@ -198,12 +232,11 @@ fn encode_jpeg_pixels(img: &Image, cli: &Cli, quality: u8, arithmetic: bool) -> 
             let ci = jpeg::encode::build_coefs(&flat, &jpeg_options(cli, quality));
             Encoded::from(write_jpeg_bytes(&ci, arithmetic))
         }
-        Some(target) => {
+        Some(goal) => {
             let reference = img.flatten(cli.background);
-            let found = jpeg::target::find_quality(&reference, target, 100, |q| {
-                jpeg::encode::build_coefs(&reference, &jpeg_options(cli, q))
-            });
-            let note = format!("q{}, ssim {:.4}", found.quality, found.ssim);
+            let (found, metric) =
+                find_jpeg_quality(&reference, goal, |q| jpeg::encode::build_coefs(&reference, &jpeg_options(cli, q)))?;
+            let note = format!("q{}, {metric} {:.4}", found.quality, found.score);
             Encoded { bytes: write_jpeg_bytes(&found.coefs, arithmetic), note: Some(note), forced: false }
         }
     };
@@ -335,14 +368,14 @@ fn jpeg_to_jpeg(data: &[u8], cli: &Cli) -> Result<Encoded> {
     {
         let mut ci = parsed.into_coefs()?;
         apply_metadata_policy(&mut ci.meta, cli);
-        if let Some(target) = cli.target_ssim {
+        if let Some(goal) = jpeg_goal(cli) {
             let reference = jpeg::decode::reconstruct(&ci)?;
-            let found = jpeg::target::find_quality(&reference, target, 100, |q| {
+            let (found, metric) = find_jpeg_quality(&reference, goal, |q| {
                 let mut c = ci.clone();
                 c.requantize(q, !cli.no_trellis);
                 c
-            });
-            let note = format!("q{}, ssim {:.4}", found.quality, found.ssim);
+            })?;
+            let note = format!("q{}, {metric} {:.4}", found.quality, found.score);
             let mut encoded =
                 Encoded { bytes: write_jpeg_bytes(&found.coefs, arithmetic), note: Some(note), forced: false };
             if arithmetic {
@@ -420,7 +453,7 @@ fn encode(img: &Image, fmt: Format, cli: &Cli) -> Result<Encoded> {
                     let tv = target_value(t);
                     let (colors, s) = bisect_score(2, max_colors, tv, |c| {
                         let q = png::quant::quantize(img, c as usize, cli.dither);
-                        Ok(score(&reference, &rgba8(&q), t))
+                        score(&reference, &rgba8(&q), t)
                     })?;
                     let q = png::quant::quantize(img, colors as usize, cli.dither);
                     let mut encoded: Encoded = png::encode::encode(&q, &opts).into();
@@ -433,7 +466,7 @@ fn encode(img: &Image, fmt: Format, cli: &Cli) -> Result<Encoded> {
             Ok(png::encode::encode(img, &opts).into())
         }
         Format::Jpeg => {
-            if target(cli).is_some_and(|t| !matches!(t, Target::Ssim(_))) {
+            if target(cli).is_some_and(|t| !matches!(t, Target::Ssim(_) | Target::Ssimulacra2(_))) {
                 return Err(Error::unsupported(
                     "--target-psnr/--target-ms-ssim/--target-size need lossy WebP, AVIF or --lossy PNG",
                 ));
@@ -458,7 +491,7 @@ fn encode(img: &Image, fmt: Format, cli: &Cli) -> Result<Encoded> {
                     let tv = target_value(t);
                     let (q, s) = bisect_score(1, 100, tv, |q| {
                         let bytes = webp::encode_lossy(img, q as u8, level, clean)?;
-                        Ok(score(&reference, &rgba8(&webp::decode(&bytes)?), t))
+                        score(&reference, &rgba8(&webp::decode(&bytes)?), t)
                     })?;
                     let bytes = webp::encode_lossy(img, q as u8, level, clean)?;
                     let mut encoded: Encoded = bytes.into();
@@ -503,7 +536,7 @@ fn encode(img: &Image, fmt: Format, cli: &Cli) -> Result<Encoded> {
                 let tv = target_value(t);
                 let (q, s) = bisect_score(1, 100, tv, |q| {
                     let bytes = avif::encode::encode(img, &avif_opts(cli, q as u8, img.depth))?;
-                    Ok(score(&reference, &rgba8(&avif::decode(&bytes)?), t))
+                    score(&reference, &rgba8(&avif::decode(&bytes)?), t)
                 })?;
                 let mut encoded: Encoded = avif::encode::encode(img, &avif_opts(cli, q as u8, img.depth))?.into();
                 encoded.note = Some(format!("q{q}, {} {:.4}", metric_name(t), s));
@@ -649,7 +682,7 @@ fn run(job: &Job, cli: &Cli, data: &[u8], guard: Option<&Snapshot>) -> Result<(S
         .or_else(|| Format::from_extension(&job.input))
         .ok_or_else(|| Error::unsupported("unrecognized image format (supported: PNG, JPEG, WebP, AVIF, GIF)"))?;
     let out_fmt = target_format(cli, in_fmt);
-    if out_fmt == Format::Jpeg && target(cli).is_some_and(|t| !matches!(t, Target::Ssim(_))) {
+    if out_fmt == Format::Jpeg && target(cli).is_some_and(|t| !matches!(t, Target::Ssim(_) | Target::Ssimulacra2(_))) {
         return Err(Error::unsupported(
             "--target-psnr/--target-ms-ssim/--target-size need lossy WebP, AVIF or --lossy PNG",
         ));

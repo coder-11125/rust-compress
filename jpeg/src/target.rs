@@ -1,5 +1,6 @@
 //! Perceptual quality targeting: find the lowest JPEG quality whose reconstruction still scores at
-//! least a target SSIM against the reference, instead of guessing a quality number.
+//! least a target (SSIM by default, or any metric that grows with quality) against the reference, instead of
+//! guessing a quality number.
 
 use super::decode::reconstruct;
 use super::encode::CoefImage;
@@ -9,7 +10,8 @@ use rc_core::metrics::ssim;
 /// Result of a quality search.
 pub struct Found {
     pub quality: u8,
-    pub ssim: f64,
+    /// The metric's value for the chosen quality.
+    pub score: f64,
     pub coefs: CoefImage,
 }
 
@@ -18,12 +20,24 @@ pub struct Found {
 /// target, that best-effort result is returned. SSIM is assumed to grow with quality; every
 /// accepted candidate has been checked against the target, so a non-monotonic stretch can only
 /// make the answer slightly larger than necessary, never worse than the target.
-pub fn find_quality(reference: &Image, target: f64, max_quality: u8, mut make: impl FnMut(u8) -> CoefImage) -> Found {
-    let score = |ci: &CoefImage| -> f64 { reconstruct(ci).map(|img| ssim(reference, &img)).unwrap_or(0.0) };
+pub fn find_quality(reference: &Image, target: f64, max_quality: u8, make: impl FnMut(u8) -> CoefImage) -> Found {
+    find_quality_with(reference, target, max_quality, make, ssim)
+}
+
+/// Like [`find_quality`] with another metric: `metric(reference, candidate)` must grow (roughly) with quality, and a
+/// candidate that cannot be scored should return a very low value so the search moves to higher quality.
+pub fn find_quality_with(
+    reference: &Image,
+    target: f64,
+    max_quality: u8,
+    mut make: impl FnMut(u8) -> CoefImage,
+    metric: impl Fn(&Image, &Image) -> f64,
+) -> Found {
+    let score = |ci: &CoefImage| -> f64 { reconstruct(ci).map(|img| metric(reference, &img)).unwrap_or(f64::MIN) };
     let (mut lo, mut hi) = (1u8, max_quality.max(1));
     let top = make(hi);
     let top_score = score(&top);
-    let mut best = Found { quality: hi, ssim: top_score, coefs: top };
+    let mut best = Found { quality: hi, score: top_score, coefs: top };
     if top_score < target {
         return best;
     }
@@ -33,7 +47,7 @@ pub fn find_quality(reference: &Image, target: f64, max_quality: u8, mut make: i
         let s = score(&ci);
         if s >= target {
             hi = mid;
-            best = Found { quality: mid, ssim: s, coefs: ci };
+            best = Found { quality: mid, score: s, coefs: ci };
         } else {
             lo = mid + 1;
         }

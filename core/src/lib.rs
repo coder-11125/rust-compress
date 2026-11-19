@@ -7,4 +7,5 @@ pub mod image;
 pub mod metrics;
 pub mod quant;
 pub mod resize;
+pub mod ssimulacra2;
 pub mod util;

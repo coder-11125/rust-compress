@@ -103,7 +103,7 @@ fn quality_search_meets_the_target_and_is_monotonic_in_it() {
     let mut last = 0u8;
     for target in [0.80, 0.90, 0.95, 0.98] {
         let found = find_quality(&reference, target, 100, make);
-        assert!(found.ssim >= target || found.quality == 100, "target {target}: got {}", found.ssim);
+        assert!(found.score >= target || found.quality == 100, "target {target}: got {}", found.score);
         assert!(found.quality >= last, "quality must not drop as the target rises: {} < {last}", found.quality);
         last = found.quality;
         // One step lower must miss the target (the search returned the smallest passing quality).

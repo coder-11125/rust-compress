@@ -153,20 +153,26 @@ pub struct Cli {
     /// Pick the lowest quality whose result still scores at least this SSIM (0-1, e.g. 0.97)
     /// against the original, instead of a fixed -q. Works for JPEG, and for lossy WebP, AVIF and
     /// `--lossy` PNG. Typical: 0.95 small, 0.97 good, 0.99 near-lossless.
-    #[arg(long, value_name = "SSIM", value_parser = parse_ssim, conflicts_with_all = ["target_psnr", "target_ms_ssim", "target_size"])]
+    #[arg(long, value_name = "SSIM", value_parser = parse_ssim, conflicts_with_all = ["target_psnr", "target_ms_ssim", "target_ssimulacra2", "target_size"])]
     pub target_ssim: Option<f64>,
 
     /// Like --target-ssim, but target a PSNR in dB (higher is better) for lossy WebP, AVIF and `--lossy` PNG.
-    #[arg(long, value_name = "DB", value_parser = parse_psnr, conflicts_with_all = ["target_ssim", "target_ms_ssim", "target_size"])]
+    #[arg(long, value_name = "DB", value_parser = parse_psnr, conflicts_with_all = ["target_ssim", "target_ms_ssim", "target_ssimulacra2", "target_size"])]
     pub target_psnr: Option<f64>,
 
     /// Like --target-ssim, but target multi-scale SSIM for lossy WebP, AVIF and `--lossy` PNG.
-    #[arg(long, value_name = "SSIM", value_parser = parse_ssim, conflicts_with_all = ["target_ssim", "target_psnr", "target_size"])]
+    #[arg(long, value_name = "SSIM", value_parser = parse_ssim, conflicts_with_all = ["target_ssim", "target_psnr", "target_ssimulacra2", "target_size"])]
     pub target_ms_ssim: Option<f64>,
+
+    /// Pick the lowest quality that still scores at least this SSIMULACRA 2 (a perceptual metric: 100 is identical,
+    /// about 90 is visually indistinguishable, 70 good, 50 clearly degraded). Works for JPEG, lossy WebP, AVIF and
+    /// `--lossy` PNG; the image must be at least 8x8 pixels. Slower than --target-ssim. JPEG is scored on rc's own decode, which other decoders can score a point or two lower at high targets.
+    #[arg(long, value_name = "SCORE", value_parser = parse_ssimulacra2, conflicts_with_all = ["target_ssim", "target_psnr", "target_ms_ssim", "target_size"])]
+    pub target_ssimulacra2: Option<f64>,
 
     /// Largest output size in bytes for lossy WebP, AVIF and `--lossy` PNG: picks the highest quality
     /// whose file still fits (or the smallest quality when even that is too big).
-    #[arg(long, value_name = "BYTES", value_parser = clap::value_parser!(u64).range(1..), conflicts_with_all = ["target_ssim", "target_psnr", "target_ms_ssim"])]
+    #[arg(long, value_name = "BYTES", value_parser = clap::value_parser!(u64).range(1..), conflicts_with_all = ["target_ssim", "target_psnr", "target_ms_ssim", "target_ssimulacra2"])]
     pub target_size: Option<u64>,
 
     /// JPEG: disable trellis (rate-distortion) quantization; faster, but ~5-10% larger at equal quality.
@@ -247,6 +253,11 @@ fn parse_hex_color(s: &str) -> Result<[u8; 3], String> {
 fn parse_ssim(s: &str) -> Result<f64, String> {
     let v: f64 = s.parse().map_err(|_| "expected a number between 0 and 1".to_string())?;
     if v > 0.0 && v <= 1.0 { Ok(v) } else { Err("SSIM target must be in (0, 1]".into()) }
+}
+
+fn parse_ssimulacra2(s: &str) -> Result<f64, String> {
+    let v: f64 = s.parse().map_err(|_| "expected a number such as 80".to_string())?;
+    if v > 0.0 && v <= 100.0 { Ok(v) } else { Err("SSIMULACRA 2 target must be in (0, 100]".into()) }
 }
 
 fn parse_psnr(s: &str) -> Result<f64, String> {

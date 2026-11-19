@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+- New `--target-ssimulacra2 SCORE` picks the lowest quality that still scores at least SCORE on SSIMULACRA 2, a perceptual
+  metric (100 identical, about 90 visually indistinguishable, 70 good, 50 clearly degraded; not clamped, so it can go
+  negative), for JPEG, lossy WebP, AVIF and `--lossy` PNG. The metric is implemented from scratch in
+  `core/src/ssimulacra2.rs` (`rc_core::ssimulacra2::ssimulacra2`): XYB colour space, six scales, SSIM and edge-difference
+  statistics pooled by the mean and the 4th-power norm, 108 trained weights, stripe-parallel with bounded memory
+  (about 35 G instructions for a 14.7-megapixel pair). It needs at least 8x8 pixels; alpha is composited onto
+  mid-grey. It matches the py-ssimulacra2 reference to 7e-6 points on 54 synthetic pairs (`fixtures/ssim2`) and to 1e-6
+  on 18 pairs of 1280-pixel photographs; it has not been compared with the official libjxl tool, which blurs with a
+  recursive filter and may treat image edges differently (the choice moves scores by up to about 5 points on a small image
+  at low quality and by much less on large ones). JPEG candidates are scored on rc's own decode, which rounds slightly
+  differently from libjpeg-turbo: one test photograph scored 1.2-1.9 points lower in libjpeg-turbo around targets of
+  75-90, while lossy WebP agreed to three decimals.
+- `jpeg::target::find_quality_with` runs the JPEG quality search with any metric (`find_quality` is the SSIM version),
+  and `Found.ssim` is now `Found.score`. Third-party licence notice for the SSIMULACRA 2 weights and constants added
+  to `THIRD_PARTY_NOTICES.md`.
 - Lossy JPEG is tuned for perceptual quality (SSIMULACRA2) instead of squared error. A flatter base quantization table
   (the one mozjpeg writes by default, for luma and chroma, clamped to 255), a weaker trellis (kappa 0.02) with a
   per-frequency distortion weight, and AC band splits at coefficient 2 in the progressive scan search (144 candidate
