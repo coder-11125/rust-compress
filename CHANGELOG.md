@@ -2,6 +2,41 @@
 
 ## Unreleased
 
+- Lossy JPEG is tuned for perceptual quality (SSIMULACRA2) instead of squared error. A flatter base quantization table
+  (the one mozjpeg writes by default, for luma and chroma, clamped to 255), a weaker trellis (kappa 0.02) with a
+  per-frequency distortion weight, and AC band splits at coefficient 2 in the progressive scan search (144 candidate
+  layouts instead of 72). Against mozjpeg 4.0.3 at equal SSIMULACRA2 on ten smooth desktop wallpapers the files went from
+  15-19% larger to 0.8-1.2% smaller on average over scores 55-85 (worst single file +3.5% at score 55); this is not
+  checked on real photographs. PSNR at the same `-q` is lower than with the Annex K tables (35.2 dB against 36.6 on the
+  q95 test fixture), so a `-q` value no longer means the same PSNR as libjpeg's, and files written at a given `-q` differ
+  from earlier versions.
+- GIF: a frame's local colour table now holds only the colours of the rectangle it draws, and whether a GIF can be coded
+  exactly is judged on that rectangle, not the whole canvas. A GIF whose frames each use all 256 colours but change
+  little used to be left unchanged; one such test animation went from 211 KB to 108 KB, pixel-exact (gifsicle `-O3`:
+  107 KB).
+- New `--gif-lossy 0-200` (gifsicle's `--lossy` scale; `--lossy` alone now means 80 for GIF output). A pixel close to what
+  the previous frame shows is left unchanged, and the LZW coder may substitute a nearby palette colour or "unchanged"
+  when that extends a dictionary match. Every pixel stays within a colour distance of 0.4 x N of its source, errors do not
+  accumulate across frames, and level 0 is exact. It works with a shared palette and with per-frame palettes. On four
+  synthetic animations, at equal quality, files were 10-80% smaller than gifsicle `-O3 --lossy` on two, about even on one
+  and 0.7-2.9% larger on one; lossless output is still about 4-6% above gifsicle `-O3` on two of them. That is a small
+  synthetic sample, not a real-world corpus.
+- Lossless WebP effort levels 0-4 are now a fast tier (the photographic pipeline fitted on sampled pixels, a cheaper
+  parse, no ranking pass for a single candidate); levels 5-9 produce the same bytes as before. The default effort for
+  lossless WebP is now 5 (PNG, AVIF and lossy WebP stay at 7, and an explicit `-l` always wins): on three wallpapers
+  level 5 was 0.03% smaller than 7 in about half the time, level 6 was larger than both, and level 4 was 0.75% larger
+  for 6-8x less wall time. All outputs pixel-exact; evidence is smooth images.
+- Lossy WebP is tuned for SSIMULACRA2: the loop filter runs at half the MSE-optimal strength with header sharpness 6, and
+  chroma quantization decisions are cheaper. Against libwebp method 6 (through Pillow) on ten wallpapers, the mean size
+  at equal SSIMULACRA2 went from +4.8% / +5.1% to -0.8% / -1.4% at scores 65 / 75 (worst file +11.7% / +22.9% before,
+  +6.5% / +9.5% after). The gain comes mostly from the weaker loop filter, which the metric rewards; it is not checked on
+  real photographs or by eye. Files written at a given `-q` differ from earlier versions.
+- One benchmark script per format in `tools/` on a shared `benchlib.py`: `bench_png.py`, `bench_jpeg.py`,
+  `bench_webp.py`, `bench_avif.py` and `bench_gif.py` compare `rc` with oxipng, mozjpeg, libwebp, libavif and gifsicle (or
+  any command given with `--ref-cmd`) on any images, on Linux, macOS and Windows.
+- Tests: the control-character file name test only runs on Unix (Windows cannot create such a file and it failed there
+  since it was added), and the tests that run a freshly copied binary retry while the OS reports "text file busy", a race
+  that made `an_unreachable_server_is_a_clean_error` flaky on Linux.
 - Metadata no longer leaks through the "keep the original" fallback. When re-encoding does not help, `rc` keeps the
   original bytes, which used to carry their EXIF, XMP, text chunks and comments along although only colour
   information is meant to survive. The descriptive metadata is now cut out of the PNG chunks, JPEG segments or WebP
