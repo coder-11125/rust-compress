@@ -2466,23 +2466,25 @@ impl<C: Coder> TileCoder<'_, C> {
         };
         let mut nz_rows = 0;
         let mut nz_cols = 0;
-        for pos in 0..cw * ch {
-            let q = quant[pos];
-            if q == 0 {
-                continue;
+        for i in 0..ch {
+            for j in 0..cw {
+                let pos = i * cw + j;
+                let q = quant[pos];
+                if q == 0 {
+                    continue;
+                }
+                let mut step = if pos == 0 { dc_q } else { ac_q } as i64;
+                if let Some(m) = qm {
+                    step = (step * m[pos] as i64 + 16) >> 5;
+                }
+                let mut dq = ((q.unsigned_abs() as i64 * step) & 0xff_ffff) >> dq_shift;
+                if q < 0 {
+                    dq = -dq;
+                }
+                coefs[i * tw + j] = dq.clamp(-limit, limit - 1) as i32;
+                nz_rows = nz_rows.max(i + 1);
+                nz_cols = nz_cols.max(j + 1);
             }
-            let (i, j) = (pos / cw, pos % cw);
-            let mut step = if pos == 0 { dc_q } else { ac_q } as i64;
-            if let Some(m) = qm {
-                step = (step * m[pos] as i64 + 16) >> 5;
-            }
-            let mut dq = ((q.unsigned_abs() as i64 * step) & 0xff_ffff) >> dq_shift;
-            if q < 0 {
-                dq = -dq;
-            }
-            coefs[i * tw + j] = dq.clamp(-limit, limit - 1) as i32;
-            nz_rows = nz_rows.max(i + 1);
-            nz_cols = nz_cols.max(j + 1);
         }
         (coefs, nz_rows, nz_cols)
     }
