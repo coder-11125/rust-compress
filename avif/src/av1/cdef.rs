@@ -69,22 +69,91 @@ pub fn cdef_frame(
     mi_cols: usize,
     mi_rows: usize,
 ) {
-    copy_frame(pre, out);
+    cdef_frame_planes(pre, out, p, cdef_idx, cdef_stride, skip, mi_cols, mi_rows, 7, None);
+}
+
+/// Per 8x8 block (row-major, `mi_cols.div_ceil(2)` per row) direction and variance of the luma plane.
+pub type CdefDirections = Vec<(u8, i32)>;
+
+fn block_is_filtered(
+    cdef_idx: &[i8],
+    cdef_stride: usize,
+    skip: &[bool],
+    mi_cols: usize,
+    mi_rows: usize,
+    r: usize,
+    c: usize,
+) -> Option<usize> {
+    let skip_at = |r: usize, c: usize| skip[r.min(mi_rows - 1) * mi_cols + c.min(mi_cols - 1)];
+    let idx = cdef_idx[(r >> 4) * cdef_stride + (c >> 4)];
+    let all_skipped = skip_at(r, c) && skip_at(r + 1, c) && skip_at(r, c + 1) && skip_at(r + 1, c + 1);
+    if idx >= 0 && !all_skipped { Some(idx as usize & 7) } else { None }
+}
+
+/// The direction search of every block that `cdef_frame` may filter, so a search over strengths can reuse it.
+pub fn cdef_directions(
+    pre: &Frame,
+    cdef_idx: &[i8],
+    cdef_stride: usize,
+    skip: &[bool],
+    mi_cols: usize,
+    mi_rows: usize,
+) -> CdefDirections {
+    let per_row = mi_cols.div_ceil(2);
+    let mut dirs = vec![(0u8, 0i32); per_row * mi_rows.div_ceil(2)];
+    for r in (0..mi_rows).step_by(2) {
+        for c in (0..mi_cols).step_by(2) {
+            if block_is_filtered(cdef_idx, cdef_stride, skip, mi_cols, mi_rows, r, c).is_some() {
+                let (d, v) = find_direction(&pre.planes[0], c * 4, r * 4, pre.bit_depth as u32);
+                dirs[(r / 2) * per_row + c / 2] = (d as u8, v);
+            }
+        }
+    }
+    dirs
+}
+
+/// `cdef_frame` restricted to the planes in the bit mask `planes` (bit i = plane i): the other planes of `out` are
+/// left untouched. `dirs` optionally supplies precomputed `cdef_directions` (it must come from the same `pre`).
+#[allow(clippy::too_many_arguments)]
+pub fn cdef_frame_planes(
+    pre: &Frame,
+    out: &mut Frame,
+    p: &CdefParams,
+    cdef_idx: &[i8],
+    cdef_stride: usize,
+    skip: &[bool],
+    mi_cols: usize,
+    mi_rows: usize,
+    planes: u8,
+    dirs: Option<&CdefDirections>,
+) {
+    if planes == 7 || planes as usize >= 1 << pre.planes.len() {
+        copy_frame(pre, out);
+    } else {
+        for (i, (a, b)) in out.planes.iter_mut().zip(&pre.planes).enumerate() {
+            if planes >> i & 1 != 0 {
+                a.data.copy_from_slice(&b.data);
+            }
+        }
+    }
     let num_planes = pre.planes.len();
     let (sx, sy) = (pre.sub_x as usize, pre.sub_y as usize);
     let coeff_shift = pre.bit_depth as u32 - 8;
-    let skip_at = |r: usize, c: usize| skip[r.min(mi_rows - 1) * mi_cols + c.min(mi_cols - 1)];
+    let per_row = mi_cols.div_ceil(2);
     let mut r = 0;
     while r < mi_rows {
         let mut c = 0;
         while c < mi_cols {
-            let idx = cdef_idx[(r >> 4) * cdef_stride + (c >> 4)];
-            let all_skipped = skip_at(r, c) && skip_at(r + 1, c) && skip_at(r, c + 1) && skip_at(r + 1, c + 1);
-            if idx >= 0 && !all_skipped {
-                let idx = idx as usize & 7;
+            if let Some(idx) = block_is_filtered(cdef_idx, cdef_stride, skip, mi_cols, mi_rows, r, c) {
                 let any_pri = p.y_pri[idx] != 0 || (num_planes > 1 && p.uv_pri[idx] != 0);
-                let (y_dir, var) =
-                    if any_pri { find_direction(&pre.planes[0], c * 4, r * 4, pre.bit_depth as u32) } else { (0, 0) };
+                let (y_dir, var) = if !any_pri {
+                    (0, 0)
+                } else if let Some(d) = dirs {
+                    let (d, v) = d[(r / 2) * per_row + c / 2];
+                    (d as usize, v)
+                } else {
+                    find_direction(&pre.planes[0], c * 4, r * 4, pre.bit_depth as u32)
+                };
 
                 // Luma: the direction only matters with a primary strength, whose size follows the local variance.
                 let pri = (p.y_pri[idx] as i32) << coeff_shift;
@@ -94,7 +163,7 @@ pub fn cdef_frame(
                 let pri = if var != 0 { (pri * (4 + var_str) + 8) >> 4 } else { 0 };
                 let damping = p.damping as i32 + coeff_shift as i32;
                 let blk = Block { c, r, sx: 0, sy: 0, mi_cols, mi_rows };
-                if pri != 0 || sec != 0 {
+                if planes & 1 != 0 && (pri != 0 || sec != 0) {
                     filter_block(
                         &pre.planes[0],
                         &mut out.planes[0],
@@ -116,7 +185,7 @@ pub fn cdef_frame(
                     };
                     let damping = damping - 1;
                     let blk = Block { c, r, sx, sy, mi_cols, mi_rows };
-                    for plane in (1..num_planes).filter(|_| pri != 0 || sec != 0) {
+                    for plane in (1..num_planes).filter(|&pl| planes >> pl & 1 != 0 && (pri != 0 || sec != 0)) {
                         filter_block(
                             &pre.planes[plane],
                             &mut out.planes[plane],
@@ -221,12 +290,19 @@ struct Block {
 }
 
 /// `constrain()` of the spec: `diff` limited so that large differences (edges) contribute little or nothing.
+#[cfg(test)]
 #[inline]
 fn constrain(diff: i32, threshold: i32, damping: i32) -> i32 {
     if threshold == 0 {
         return 0;
     }
     let adj = (damping - floor_log2(threshold as u32)).max(0);
+    constrain_adj(diff, threshold, adj)
+}
+
+/// `constrain()` with the shift `adj = max(0, damping - floor_log2(threshold))` already worked out.
+#[inline(always)]
+fn constrain_adj(diff: i32, threshold: i32, adj: i32) -> i32 {
     let mag = diff.abs();
     let v = mag.min((threshold - (mag >> adj)).max(0));
     if diff < 0 { -v } else { v }
@@ -248,45 +324,55 @@ fn filter_block(src: &Plane, dst: &mut Plane, blk: &Block, params: [i32; 4], coe
     const PAD: usize = 2;
     const TS: usize = 8 + 2 * PAD;
     let mut tmp = [UNAVAILABLE; TS * TS];
+    // Columns of the padded block that lie inside the frame.
+    let tx_lo = (PAD as i32 - x0 as i32).max(0) as usize;
+    let tx_hi = ((lim_w - x0 as i32 + PAD as i32).max(0) as usize).min(w + 2 * PAD);
     for ty in 0..h + 2 * PAD {
         let y = (y0 + ty) as i32 - PAD as i32;
-        if y < 0 || y >= lim_h {
+        if y < 0 || y >= lim_h || tx_lo >= tx_hi {
             continue;
         }
-        for tx in 0..w + 2 * PAD {
-            let x = (x0 + tx) as i32 - PAD as i32;
-            if x >= 0 && x < lim_w {
-                tmp[ty * TS + tx] = src.at(x as usize, y as usize) as i32;
-            }
+        let row = src.row(y as usize);
+        let xs = x0 + tx_lo - PAD;
+        for (d, &s) in tmp[ty * TS + tx_lo..ty * TS + tx_hi].iter_mut().zip(&row[xs..xs + tx_hi - tx_lo]) {
+            *d = s as i32;
         }
     }
     let pri_taps = PRI_TAPS[((pri >> coeff_shift) & 1) as usize];
     let dirs = [dir as usize, (dir as usize + 2) & 7, (dir as usize + 6) & 7];
+    let adj_of = |t: i32| if t == 0 { 0 } else { (damping - floor_log2(t as u32)).max(0) };
+    let (pri_adj, sec_adj) = (adj_of(pri), adj_of(sec));
     for i in 0..h {
-        for j in 0..w {
-            let at = |dy: i32, dx: i32| tmp[((i + PAD) as i32 + dy) as usize * TS + ((j + PAD) as i32 + dx) as usize];
-            let x = at(0, 0);
-            let (mut sum, mut max, mut min) = (0, x, x);
-            for k in 0..2 {
-                for sign in [-1, 1] {
-                    for (n, &d) in dirs.iter().enumerate() {
-                        let (dy, dx) = DIRECTIONS[d][k];
-                        let s = at(sign * dy, sign * dx);
-                        if s == UNAVAILABLE {
-                            continue;
-                        }
-                        sum += if n == 0 {
-                            pri_taps[k] * constrain(s - x, pri, damping)
-                        } else {
-                            SEC_TAPS[k] * constrain(s - x, sec, damping)
-                        };
-                        max = max.max(s);
-                        min = min.min(s);
+        let mut x = [0i32; 8];
+        for (j, v) in x[..w].iter_mut().enumerate() {
+            *v = tmp[(i + PAD) * TS + j + PAD];
+        }
+        let mut sum = [0i32; 8];
+        let mut max = x;
+        // Unavailable samples are -1, i.e. u32::MAX, which never lowers the unsigned minimum.
+        let mut min = x.map(|v| v as u32);
+        for k in 0..2 {
+            for sign in [-1i32, 1] {
+                for (n, &d) in dirs.iter().enumerate() {
+                    let (dy, dx) = DIRECTIONS[d][k];
+                    let off = ((i + PAD) as i32 + sign * dy) as usize * TS + (PAD as i32 + sign * dx) as usize;
+                    let sl = &tmp[off..off + w];
+                    let (tap, thr, adj) =
+                        if n == 0 { (pri_taps[k], pri, pri_adj) } else { (SEC_TAPS[k], sec, sec_adj) };
+                    for j in 0..w {
+                        let s = sl[j];
+                        let c = tap * constrain_adj(s - x[j], thr, adj);
+                        sum[j] += if s >= 0 { c } else { 0 };
+                        max[j] = max[j].max(s);
+                        min[j] = min[j].min(s as u32);
                     }
                 }
             }
-            let v = x + ((8 + sum - (sum < 0) as i32) >> 4);
-            dst.data[(y0 + i) * dst.stride + x0 + j] = v.clamp(min, max) as u16;
+        }
+        let out = &mut dst.data[(y0 + i) * dst.stride + x0..][..w];
+        for j in 0..w {
+            let v = x[j] + ((8 + sum[j] - (sum[j] < 0) as i32) >> 4);
+            out[j] = v.clamp(min[j] as i32, max[j]) as u16;
         }
     }
 }

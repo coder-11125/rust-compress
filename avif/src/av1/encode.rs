@@ -780,7 +780,7 @@ fn plane_sse(a: &Frame, b: &Frame, plane: usize) -> f64 {
 /// Pick the deblocking levels and the CDEF strengths that minimise the error against the source, and store them
 /// in the frame header. The entropy-coded data does not depend on them.
 fn choose_filters(fs: &mut FrameState, src: &Frame, base_q_idx: u8) -> Option<(Frame, Frame)> {
-    use super::cdef::{CdefParams, cdef_frame};
+    use super::cdef::{CdefParams, cdef_directions, cdef_frame, cdef_frame_planes};
     use super::deblock::deblock_frame;
     use super::decoder::{build_deblock, coded_frame};
     if fs.hdr.coded_lossless || std::env::var_os("AV1_NOFILT").is_some() {
@@ -815,10 +815,12 @@ fn choose_filters(fs: &mut FrameState, src: &Frame, base_q_idx: u8) -> Option<(F
     // CDEF: one strength set for the whole frame.
     let damping = (3 + (base_q_idx >> 6)).min(6);
     let skip: Vec<bool> = fs.skip.iter().map(|&s| s != 0).collect();
+    let dirs = cdef_directions(&deblocked, &fs.cdef_idx, fs.cdef_stride, &skip, fs.mi_cols, fs.mi_rows);
     let cdef_cost = |y: (u8, u8), uv: (u8, u8), plane: usize| -> f64 {
         let p = CdefParams { damping, bits: 0, y_pri: [y.0; 8], y_sec: [y.1; 8], uv_pri: [uv.0; 8], uv_sec: [uv.1; 8] };
         let mut out = deblocked.clone();
-        cdef_frame(&deblocked, &mut out, &p, &fs.cdef_idx, fs.cdef_stride, &skip, fs.mi_cols, fs.mi_rows);
+        let (cols, rows, stride) = (fs.mi_cols, fs.mi_rows, fs.cdef_stride);
+        cdef_frame_planes(&deblocked, &mut out, &p, &fs.cdef_idx, stride, &skip, cols, rows, 1 << plane, Some(&dirs));
         plane_sse(&out, src, plane)
     };
     let pris = [0u8, 1, 2, 3, 4, 6, 8, 11, 15];
