@@ -252,17 +252,28 @@ impl CostCoder {
     }
 }
 
-/// `-log2(p / 32768) * 256` for `p` in 1..=32768.
-pub fn cost_table() -> &'static [u16; 129] {
+/// Cost lookup tables: `t[i]` is `-log2(i / 128) * 256` (the interpolation knots, with the last repeated) and `small[p]` the exact
+/// `-log2(p / 32768) * 256` for the probabilities below 1/128.
+struct CostTables {
+    t: [u16; 130],
+    small: [u16; 256],
+}
+
+fn cost_tables() -> &'static CostTables {
     use std::sync::OnceLock;
-    static T: OnceLock<[u16; 129]> = OnceLock::new();
+    static T: OnceLock<CostTables> = OnceLock::new();
     T.get_or_init(|| {
-        let mut t = [0u16; 129];
-        for (i, v) in t.iter_mut().enumerate().skip(1) {
+        let mut t = [0u16; 130];
+        for (i, v) in t.iter_mut().enumerate().take(129).skip(1) {
             *v = (-(i as f64 / 128.0).log2() * 256.0).round() as u16;
         }
         t[0] = t[1];
-        t
+        t[129] = t[128];
+        let mut small = [0u16; 256];
+        for (p, v) in small.iter_mut().enumerate().skip(1) {
+            *v = (-(p as f64 / 32768.0).log2() * 256.0).round() as u16;
+        }
+        CostTables { t, small }
     })
 }
 
@@ -270,17 +281,17 @@ pub fn cost_table() -> &'static [u16; 129] {
 #[inline]
 pub fn prob_cost(p: u32) -> u32 {
     let p = p.clamp(1, 32768);
-    let t = cost_table();
+    let tables = cost_tables();
     // Linear interpolation on a 128-entry table over [0, 1] keeps the error under 1%.
-    let x = p as u64 * 128;
+    let x = p * 128;
     let i = (x >> 15) as usize;
-    let f = (x & 0x7fff) as u32;
-    let a = t[i.max(1)] as u32;
-    let b = t[(i + 1).min(128)] as u32;
     if i == 0 {
         // Below 1/128 use the exact log.
-        return (-(p as f64 / 32768.0).log2() * 256.0).round() as u32;
+        return u32::from(tables.small[p as usize]);
     }
+    let f = x & 0x7fff;
+    let a = u32::from(tables.t[i]);
+    let b = u32::from(tables.t[i + 1]);
     (a * (32768 - f) + b * f) >> 15
 }
 
