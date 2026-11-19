@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+- The AVIF encoder is about 41% cheaper in instructions with **byte-identical output**: 396 G to 234 G instructions
+  retired on four detailed 640x400 photo crops at two qualities each, and every compressed file is identical to the
+  previous encoder's. Three changes: the CDEF strength search filters only the plane it measures and computes block
+  directions once per frame instead of once per candidate (-15% on its own); the forward and inverse transforms run four
+  or eight rows or columns at once so the butterflies vectorize, with cheaper quantization (-19%); rate estimation reads
+  its costs from tables, intra edges are built once per block, and the analysis buffers are reused (-7%). They were
+  profiled first (about 19% CDEF, 27% transforms and quantization, 28% rate estimation, allocation and intra prediction)
+  and the shared tile, entropy, intra-prediction and inverse-transform code stays bit-exact with the dav1d fixtures.
+  Measured in instructions on four photo crops, and with a stopwatch on two of them on a quiet machine, old and new
+  encoder run one after the other, best of two: 12.0 s to 7.3 s and 5.0 s to 2.9 s with all cores (1.65-1.69x faster) and
+  1.5-1.7x on one thread, with identical output sizes. The encoder is still far slower than libaom's fast presets. Against libavif through Pillow at equal SSIMULACRA 2 it ranges from 1% smaller to 9% larger than speed 6 on average
+  at scores 55-75 (worst file +18-22%) and is 6-13% larger than speed 4, on the same four crops.
+- New `tools/check.sh` runs the CI checks (fmt, clippy, build, tests, Windows type-check) one at a time, stopping at the
+  first failure, with a lock so two runs cannot overlap; `--quick` runs fmt and clippy only.
 - New `--target-ssimulacra2 SCORE` picks the lowest quality that still scores at least SCORE on SSIMULACRA 2, a perceptual
   metric (100 identical, about 90 visually indistinguishable, 70 good, 50 clearly degraded; not clamped, so it can go
   negative), for JPEG, lossy WebP, AVIF and `--lossy` PNG. The metric is implemented from scratch in
