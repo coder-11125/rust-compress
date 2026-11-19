@@ -492,32 +492,69 @@ fn directional(dst: &mut [u16], stride: usize, e: &Edges, p: &IntraParams) {
     } else if angle < 90 {
         let dx = dr_derivative(angle);
         let max_base = ((w + h - 1) << up_above) as i32;
-        fill_rows(dst, stride, w, h, |i, j| {
+        let last = above.at(max_base) as u16;
+        for (i, row) in dst.chunks_mut(stride).take(h).enumerate() {
             let idx = (i as i32 + 1) * dx;
-            let base = (idx >> (6 - up_above)) + ((j as i32) << up_above);
+            let base = idx >> (6 - up_above);
             let shift = ((idx << up_above) >> 1) & 31;
-            if base < max_base { interpolate(&above, base, shift) } else { above.at(max_base) as u16 }
-        });
+            // The columns whose base is below `max_base` interpolate, the others repeat the last sample.
+            let n = if base >= max_base { 0 } else { (((max_base - base - 1) >> up_above) as usize + 1).min(w) };
+            let (head, tail) = row[..w].split_at_mut(n);
+            interpolate_row(head, &above.buf, (Edge::OFF as i32 + base).max(0) as usize, up_above, shift);
+            tail.fill(last);
+        }
     } else if angle < 180 {
         let (dx, dy) = (dr_derivative(180 - angle), dr_derivative(angle - 90));
-        fill_rows(dst, stride, w, h, |i, j| {
-            let (i, j) = (i as i32, j as i32);
-            let idx = (j << 6) - (i + 1) * dx;
-            let base = idx >> (6 - up_above);
-            if base >= -(1 << up_above) {
-                interpolate(&above, base, ((idx << up_above) >> 1) & 31)
-            } else {
-                let idx = (i << 6) - (j + 1) * dy;
-                interpolate(&left, idx >> (6 - up_left), ((idx << up_left) >> 1) & 31)
+        for (i, row) in dst.chunks_mut(stride).take(h).enumerate() {
+            let i = i as i32;
+            // From column `from` on the sample comes from the above edge (`base >= -(1 << up_above)`), with a
+            // base that advances by `1 << up_above` per column and a constant shift.
+            let c = (i + 1) * dx;
+            let from = (((c + 63) >> 6) - 1).clamp(0, w as i32) as usize;
+            let (head, tail) = row[..w].split_at_mut(from);
+            for (j, out) in head.iter_mut().enumerate() {
+                let idx = (i << 6) - (j as i32 + 1) * dy;
+                *out = interpolate(&left, idx >> (6 - up_left), ((idx << up_left) >> 1) & 31);
             }
-        });
+            let base = (-c) >> (6 - up_above);
+            let shift = (((-c) << up_above) >> 1) & 31;
+            let start = Edge::OFF as i32 + base + ((from as i32) << up_above);
+            interpolate_row(tail, &above.buf, start.max(0) as usize, up_above, shift);
+        }
     } else {
         let dy = dr_derivative(270 - angle);
-        fill_rows(dst, stride, w, h, |i, j| {
+        // Per column the base offset and the shift are fixed; the base advances by `1 << up_left` per row.
+        let mut cols = [(0i32, 0i32); 64];
+        for (j, col) in cols.iter_mut().take(w).enumerate() {
             let idx = (j as i32 + 1) * dy;
-            let base = (idx >> (6 - up_left)) + ((i as i32) << up_left);
-            interpolate(&left, base, ((idx << up_left) >> 1) & 31)
-        });
+            *col = (idx >> (6 - up_left), ((idx << up_left) >> 1) & 31);
+        }
+        for (i, row) in dst.chunks_mut(stride).take(h).enumerate() {
+            let step = (i as i32) << up_left;
+            for (out, &(base, shift)) in row[..w].iter_mut().zip(&cols) {
+                *out = interpolate(&left, base + step, shift);
+            }
+        }
+    }
+}
+
+/// Fills `out` with `(buf[o + k] * (32 - shift) + buf[o + k + 1] * shift + 16) >> 5` where `k` is `j << up` for
+/// output column `j`.
+#[inline(always)]
+fn interpolate_row(out: &mut [u16], buf: &[u16], o: usize, up: u32, shift: i32) {
+    if out.is_empty() {
+        return;
+    }
+    let (wa, wb) = (32 - shift, shift);
+    if up == 0 {
+        for ((d, &a), &b) in out.iter_mut().zip(&buf[o..]).zip(&buf[o + 1..]) {
+            *d = ((i32::from(a) * wa + i32::from(b) * wb + 16) >> 5) as u16;
+        }
+    } else {
+        for (j, d) in out.iter_mut().enumerate() {
+            let k = o + (j << up);
+            *d = ((i32::from(buf[k]) * wa + i32::from(buf[k + 1]) * wb + 16) >> 5) as u16;
+        }
     }
 }
 

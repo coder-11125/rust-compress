@@ -185,7 +185,8 @@ impl<C: Coder> TileCoder<'_, C> {
         let (dc_q, ac_q) = self.quant_steps(b, plane);
         let (round, lambda) = self.enc_src.as_ref().map_or((128, 0.0), |e| (e.quant_round, e.lambda));
         // Residual = source - prediction (the frame buffer holds the prediction).
-        let mut residual = vec![0i32; tw * th];
+        let [mut residual, mut coefs, mut best_quant] = std::mem::take(&mut self.an_scratch);
+        residual.resize(tw * th, 0);
         {
             let src = &self.enc_src.as_ref().expect("encoder source").planes[plane];
             let cur = &self.f.planes[plane];
@@ -197,10 +198,18 @@ impl<C: Coder> TileCoder<'_, C> {
                 }
             }
         }
-        let hash = residual
-            .iter()
-            .fold(0xcbf2_9ce4_8422_2325u64, |h, &r| (h ^ (r as u32 as u64)).wrapping_mul(0x0100_0000_01b3))
-            | 1;
+        // Only compared with the hash of the same residual computed later in this run: four independent lanes.
+        let mut lanes = [0xcbf2_9ce4_8422_2325u64; 4];
+        let mut chunks = residual.chunks_exact(4);
+        for c in &mut chunks {
+            for (h, &r) in lanes.iter_mut().zip(c) {
+                *h = (*h ^ (r as u32 as u64)).wrapping_mul(0x0100_0000_01b3);
+            }
+        }
+        for (h, &r) in lanes.iter_mut().zip(chunks.remainder()) {
+            *h = (*h ^ (r as u32 as u64)).wrapping_mul(0x0100_0000_01b3);
+        }
+        let hash = lanes.iter().fold(0u64, |a, &h| (a.rotate_left(17) ^ h).wrapping_mul(0x9e37_79b9_7f4a_7c15)) | 1;
         if let Some(sc) = self.pre_coefs.pop_front()
             && sc.hash == hash
         {
@@ -217,6 +226,7 @@ impl<C: Coder> TileCoder<'_, C> {
                 if plane == 0 {
                     self.store_tx_type(x >> 2, y >> 2, tw >> 2, th >> 2, if sc.eob > 0 { sc.tx_type } else { DCT_DCT });
                 }
+                self.an_scratch = [residual, coefs, best_quant];
                 return sc;
             }
         }
@@ -242,10 +252,11 @@ impl<C: Coder> TileCoder<'_, C> {
         };
         let (cw, ch) = (tw.min(32), th.min(32));
         let mut cb = CoefBlock { eob: 0, tx_type: 0, quant: [0; 1024] };
-        let mut coefs = vec![0i32; tw * th];
-        // (cost, type, eob, quantized levels, bits) of the best candidate so far. Candidates are ranked by their
-        // coefficient-domain error (scaled to pixels), which avoids reconstructing each of them.
-        let mut best: Option<(f64, u8, usize, Vec<i32>, u64)> = None;
+        // The forward transform overwrites every coefficient.
+        coefs.resize(tw * th, 0);
+        // (cost, type, eob, bits) of the best candidate so far, its quantized levels in `best_quant`. Candidates are
+        // ranked by their coefficient-domain error (scaled to pixels), which avoids reconstructing each of them.
+        let mut best: Option<(f64, u8, usize, u64)> = None;
         for &tx_type in types {
             itx::forward_transform(&residual, tw, tx_sz, tx_type, b.lossless, bit_depth, &mut coefs);
             let eob = quantize(&coefs, tx_sz, tx_type, dc_q as i64, ac_q as i64, round, &mut cb.quant);
@@ -261,13 +272,15 @@ impl<C: Coder> TileCoder<'_, C> {
             let sse = if b.lossless { 0.0 } else { err * itx::dist_scale(tx_sz, tx_type) };
             let j = sse + lambda * bits as f64 / 256.0;
             if best.as_ref().is_none_or(|b| j < b.0) {
-                best = Some((j, tx_type, eob, cb.quant[..cw * ch].to_vec(), bits));
+                best_quant.clear();
+                best_quant.extend_from_slice(&cb.quant[..cw * ch]);
+                best = Some((j, tx_type, eob, bits));
             }
             if tx_type == DCT_DCT && eob == 0 {
                 break;
             }
         }
-        let (_, tx_type, eob, quant, bits) = best.expect("at least one transform type");
+        let (_, tx_type, eob, bits) = best.expect("at least one transform type");
         self.an_bits += bits;
         if plane == 0 {
             self.store_tx_type(setup.x4, setup.y4, setup.w4, setup.h4, if eob > 0 { tx_type } else { DCT_DCT });
@@ -275,9 +288,9 @@ impl<C: Coder> TileCoder<'_, C> {
         let mut sc = StoredCoefs { tx_type, eob, coefs: Vec::new(), hash };
         if eob > 0 {
             for pos in 0..cw * ch {
-                if quant[pos] != 0 {
-                    sc.coefs.push((pos as u16, quant[pos]));
-                    self.cb.quant[pos] = quant[pos];
+                if best_quant[pos] != 0 {
+                    sc.coefs.push((pos as u16, best_quant[pos]));
+                    self.cb.quant[pos] = best_quant[pos];
                 }
             }
             self.cb.tx_type = tx_type;
@@ -298,6 +311,7 @@ impl<C: Coder> TileCoder<'_, C> {
             }
             self.an_dist += sse as f64;
         }
+        self.an_scratch = [residual, coefs, best_quant];
         sc
     }
 }

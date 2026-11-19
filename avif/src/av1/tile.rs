@@ -322,6 +322,8 @@ pub struct TileCoder<'a, C: Coder> {
     pub pre_coefs: std::collections::VecDeque<StoredCoefs>,
     pub an_dist: f64,
     pub an_bits: u64,
+    /// Encoder: reusable buffers of the transform block analysis (residual, coefficients, best quantized levels).
+    pub an_scratch: [Vec<i32>; 3],
 }
 
 impl<'a, C: Coder> TileCoder<'a, C> {
@@ -391,6 +393,7 @@ impl<'a, C: Coder> TileCoder<'a, C> {
             pre_coefs: Default::default(),
             an_dist: 0.0,
             an_bits: 0,
+            an_scratch: Default::default(),
         }
         .with_planes(np)
     }
