@@ -25,13 +25,13 @@ A fast command-line image compressor for **PNG**, **JPEG**, **WebP**, **AVIF** a
 | Lossy PNG (`--lossy`) | pngquant | **4% smaller** at similar quality (pngquant + oxipng is 6% smaller still) |
 | Lossy JPEG | mozjpeg 4.0.3, equal SSIMULACRA2 | **−0.8% to −1.2%** mean at scores 55-85 (worst file +3.5%, on a 10-image corpus) |
 | Lossless JPEG | mozjpeg `jpegtran` | +0.4% (beats libjpeg-turbo's `jpegtran` and jpegoptim) |
-| WebP lossless | `cwebp -lossless` | +2% at ~10× the CPU |
-| WebP lossy | `cwebp -m 6` | +6-12% at ~3× the CPU |
+| WebP lossless | `cwebp -lossless` | +2% at ~10× the CPU (default effort is now 5: same size as 7 at about half the time, see the WebP note) |
+| WebP lossy | `cwebp -m 6` | +6-12% at ~3× the CPU (since tuned: about 1% smaller on smooth wallpapers, unproven on photographs, see the WebP note) |
 | AVIF | libaom speed 6 / speed 4 | +3-4% / +9-12%, ~30× slower than speed 6 |
 | GIF kept as GIF | gifsicle | −0.9% vs −4.5%; `--lossy` −5% vs `--lossy=80` −32% |
 | GIF → WebP | gif2webp | Lossless −23% vs +10% (better); lossy ~4% larger |
 
-**Where it is weaker, plainly:** lossy WebP and AVIF are behind the dedicated encoders (and GIF `--lossy` was in the benchmark run behind the table; it has since been reworked, see the GIF note under *Head-to-head*), and the AVIF encoder is far slower than libaom's fast presets. The PNG, WebP, AVIF and GIF rows come from the project's benchmark run and were not re-run when the JPEG encoder was retuned; the JPEG row was re-measured with `tools/bench_jpeg.py` on a small corpus of smooth desktop images, so re-run it on your own photos (it takes any folder via `--src`).
+**Where it is weaker, plainly:** AVIF is behind the dedicated encoders (and lossy WebP and GIF `--lossy` were behind in the benchmark run behind the table; both have since been reworked, see the WebP and GIF notes under *Head-to-head*), and the AVIF encoder is far slower than libaom's fast presets. The PNG, WebP, AVIF and GIF rows come from the project's benchmark run and were not re-run when the JPEG encoder was retuned; the JPEG row was re-measured with `tools/bench_jpeg.py` on a small corpus of smooth desktop images, so re-run it on your own photos (it takes any folder via `--src`).
 
 ## Install
 
@@ -95,7 +95,7 @@ cat in.png | rc - > out.png  # stdin to stdout
 
 **WebP (lossy)** — a from-scratch VP8 key-frame encoder and decoder (`-f webp --lossy -q N`):
 - The decoder is bit-exact with libwebp (planes and RGB output, including the "fancy" chroma upsampling, loop filters, segments, multiple partitions and `ALPH`).
-- The encoder does rate-distortion mode decisions (16x16, 4x4 and chroma intra modes), quantizes with deadzone biasing, tunes the token probabilities from first-pass statistics, and searches the loop-filter level. Its streams decode to the identical picture in libwebp. In the current head-to-head benchmark (see *Head-to-head* below) it is 6-12% larger than `cwebp -m 6` at about 3x the CPU, so lossy WebP is behind libwebp.
+- The encoder does rate-distortion mode decisions (16x16, 4x4 and chroma intra modes), quantizes with deadzone biasing, tunes the token probabilities from first-pass statistics, and searches the loop-filter level. Its streams decode to the identical picture in libwebp. In the project's earlier head-to-head benchmark it was 6-12% larger than `cwebp -m 6` at about 3x the CPU. It has since been tuned for SSIMULACRA2 rather than squared error (a loop filter at half the MSE-optimal strength with header sharpness 6, cheaper chroma decisions): on 10 smooth desktop wallpapers that took it from about 5% larger than libwebp method 6 to about 1% smaller at equal SSIMULACRA2 65-75 (see the WebP note under *Head-to-head*). That is a metric result on smooth images, not yet checked on real photographs, where a weaker loop filter may behave differently.
 - Transparency is stored losslessly in an `ALPH` chunk (best of four prediction filters, coded with the VP8L encoder); hidden pixels are smoothed to be cheap. Lossy WebP inputs are only re-encoded with `--lossy`; otherwise they are left untouched.
 
 **AVIF** — a from-scratch AV1 still-picture decoder and intra encoder inside a HEIF container (`-f avif -q N`):
@@ -106,6 +106,7 @@ cat in.png | rc - > out.png  # stdin to stdout
 
 **WebP (lossless)** — full VP8L encoder and decoder:
 - Encoder tries a palette transform (bundling up to 8 pixels per symbol) or subtract-green + per-tile predictor + cross-color decorrelation, ranks the pipelines with a cheap estimate and fully encodes the best ones.
+- **Effort levels** (`-l`, default **5** for lossless WebP): level 5 was as small as 7 (slightly smaller on three wallpapers) for about half the time; 6 is larger than both and about as slow as 7, so there is no reason to use it; 7-9 are the slow, thorough levels; 0-4 are a fast tier that fits the transforms on sampled pixels and uses a cheaper parse (on three wallpapers, level 4 was 0.75% larger than 7 for 6-8x less wall time). The fast levels try fewer candidate pipelines, so graphics and screenshots can come out noticeably larger at them than at 5.
 - LZ77 with the format's 2-D distance codes, an optimal (cost-model driven) parse, a colour cache sized by trial, and **entropy-clustered prefix-code groups**: image tiles with similar statistics share one set of codes.
 - 8-bit only: 16-bit inputs are reduced to 8-bit (the report note says so). Images are limited to 16384×16384 by the format. Lossy WebP (VP8) is decoded for conversions or an explicit `--lossy` re-encode; when the format is kept it is left untouched, since recompressing it would only add generation loss. Animated WebP is treated the same way: left untouched unless `--lossy` asks for a re-encode.
 
@@ -146,7 +147,7 @@ rc [OPTIONS] <INPUT>...
       --colors <2-256>    with --lossy (default 256)
       --dither <0.0-1.0>  with --lossy (default 0.5)
       --gif-lossy <0-200> GIF output: lossiness on gifsicle's --lossy scale (default 0; 80 with --lossy)
-  -l, --level <0-9>       PNG / WebP effort (default 7; PNG: 1-6 fast, 7-9 optimal parsing, 9 slowest)
+  -l, --level <0-9>       PNG / WebP / AVIF effort (default 7; lossless WebP 5; PNG: 1-6 fast, 7-9 optimal parsing, 9 slowest)
       --no-trellis        JPEG: skip rate-distortion quantization (faster, larger)
       --target-ssim <S>   smallest quality with SSIM >= S (0-1; 0.95 small, 0.97 good, 0.99 near-lossless)
       --target-psnr <DB>  lossy WebP/AVIF and --lossy PNG: smallest quality with PSNR >= DB
@@ -190,7 +191,11 @@ Two measurements from earlier runs that the table above does not repeat: `-l 6` 
 
 **GIF, re-measured after the table above was produced.** The GIF encoder changed after that benchmark run (compact per-frame palettes and lossy coding), so the two GIF rows are from before. With `tools/bench_gif.py` against gifsicle 1.96 (`-O3 --lossy`) on **four synthetic animations that I generated** (a camera pan over a photo, a sprite over a photo, a typing UI and an ffmpeg test pattern; quality is the mean SSIMULACRA2 of 8 sampled frames against the input GIF): lossless re-coding of a GIF whose frames each carry their own palette went from "left unchanged" to −49% (211 KB → 108 KB, pixel-exact, +0.7% vs gifsicle `-O3`); at equal quality rc was 10-32% smaller on the pan, 34-80% smaller on the sprite, 2.7% smaller on the UI animation and 0.7-2.9% larger on the test pattern; lossless output is still about 4-6% above gifsicle `-O3` on the UI animation and the test pattern. The big wins come from animations whose frames are dithered independently, where near-identical pixels become "unchanged"; four synthetic files is a very small sample, and the real-world corpus behind the table has not been re-run.
 
-So PNG is the strong area, JPEG is at parity with mozjpeg on perceptual quality (on the small test corpus above), and lossy WebP and AVIF are still behind, with AVIF also much slower. GIF has improved since the benchmark run (see the note above). Against weaker baselines it is far ahead (e.g. 14-28% smaller than PIL's `optimize=True` PNGs).
+**WebP, re-measured after the table above was produced.** The WebP encoders changed after that benchmark run, so the two WebP rows are from before. With `tools/bench_webp.py` against libwebp method 6 (through Pillow, not a standalone `cwebp`) on desktop wallpapers, which are smooth images rather than typical photographs or screenshots:
+- *Lossless* (3 images at 1280 px, all pixel-exact): effort 5 produced 3,007,018 bytes against 3,007,810 at effort 7 (-0.03%) in about half the time (5-10 s against 9-17 s per file); effort 6 was +0.17% and as slow as 7; effort 4 was +0.75% at 1.4-2.9 s per file. Against libwebp method 6, levels 5 and 7 were +3.3% in total and level 4 +4.1%. Wall-clock times come from a busy machine, so read them as indicative. This is not comparable with the +2% in the table, which used `cwebp -lossless` at its default speed.
+- *Lossy* (10 images, size at equal SSIMULACRA2, positive means `rc` is larger): at score 65 the mean went from +4.8% to -0.8% (worst file +11.7% to +6.5%) and at score 75 from +5.1% to -1.4% (worst file +22.9% to +9.5%). The 55 and 85 rows have only 1-5 images that both encoders reach and say nothing. The gain comes mostly from a weaker loop filter, a choice SSIMULACRA2 rewards because it penalizes blur, so it needs checking on real photographs and by eye. A rate-distortion trellis and token-probability tuning, which helped JPEG, were not tried.
+
+So PNG is the strong area, JPEG is at parity with mozjpeg on perceptual quality (on the small test corpus above), and AVIF is still behind and much slower. Lossy and lossless WebP and GIF have improved since the benchmark run (see the notes above). Against weaker baselines it is far ahead (e.g. 14-28% smaller than PIL's `optimize=True` PNGs).
 
 What it offers beyond ratio: no C dependencies, one binary for all of these formats, a coefficient-domain JPEG pipeline, pipe support, and parallel batch processing.
 
